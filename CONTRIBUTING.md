@@ -34,6 +34,20 @@ npm run check
 
 Local tests use temporary data and do not modify real Cloudflare, GitHub, or Docker resources. Only run provider or VPS smoke tests with explicit approval and disposable test resources.
 
+GitHub also runs the full check, installer and release-bundle tests, Compose
+validation, a production container build, CodeQL, and Dependency Review. All
+third-party Actions are pinned to complete commit SHAs; keep the version comment
+when Dependabot updates a pin.
+
+## Releases
+
+Only maintainers publish releases. Do not create `v*` tags from a contribution
+branch or upload release assets manually. The release workflow accepts a
+version-matching commit on `main`, builds the multi-platform image once, emits
+signed provenance and SBOM attestations, and publishes an immutable GitHub
+Release. See [docs/RELEASES.md](docs/RELEASES.md) for the complete process and
+verification model.
+
 ## What makes a good change
 
 - Keep each pull request focused on one problem or feature.

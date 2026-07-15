@@ -12,5 +12,8 @@ traefik/dynamic.yml
 coverage/
 *.log
 .shelter-install.lock/
+.shelter-release-sync-incomplete
+release.manifest
+release.checksums
 .DS_Store
 *.tsbuildinfo

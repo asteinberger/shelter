@@ -1,0 +1,1675 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag, versions, and branch
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG_NAME" == *+* ]]; then
+            echo "::error title=Unsupported release tag::SemVer build metadata is not supported because OCI image tags cannot contain '+'."
+            exit 1
+          fi
+          if (( ${#TAG_NAME} > 128 )); then
+            echo "::error title=Release tag too long::Release tags cannot exceed OCI's 128-character tag limit."
+            exit 1
+          fi
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
+          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+            echo "::error title=Invalid release tag::Release tags must use vMAJOR.MINOR.PATCH with an optional SemVer prerelease suffix; numeric prerelease identifiers must not have leading zeros."
+            exit 1
+          fi
+
+          version="${TAG_NAME#v}"
+          package_version="$(jq -er '.version' package.json)"
+          lock_version="$(jq -er '.version' package-lock.json)"
+          lock_root_version="$(jq -er '.packages[""].version' package-lock.json)"
+          if [[ "$version" != "$package_version" || "$version" != "$lock_version" || "$version" != "$lock_root_version" ]]; then
+            echo "::error title=Version mismatch::Tag ${TAG_NAME}, package.json (${package_version}), package-lock.json (${lock_version}), and its root package (${lock_root_version}) must use the same version."
+            exit 1
+          fi
+
+          commit_sha="$(git rev-parse "${EVENT_SHA}^{commit}")"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/tag"
+          remote_tag_commit="$(git rev-parse 'refs/shelter-release/tag^{commit}')"
+          if [[ "$remote_tag_commit" != "$commit_sha" ]]; then
+            echo "::error title=Release tag moved::The remote tag no longer resolves to the commit that triggered this workflow."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$commit_sha" refs/remotes/origin/main; then
+            echo "::error title=Release commit is not on main::The tagged commit must be part of origin/main before it can be released."
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Check, test, and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+
+  prepare:
+    name: Prepare verified release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      DOCKER_CONFIG: /tmp/shelter-docker-config-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate and prepare release metadata
+        id: metadata
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          REGISTRY: ghcr.io
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG_NAME" == *+* ]]; then
+            echo "::error title=Unsupported release tag::SemVer build metadata is not supported because OCI image tags cannot contain '+'."
+            exit 1
+          fi
+          if (( ${#TAG_NAME} > 128 )); then
+            echo "::error title=Release tag too long::Release tags cannot exceed OCI's 128-character tag limit."
+            exit 1
+          fi
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
+          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+            echo "::error title=Invalid release tag::Release tags must use vMAJOR.MINOR.PATCH with an optional SemVer prerelease suffix; numeric prerelease identifiers must not have leading zeros."
+            exit 1
+          fi
+
+          version="${TAG_NAME#v}"
+          package_version="$(jq -er '.version' package.json)"
+          lock_version="$(jq -er '.version' package-lock.json)"
+          lock_root_version="$(jq -er '.packages[""].version' package-lock.json)"
+          if [[ "$version" != "$package_version" || "$version" != "$lock_version" || "$version" != "$lock_root_version" ]]; then
+            echo "::error title=Version mismatch::Tag ${TAG_NAME}, package.json (${package_version}), package-lock.json (${lock_version}), and its root package (${lock_root_version}) must use the same version."
+            exit 1
+          fi
+
+          commit_sha="$(git rev-parse "${EVENT_SHA}^{commit}")"
+          repository_lower="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image_name="${REGISTRY}/${repository_lower}"
+          version_reference="${image_name}:${TAG_NAME}"
+          commit_reference="${image_name}:sha-${commit_sha}"
+          candidate_reference="${image_name}:candidate-${commit_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          created="$(git show -s --format=%cI "$commit_sha")"
+          source_date_epoch="$(git show -s --format=%ct "$commit_sha")"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          {
+            printf 'candidate_reference=%s\n' "$candidate_reference"
+            printf 'commit_sha=%s\n' "$commit_sha"
+            printf 'commit_reference=%s\n' "$commit_reference"
+            printf 'created=%s\n' "$created"
+            printf 'image_name=%s\n' "$image_name"
+            printf 'prerelease=%s\n' "$prerelease"
+            printf 'source_date_epoch=%s\n' "$source_date_epoch"
+            printf 'version=%s\n' "$version"
+            printf 'version_reference=%s\n' "$version_reference"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require release commit on main
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/tag"
+          remote_tag_commit="$(git rev-parse 'refs/shelter-release/tag^{commit}')"
+          if [[ "$remote_tag_commit" != "$COMMIT_SHA" ]]; then
+            echo "::error title=Release tag moved::The remote tag no longer resolves to the validated release commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main; then
+            echo "::error title=Release commit is not on main::The tagged commit must be part of origin/main before it can be released."
+            exit 1
+          fi
+
+      - name: Preflight immutable GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          immutable_error="$(mktemp)"
+          releases_error="$(mktemp)"
+          trap 'rm -f "$immutable_error" "$releases_error"' EXIT
+
+          if ! immutable_state="$(gh api "/repos/${REPOSITORY}/immutable-releases" 2> "$immutable_error")"; then
+            echo "::error title=Unable to verify immutable releases::The repository immutable-release setting could not be read. Refusing to push a release image."
+            exit 1
+          fi
+          immutable_enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else "invalid" end' <<< "$immutable_state")"
+          case "$immutable_enabled" in
+            true) ;;
+            false)
+              echo "::error title=Immutable releases disabled::Enable immutable releases for this repository before publishing. No registry content has been pushed."
+              exit 1
+              ;;
+            *)
+              echo "::error title=Invalid immutable-release response::GitHub returned an unexpected immutable-release setting. Refusing to push a release image."
+              exit 1
+              ;;
+          esac
+
+          if ! releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100" 2> "$releases_error")"; then
+            echo "::error title=Unable to check existing releases::The releases API did not return a definitive state. Refusing to push a release image."
+            exit 1
+          fi
+          if jq -e --arg tag "$TAG_NAME" 'any(.[][]; .tag_name == $tag)' <<< "$releases" >/dev/null; then
+            echo "::error title=Release already exists::A GitHub Release for ${TAG_NAME} already exists. Refusing to rebuild or overwrite its image."
+            exit 1
+          fi
+
+      - name: Set up Node.js for release metadata
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install checksum-pinned Docker Buildx
+        shell: bash
+        env:
+          # From docker/buildx's official v0.35.0 checksums asset.
+          BUILDX_BINARY_SHA256: d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda
+          BUILDX_VERSION: 0.35.0
+        run: |
+          set -euo pipefail
+
+          download="${RUNNER_TEMP}/buildx-v${BUILDX_VERSION}.linux-amd64"
+          plugin_directory="${DOCKER_CONFIG}/cli-plugins"
+          plugin="${plugin_directory}/docker-buildx"
+          mkdir -p "$plugin_directory"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --retry 3 \
+            --show-error \
+            --silent \
+            --tlsv1.2 \
+            --output "$download" \
+            "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64"
+          printf '%s  %s\n' "$BUILDX_BINARY_SHA256" "$download" | sha256sum -c -
+          install -m 0755 "$download" "$plugin"
+          printf '%s  %s\n' "$BUILDX_BINARY_SHA256" "$plugin" | sha256sum -c -
+          "$plugin" version | grep -Eq '^github.com/docker/buildx v0\.35\.0([[:space:]]|$)'
+          docker buildx version | grep -Eq '^github.com/docker/buildx v0\.35\.0([[:space:]]|$)'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          cache-binary: false
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+
+      - name: Verify Docker Buildx remained pinned
+        shell: bash
+        env:
+          BUILDX_BINARY_SHA256: d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda
+        run: |
+          set -euo pipefail
+          plugin="${DOCKER_CONFIG}/cli-plugins/docker-buildx"
+          printf '%s  %s\n' "$BUILDX_BINARY_SHA256" "$plugin" | sha256sum -c -
+          docker buildx version | grep -Eq '^github.com/docker/buildx v0\.35\.0([[:space:]]|$)'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to reuse a release candidate tag
+        shell: bash
+        env:
+          CANDIDATE_TAG: candidate-${{ steps.metadata.outputs.commit_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          PACKAGE_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          api_error="$(mktemp)"
+          trap 'rm -f "$api_error"' EXIT
+          case "$OWNER_TYPE" in
+            User) endpoint="/users/${OWNER}/packages/container/${PACKAGE_NAME}/versions?per_page=100" ;;
+            Organization) endpoint="/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/versions?per_page=100" ;;
+            *)
+              echo "::error title=Unsupported package owner::GitHub returned an unknown repository owner type. Refusing to push."
+              exit 1
+              ;;
+          esac
+          if package_versions="$(gh api --paginate --slurp "$endpoint" 2> "$api_error")"; then
+            if jq -e --arg tag "$CANDIDATE_TAG" 'any(.[][] | .metadata.container.tags[]?; . == $tag)' \
+              <<< "$package_versions" >/dev/null; then
+              echo "::error title=Release candidate already exists::The run-specific GHCR candidate tag already exists. Refusing to reuse or attest a pre-existing image."
+              exit 1
+            fi
+          elif grep -q 'HTTP 404' "$api_error"; then
+            echo "No existing GHCR package was found; this will be its first release candidate."
+          else
+            echo "::error title=Unable to verify candidate tag absence::The GitHub Packages API did not return a definitive package state. Refusing to push."
+            exit 1
+          fi
+
+      - name: Build and push multi-platform image once
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ github.server_url }}/${{ github.repository }}.git#${{ steps.metadata.outputs.commit_sha }}
+          file: ./Dockerfile
+          labels: |
+            org.opencontainers.image.created=${{ steps.metadata.outputs.created }}
+            org.opencontainers.image.description=A small, self-hosted deployment control plane for a single VPS.
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.revision=${{ steps.metadata.outputs.commit_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=Shelter
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          pull: true
+          push: true
+          sbom: true
+          tags: |
+            ${{ steps.metadata.outputs.candidate_reference }}
+
+      - name: Verify candidate digest, platforms, and labels
+        id: image
+        shell: bash
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          CANDIDATE_REFERENCE: ${{ steps.metadata.outputs.candidate_reference }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected_digest="$BUILT_DIGEST"
+          if [[ ! "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error title=Invalid image digest::Buildx did not return a valid sha256 digest."
+            exit 1
+          fi
+
+          inspect_manifest() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}'
+          }
+
+          actual_digest="$(inspect_manifest "$CANDIDATE_REFERENCE" | jq -er '.digest')"
+          if [[ "$actual_digest" != "$expected_digest" ]]; then
+            echo "::error title=Candidate digest mismatch::${CANDIDATE_REFERENCE} resolves to ${actual_digest}, expected ${expected_digest}."
+            exit 1
+          fi
+
+          manifest="$(inspect_manifest "${IMAGE_NAME}@${expected_digest}")"
+          platform_digest() {
+            local architecture="$1"
+            jq -er --arg architecture "$architecture" '
+              [.manifests[]
+                | select(.platform.os == "linux" and .platform.architecture == $architecture)
+                | .digest]
+              | if length == 1 then .[0] else error("expected exactly one platform manifest") end
+            ' <<< "$manifest"
+          }
+
+          amd64_digest="$(platform_digest amd64)"
+          arm64_digest="$(platform_digest arm64)"
+
+          for platform_digest in "$amd64_digest" "$arm64_digest"; do
+            image_config="$(docker buildx imagetools inspect "${IMAGE_NAME}@${platform_digest}" --format '{{json .Image}}')"
+            revision="$(jq -er '.config.Labels["org.opencontainers.image.revision"]' <<< "$image_config")"
+            image_version="$(jq -er '.config.Labels["org.opencontainers.image.version"]' <<< "$image_config")"
+            if [[ "$revision" != "$COMMIT_SHA" || "$image_version" != "$VERSION" ]]; then
+              echo "::error title=Image metadata mismatch::Existing image labels do not match the release commit and version."
+              exit 1
+            fi
+          done
+
+          {
+            printf 'amd64_digest=%s\n' "$amd64_digest"
+            printf 'arm64_digest=%s\n' "$arm64_digest"
+            printf 'digest=%s\n' "$expected_digest"
+            printf 'reference=%s@%s\n' "$IMAGE_NAME" "$expected_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release assets
+        id: assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          asset_directory="${RUNNER_TEMP}/shelter-release-${VERSION}"
+          mkdir -p "$asset_directory"
+          printf 'directory=%s\n' "$asset_directory" >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned Syft
+        id: syft
+        shell: bash
+        env:
+          # From anchore/syft's official v1.46.0 checksums asset.
+          SYFT_ARCHIVE_SHA256: d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca
+          SYFT_VERSION: 1.46.0
+        run: |
+          set -euo pipefail
+
+          install_directory="${RUNNER_TEMP}/syft-${SYFT_VERSION}"
+          archive="${RUNNER_TEMP}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          mkdir -p "$install_directory"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --retry 3 \
+            --show-error \
+            --silent \
+            --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$SYFT_ARCHIVE_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$install_directory" syft
+          chmod 0755 "$install_directory/syft"
+          "$install_directory/syft" version
+          printf 'path=%s\n' "$install_directory/syft" >> "$GITHUB_OUTPUT"
+
+      - name: Generate platform SBOMs
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.image.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.image.outputs.arm64_digest }}
+          ASSET_DIRECTORY: ${{ steps.assets.outputs.directory }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          SYFT_BINARY: ${{ steps.syft.outputs.path }}
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+          SYFT_REGISTRY_AUTH_AUTHORITY: ghcr.io
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          amd64_sbom="${ASSET_DIRECTORY}/shelter-${VERSION}-linux-amd64.spdx.json"
+          arm64_sbom="${ASSET_DIRECTORY}/shelter-${VERSION}-linux-arm64.spdx.json"
+          "$SYFT_BINARY" "registry:${IMAGE_NAME}@${AMD64_DIGEST}" --output "spdx-json=${amd64_sbom}"
+          "$SYFT_BINARY" "registry:${IMAGE_NAME}@${ARM64_DIGEST}" --output "spdx-json=${arm64_sbom}"
+          for sbom in "$amd64_sbom" "$arm64_sbom"; do
+            jq -e '.spdxVersion == "SPDX-2.3" and (.SPDXID | type == "string")' "$sbom" >/dev/null
+          done
+
+      - name: Attest image provenance
+        id: provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.metadata.outputs.image_name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          subject-version: ${{ steps.metadata.outputs.version }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest linux/amd64 SBOM
+        id: sbom_attestation_amd64
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.metadata.outputs.image_name }}
+          subject-digest: ${{ steps.image.outputs.amd64_digest }}
+          subject-version: ${{ steps.metadata.outputs.version }}
+          sbom-path: ${{ steps.assets.outputs.directory }}/shelter-${{ steps.metadata.outputs.version }}-linux-amd64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest linux/arm64 SBOM
+        id: sbom_attestation_arm64
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.metadata.outputs.image_name }}
+          subject-digest: ${{ steps.image.outputs.arm64_digest }}
+          subject-version: ${{ steps.metadata.outputs.version }}
+          sbom-path: ${{ steps.assets.outputs.directory }}/shelter-${{ steps.metadata.outputs.version }}-linux-arm64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify signed image attestations
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.image.outputs.amd64_digest }}
+          AMD64_SBOM_BUNDLE: ${{ steps.sbom_attestation_amd64.outputs.bundle-path }}
+          ARM64_DIGEST: ${{ steps.image.outputs.arm64_digest }}
+          ARM64_SBOM_BUNDLE: ${{ steps.sbom_attestation_arm64.outputs.bundle-path }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          certificate_identity="https://github.com/${REPOSITORY}/.github/workflows/release.yml@${SOURCE_REF}"
+          verify_attestation() {
+            local subject_name="$1"
+            local subject_digest="$2"
+            local bundle_path="$3"
+            local predicate_type="$4"
+            local verification
+            local digest_hex="${subject_digest#sha256:}"
+
+            verification="$(gh attestation verify \
+              "oci://${subject_name}@${subject_digest}" \
+              --bundle "$bundle_path" \
+              --cert-identity "$certificate_identity" \
+              --deny-self-hosted-runners \
+              --format json \
+              --predicate-type "$predicate_type" \
+              --repo "$REPOSITORY" \
+              --signer-digest "$COMMIT_SHA" \
+              --source-digest "$COMMIT_SHA" \
+              --source-ref "$SOURCE_REF")"
+
+            jq -e \
+              --arg digest "$digest_hex" \
+              --arg name "$subject_name" \
+              --arg predicate "$predicate_type" \
+              'length == 1 and all(.[];
+                .verificationResult.statement.predicateType == $predicate and
+                any(.verificationResult.statement.subject[];
+                  .name == $name and .digest.sha256 == $digest
+                )
+              )' <<< "$verification" >/dev/null
+          }
+
+          verify_attestation \
+            "$IMAGE_NAME" \
+            "$IMAGE_DIGEST" \
+            "$PROVENANCE_BUNDLE" \
+            'https://slsa.dev/provenance/v1'
+          verify_attestation \
+            "$IMAGE_NAME" \
+            "$AMD64_DIGEST" \
+            "$AMD64_SBOM_BUNDLE" \
+            'https://spdx.dev/Document/v2.3'
+          verify_attestation \
+            "$IMAGE_NAME" \
+            "$ARM64_DIGEST" \
+            "$ARM64_SBOM_BUNDLE" \
+            'https://spdx.dev/Document/v2.3'
+
+      - name: Create deterministic installer bundle
+        id: bundle
+        shell: bash
+        env:
+          ASSET_DIRECTORY: ${{ steps.assets.outputs.directory }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_REFERENCE: ${{ steps.metadata.outputs.version_reference }}
+          SOURCE_DATE_EPOCH: ${{ steps.metadata.outputs.source_date_epoch }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          bundle_name="shelter-${TAG_NAME}"
+          bundle_directory="${RUNNER_TEMP}/${bundle_name}"
+          bundle_filename="${bundle_name}.tar.gz"
+          mkdir -p "$bundle_directory"
+
+          payloads=(
+            .env.example
+            compose.yaml
+            install.sh
+            ops/create-release-manifest.sh
+            ops/download-release.sh
+            ops/install-release-bundle.sh
+            ops/lib/release-bundle.sh
+            ops/verify-release-bundle.sh
+          )
+          git archive --format=tar "$COMMIT_SHA" -- "${payloads[@]}" \
+            | tar -xf - -C "$bundle_directory"
+
+          "$bundle_directory/ops/create-release-manifest.sh" \
+            --bundle "$bundle_directory" \
+            --version "$VERSION" \
+            --commit "$COMMIT_SHA" \
+            --image-reference "$IMAGE_REFERENCE" \
+            --image-digest "$IMAGE_DIGEST"
+          "$bundle_directory/ops/verify-release-bundle.sh" \
+            --bundle "$bundle_directory" \
+            --quiet
+
+          (
+            cd "$bundle_directory"
+            tar \
+              --sort=name \
+              --format=posix \
+              --pax-option=delete=atime,delete=ctime \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              -cf - . \
+              | gzip -n -9 > "${ASSET_DIRECTORY}/${bundle_filename}"
+          )
+
+          printf 'filename=%s\n' "$bundle_filename" >> "$GITHUB_OUTPUT"
+
+      - name: Build release manifest and checksums
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.image.outputs.amd64_digest }}
+          AMD64_SBOM_ATTESTATION_BUNDLE: ${{ steps.sbom_attestation_amd64.outputs.bundle-path }}
+          AMD64_SBOM_ATTESTATION_URL: ${{ steps.sbom_attestation_amd64.outputs.attestation-url }}
+          ARM64_DIGEST: ${{ steps.image.outputs.arm64_digest }}
+          ARM64_SBOM_ATTESTATION_BUNDLE: ${{ steps.sbom_attestation_arm64.outputs.bundle-path }}
+          ARM64_SBOM_ATTESTATION_URL: ${{ steps.sbom_attestation_arm64.outputs.attestation-url }}
+          ASSET_DIRECTORY: ${{ steps.assets.outputs.directory }}
+          BUNDLE_ARCHIVE: ${{ steps.bundle.outputs.filename }}
+          COMMIT_REFERENCE: ${{ steps.metadata.outputs.commit_reference }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GENERATED_AT: ${{ steps.metadata.outputs.created }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          PROVENANCE_ATTESTATION_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          PROVENANCE_ATTESTATION_URL: ${{ steps.provenance.outputs.attestation-url }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          VERSION_REFERENCE: ${{ steps.metadata.outputs.version_reference }}
+        run: |
+          set -euo pipefail
+
+          provenance_bundle="shelter-${VERSION}-provenance.sigstore.json"
+          amd64_sbom_bundle="shelter-${VERSION}-linux-amd64-sbom-attestation.sigstore.json"
+          arm64_sbom_bundle="shelter-${VERSION}-linux-arm64-sbom-attestation.sigstore.json"
+          schema_file="shelter-release-manifest.schema.json"
+          manifest_file="shelter-${VERSION}-release-manifest.json"
+
+          install -m 0644 "$PROVENANCE_ATTESTATION_BUNDLE" "${ASSET_DIRECTORY}/${provenance_bundle}"
+          install -m 0644 "$AMD64_SBOM_ATTESTATION_BUNDLE" "${ASSET_DIRECTORY}/${amd64_sbom_bundle}"
+          install -m 0644 "$ARM64_SBOM_ATTESTATION_BUNDLE" "${ASSET_DIRECTORY}/${arm64_sbom_bundle}"
+          install -m 0644 release/manifest.schema.json "${ASSET_DIRECTORY}/${schema_file}"
+
+          export PROVENANCE_BUNDLE_FILE="$provenance_bundle"
+          export AMD64_SBOM_BUNDLE_FILE="$amd64_sbom_bundle"
+          export ARM64_SBOM_BUNDLE_FILE="$arm64_sbom_bundle"
+          export SCHEMA_FILE="$schema_file"
+          export MANIFEST_FILE="$manifest_file"
+
+          node <<'NODE'
+          const { createHash } = require('node:crypto');
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const { join } = require('node:path');
+
+          const env = process.env;
+          const checksum = (name) => createHash('sha256')
+            .update(readFileSync(join(env.ASSET_DIRECTORY, name)))
+            .digest('hex');
+          const artifact = (name, mediaType) => ({
+            name,
+            mediaType,
+            checksum: { algorithm: 'sha256', digest: checksum(name) },
+          });
+          const amd64Sbom = `shelter-${env.VERSION}-linux-amd64.spdx.json`;
+          const arm64Sbom = `shelter-${env.VERSION}-linux-arm64.spdx.json`;
+          const schemaUrl = `https://raw.githubusercontent.com/${env.REPOSITORY}/${env.TAG_NAME}/release/manifest.schema.json`;
+
+          const manifest = {
+            $schema: schemaUrl,
+            schemaVersion: 1,
+            version: env.VERSION,
+            generatedAt: env.GENERATED_AT,
+            release: {
+              tag: env.TAG_NAME,
+              url: `${env.SERVER_URL}/${env.REPOSITORY}/releases/tag/${env.TAG_NAME}`,
+            },
+            source: {
+              repository: `${env.SERVER_URL}/${env.REPOSITORY}`,
+              commit: env.COMMIT_SHA,
+            },
+            image: {
+              name: env.IMAGE_NAME,
+              digest: env.IMAGE_DIGEST,
+              reference: `${env.IMAGE_NAME}@${env.IMAGE_DIGEST}`,
+              tags: [env.VERSION_REFERENCE, env.COMMIT_REFERENCE],
+              platforms: [
+                { os: 'linux', architecture: 'amd64', digest: env.AMD64_DIGEST },
+                { os: 'linux', architecture: 'arm64', digest: env.ARM64_DIGEST },
+              ],
+            },
+            attestations: {
+              provenance: {
+                githubUrl: env.PROVENANCE_ATTESTATION_URL,
+                registry: true,
+                bundle: env.PROVENANCE_BUNDLE_FILE,
+              },
+              sbom: [
+                {
+                  platform: 'linux/amd64',
+                  githubUrl: env.AMD64_SBOM_ATTESTATION_URL,
+                  registry: true,
+                  bundle: env.AMD64_SBOM_BUNDLE_FILE,
+                },
+                {
+                  platform: 'linux/arm64',
+                  githubUrl: env.ARM64_SBOM_ATTESTATION_URL,
+                  registry: true,
+                  bundle: env.ARM64_SBOM_BUNDLE_FILE,
+                },
+              ],
+            },
+            artifacts: [
+              artifact(env.BUNDLE_ARCHIVE, 'application/gzip'),
+              artifact(amd64Sbom, 'application/spdx+json'),
+              artifact(arm64Sbom, 'application/spdx+json'),
+              artifact(env.PROVENANCE_BUNDLE_FILE, 'application/vnd.dev.sigstore.bundle+json'),
+              artifact(env.AMD64_SBOM_BUNDLE_FILE, 'application/vnd.dev.sigstore.bundle+json'),
+              artifact(env.ARM64_SBOM_BUNDLE_FILE, 'application/vnd.dev.sigstore.bundle+json'),
+              artifact(env.SCHEMA_FILE, 'application/schema+json'),
+            ],
+            checksums: {
+              algorithm: 'sha256',
+              file: 'SHA256SUMS',
+            },
+          };
+
+          writeFileSync(
+            join(env.ASSET_DIRECTORY, env.MANIFEST_FILE),
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
+          NODE
+
+          jq -e . "${ASSET_DIRECTORY}/${manifest_file}" >/dev/null
+          jq -e . "${ASSET_DIRECTORY}/${schema_file}" >/dev/null
+
+          (
+            cd "$ASSET_DIRECTORY"
+            for artifact in *; do
+              if [[ -f "$artifact" && "$artifact" != SHA256SUMS ]]; then
+                sha256sum "$artifact"
+              fi
+            done | LC_ALL=C sort -k2
+          ) > "${ASSET_DIRECTORY}/SHA256SUMS"
+
+          (
+            cd "$ASSET_DIRECTORY"
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Attest checksummed release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-checksums: ${{ steps.assets.outputs.directory }}/SHA256SUMS
+
+      - name: Upload prepared release assets before tag promotion
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shelter-release-assets-${{ github.run_id }}
+          path: ${{ steps.assets.outputs.directory }}/
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          include-hidden-files: true
+          retention-days: 7
+
+  promote:
+    name: Promote verified image tags
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOCKER_CONFIG: /tmp/shelter-docker-config-${{ github.run_id }}-${{ github.run_attempt }}-promote
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download prepared release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shelter-release-assets-${{ github.run_id }}
+          path: ${{ runner.temp }}/shelter-promotion-assets
+
+      - name: Revalidate prepared release identity
+        id: metadata
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG_NAME" == *+* || ${#TAG_NAME} -gt 128 ]]; then
+            echo "::error title=Invalid release tag::The release tag is not a supported OCI-compatible SemVer."
+            exit 1
+          fi
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
+          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+            echo "::error title=Invalid release tag::The promotion tag must use strict SemVer."
+            exit 1
+          fi
+
+          commit_sha="$(git rev-parse "${EVENT_SHA}^{commit}")"
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$commit_sha" ]] || {
+            echo "::error title=Unexpected checkout::Promotion is not running from the exact event commit."
+            exit 1
+          }
+          version="${TAG_NAME#v}"
+          asset_directory="${RUNNER_TEMP}/shelter-promotion-assets"
+          checksums_file="${asset_directory}/SHA256SUMS"
+          [[ -d "$asset_directory" && ! -L "$asset_directory" && -f "$checksums_file" && ! -L "$checksums_file" ]] || {
+            echo "::error title=Missing promotion assets::The prepared artifact or SHA256SUMS is unavailable."
+            exit 1
+          }
+
+          validation_directory="$(mktemp -d)"
+          trap 'rm -rf "$validation_directory"' EXIT
+          checksum_names="${validation_directory}/checksum-names"
+          actual_names="${validation_directory}/actual-names"
+          manifest_names="${validation_directory}/manifest-names"
+          entry_count=0
+          while IFS= read -r -d '' entry; do
+            entry_count=$((entry_count + 1))
+            filename="${entry##*/}"
+            case "$filename" in
+              [A-Za-z0-9]*) ;;
+              *) echo "::error title=Unsafe promotion asset::Unexpected filename: ${filename}"; exit 1 ;;
+            esac
+            case "$filename" in
+              *[!A-Za-z0-9._-]*) echo "::error title=Unsafe promotion asset::Unexpected filename: ${filename}"; exit 1 ;;
+            esac
+            [[ -f "$entry" && ! -L "$entry" ]] || {
+              echo "::error title=Unsafe promotion asset::Every artifact entry must be a top-level regular file."
+              exit 1
+            }
+          done < <(find "$asset_directory" -mindepth 1 -maxdepth 1 -print0)
+          if (( entry_count < 2 || entry_count > 64 )); then
+            echo "::error title=Unexpected promotion assets::The artifact entry count is invalid."
+            exit 1
+          fi
+
+          if ! awk '
+            NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-f]+$/ ||
+              $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ || $2 == "SHA256SUMS" { exit 1 }
+            seen[$2]++ { exit 1 }
+            { print $2 }
+            END { if (NR == 0) exit 1 }
+          ' "$checksums_file" | LC_ALL=C sort > "$checksum_names"; then
+            echo "::error title=Invalid promotion checksums::SHA256SUMS is malformed or unsafe."
+            exit 1
+          fi
+          find "$asset_directory" -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+            | LC_ALL=C sort > "$actual_names"
+          cmp -s "$checksum_names" "$actual_names" || {
+            echo "::error title=Unchecksummed promotion asset::The artifact contains a missing or extra checksummed file."
+            exit 1
+          }
+          (
+            cd "$asset_directory"
+            sha256sum -c SHA256SUMS
+          )
+
+          manifest_filename="shelter-${version}-release-manifest.json"
+          manifest_path="${asset_directory}/${manifest_filename}"
+          [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || {
+            echo "::error title=Missing promotion manifest::The checksummed release manifest is unavailable."
+            exit 1
+          }
+          repository_lower="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image_name="ghcr.io/${repository_lower}"
+          version_reference="${image_name}:${TAG_NAME}"
+          commit_reference="${image_name}:sha-${commit_sha}"
+          bundle_filename="shelter-${TAG_NAME}.tar.gz"
+          if ! jq -e \
+            --arg bundle "$bundle_filename" \
+            --arg commit "$commit_sha" \
+            --arg commit_reference "$commit_reference" \
+            --arg image_name "$image_name" \
+            --arg tag "$TAG_NAME" \
+            --arg version "$version" \
+            --arg version_reference "$version_reference" '
+              .schemaVersion == 1 and
+              .version == $version and
+              .release.tag == $tag and
+              .source.commit == $commit and
+              .image.name == $image_name and
+              (.image.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              .image.reference == ($image_name + "@" + .image.digest) and
+              .image.tags == [$version_reference, $commit_reference] and
+              (.image.platforms | type == "array" and length == 2) and
+              ([.image.platforms[] | .os + "/" + .architecture] | sort) == ["linux/amd64", "linux/arm64"] and
+              all(.image.platforms[]; (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))) and
+              .checksums.algorithm == "sha256" and .checksums.file == "SHA256SUMS" and
+              (.artifacts | type == "array" and length == 7) and
+              ([.artifacts[].name] | unique | length) == 7 and
+              all(.artifacts[];
+                (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+                .checksum.algorithm == "sha256" and
+                (.checksum.digest | type == "string" and test("^[0-9a-f]{64}$"))
+              ) and
+              ([.artifacts[].name] | sort) == ([
+                $bundle,
+                ("shelter-" + $version + "-linux-amd64.spdx.json"),
+                ("shelter-" + $version + "-linux-arm64.spdx.json"),
+                ("shelter-" + $version + "-provenance.sigstore.json"),
+                ("shelter-" + $version + "-linux-amd64-sbom-attestation.sigstore.json"),
+                ("shelter-" + $version + "-linux-arm64-sbom-attestation.sigstore.json"),
+                "shelter-release-manifest.schema.json"
+              ] | sort)
+            ' "$manifest_path" >/dev/null; then
+            echo "::error title=Promotion manifest mismatch::The prepared image or asset identity does not match this event."
+            exit 1
+          fi
+          {
+            jq -r '.artifacts[].name' "$manifest_path"
+            printf '%s\n' "$manifest_filename"
+          } | LC_ALL=C sort > "$manifest_names"
+          cmp -s "$checksum_names" "$manifest_names" || {
+            echo "::error title=Unexpected promotion asset::The manifest does not declare the exact checksummed asset set."
+            exit 1
+          }
+
+          {
+            printf 'amd64_digest=%s\n' "$(jq -er '.image.platforms[] | select(.os == "linux" and .architecture == "amd64") | .digest' "$manifest_path")"
+            printf 'arm64_digest=%s\n' "$(jq -er '.image.platforms[] | select(.os == "linux" and .architecture == "arm64") | .digest' "$manifest_path")"
+            printf 'asset_directory=%s\n' "$asset_directory"
+            printf 'commit_reference=%s\n' "$commit_reference"
+            printf 'commit_sha=%s\n' "$commit_sha"
+            printf 'image_digest=%s\n' "$(jq -er '.image.digest' "$manifest_path")"
+            printf 'image_name=%s\n' "$image_name"
+            printf 'version=%s\n' "$version"
+            printf 'version_reference=%s\n' "$version_reference"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned Docker Buildx
+        shell: bash
+        env:
+          BUILDX_BINARY_SHA256: d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda
+          BUILDX_VERSION: 0.35.0
+        run: |
+          set -euo pipefail
+          download="${RUNNER_TEMP}/buildx-v${BUILDX_VERSION}.linux-amd64"
+          plugin="${DOCKER_CONFIG}/cli-plugins/docker-buildx"
+          mkdir -p "$(dirname "$plugin")"
+          curl --fail --location --proto '=https' --retry 3 --show-error --silent --tlsv1.2 \
+            --output "$download" \
+            "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64"
+          printf '%s  %s\n' "$BUILDX_BINARY_SHA256" "$download" | sha256sum -c -
+          install -m 0755 "$download" "$plugin"
+          printf '%s  %s\n' "$BUILDX_BINARY_SHA256" "$plugin" | sha256sum -c -
+          docker buildx version | grep -Eq '^github.com/docker/buildx v0\.35\.0([[:space:]]|$)'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reverify promoted image source and signatures
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.metadata.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.metadata.outputs.arm64_digest }}
+          ASSET_DIRECTORY: ${{ steps.metadata.outputs.asset_directory }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.metadata.outputs.image_digest }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          manifest="$(docker buildx imagetools inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" --format '{{json .Manifest}}')"
+          [[ "$(jq -er '.digest' <<< "$manifest")" == "$IMAGE_DIGEST" ]] || {
+            echo "::error title=Promotion source digest mismatch::The registry object differs from the prepared manifest."
+            exit 1
+          }
+          for digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            jq -e --arg digest "$digest" 'any(.manifests[]; .digest == $digest)' <<< "$manifest" >/dev/null
+          done
+
+          certificate_identity="https://github.com/${REPOSITORY}/.github/workflows/release.yml@${SOURCE_REF}"
+          verify_attestation() {
+            local digest="$1"
+            local bundle="$2"
+            local predicate="$3"
+            gh attestation verify \
+              "oci://${IMAGE_NAME}@${digest}" \
+              --bundle "$bundle" \
+              --cert-identity "$certificate_identity" \
+              --deny-self-hosted-runners \
+              --predicate-type "$predicate" \
+              --repo "$REPOSITORY" \
+              --signer-digest "$COMMIT_SHA" \
+              --source-digest "$COMMIT_SHA" \
+              --source-ref "$SOURCE_REF" >/dev/null
+          }
+          verify_attestation \
+            "$IMAGE_DIGEST" \
+            "${ASSET_DIRECTORY}/shelter-${VERSION}-provenance.sigstore.json" \
+            'https://slsa.dev/provenance/v1'
+          verify_attestation \
+            "$AMD64_DIGEST" \
+            "${ASSET_DIRECTORY}/shelter-${VERSION}-linux-amd64-sbom-attestation.sigstore.json" \
+            'https://spdx.dev/Document/v2.3'
+          verify_attestation \
+            "$ARM64_DIGEST" \
+            "${ASSET_DIRECTORY}/shelter-${VERSION}-linux-arm64-sbom-attestation.sigstore.json" \
+            'https://spdx.dev/Document/v2.3'
+
+      - name: Revalidate release source before promotion
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/promote-tag"
+          [[ "$(git rev-parse 'refs/shelter-release/promote-tag^{commit}')" == "$COMMIT_SHA" ]] || {
+            echo "::error title=Release tag moved::The remote tag differs from the prepared commit."
+            exit 1
+          }
+          git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main || {
+            echo "::error title=Release commit is no longer on main::Promotion was refused."
+            exit 1
+          }
+          [[ "$(gh api "/repos/${REPOSITORY}/immutable-releases" --jq '.enabled')" == "true" ]] || {
+            echo "::error title=Immutable releases disabled::Promotion was refused."
+            exit 1
+          }
+          releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100")"
+          if jq -e --arg tag "$TAG_NAME" 'any(.[][]; .tag_name == $tag)' <<< "$releases" >/dev/null; then
+            echo "::error title=Release already exists::Promotion will not run after a release or draft has appeared."
+            exit 1
+          fi
+
+      - name: Promote final tags idempotently
+        shell: bash
+        env:
+          COMMIT_REFERENCE: ${{ steps.metadata.outputs.commit_reference }}
+          IMAGE_DIGEST: ${{ steps.metadata.outputs.image_digest }}
+          IMAGE_NAME: ${{ steps.metadata.outputs.image_name }}
+          VERSION_REFERENCE: ${{ steps.metadata.outputs.version_reference }}
+        run: |
+          set -euo pipefail
+
+          inspect_tag() {
+            local reference="$1"
+            local error_file
+            local manifest
+            error_file="$(mktemp)"
+            if manifest="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' 2> "$error_file")"; then
+              rm -f "$error_file"
+              jq -er '.digest' <<< "$manifest"
+              return 0
+            fi
+            if grep -Eqi '(manifest unknown|name unknown|not found|status code: 404|unexpected status.*404)' "$error_file"; then
+              rm -f "$error_file"
+              printf 'absent\n'
+              return 0
+            fi
+            echo "::error title=Unable to inspect final image tag::No definitive registry state for ${reference}." >&2
+            rm -f "$error_file"
+            return 1
+          }
+          verify_tag() {
+            local reference="$1"
+            local actual=
+            local attempt
+            for attempt in 1 2 3 4 5 6; do
+              if actual="$(inspect_tag "$reference")" && [[ "$actual" == "$IMAGE_DIGEST" ]]; then
+                return 0
+              fi
+              [[ "$attempt" -eq 6 ]] || sleep 5
+            done
+            echo "::error title=Final tag verification failed::${reference} resolved to ${actual:-an unavailable digest}."
+            return 1
+          }
+          promote_tag() {
+            local reference="$1"
+            local state
+            state="$(inspect_tag "$reference")" || return 1
+            if [[ "$state" == "$IMAGE_DIGEST" ]]; then
+              echo "${reference} is already promoted to the verified digest."
+            elif [[ "$state" == "absent" ]]; then
+              if ! docker buildx imagetools create --tag "$reference" "${IMAGE_NAME}@${IMAGE_DIGEST}"; then
+                state="$(inspect_tag "$reference")" || return 1
+                [[ "$state" == "$IMAGE_DIGEST" ]] || {
+                  echo "::error title=Final image promotion failed::${reference} was not promoted."
+                  return 1
+                }
+              fi
+            else
+              echo "::error title=Final tag collision::${reference} resolves to ${state}; it will not be overwritten."
+              return 1
+            fi
+            verify_tag "$reference"
+          }
+
+          promote_tag "$COMMIT_REFERENCE"
+          promote_tag "$VERSION_REFERENCE"
+
+  publish:
+    name: Publish immutable release
+    needs: promote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out exact release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download prepared release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shelter-release-assets-${{ github.run_id }}
+          path: ${{ runner.temp }}/shelter-release-assets
+
+      - name: Verify assets and reconstruct release metadata
+        id: metadata
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG_NAME" == *+* ]]; then
+            echo "::error title=Unsupported release tag::SemVer build metadata is not supported because OCI image tags cannot contain '+'."
+            exit 1
+          fi
+          if (( ${#TAG_NAME} > 128 )); then
+            echo "::error title=Release tag too long::Release tags cannot exceed OCI's 128-character tag limit."
+            exit 1
+          fi
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
+          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+            echo "::error title=Invalid release tag::Release tags must use strict SemVer without numeric prerelease leading zeros."
+            exit 1
+          fi
+
+          commit_sha="$(git rev-parse "${EVENT_SHA}^{commit}")"
+          checked_out_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ "$checked_out_sha" != "$commit_sha" ]]; then
+            echo "::error title=Unexpected checkout::The publish job is not using the exact event commit."
+            exit 1
+          fi
+
+          version="${TAG_NAME#v}"
+          asset_directory="${RUNNER_TEMP}/shelter-release-assets"
+          checksums_file="${asset_directory}/SHA256SUMS"
+          [[ -d "$asset_directory" && ! -L "$asset_directory" ]] || {
+            echo "::error title=Missing release assets::The downloaded artifact directory is unavailable or unsafe."
+            exit 1
+          }
+
+          entry_count=0
+          while IFS= read -r -d '' entry; do
+            entry_count=$((entry_count + 1))
+            if (( entry_count > 64 )); then
+              echo "::error title=Too many release assets::The prepared artifact contains an unexpected number of entries."
+              exit 1
+            fi
+            filename="${entry##*/}"
+            case "$filename" in
+              [A-Za-z0-9]*) ;;
+              *)
+                echo "::error title=Unsafe release asset::Unexpected filename: ${filename}"
+                exit 1
+                ;;
+            esac
+            case "$filename" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error title=Unsafe release asset::Unexpected filename: ${filename}"
+                exit 1
+                ;;
+            esac
+            if [[ ! -f "$entry" || -L "$entry" ]]; then
+              echo "::error title=Unsafe release asset::Every artifact entry must be a top-level regular file."
+              exit 1
+            fi
+          done < <(find "$asset_directory" -mindepth 1 -maxdepth 1 -print0)
+          if (( entry_count < 2 )); then
+            echo "::error title=Incomplete release assets::The prepared artifact is empty or incomplete."
+            exit 1
+          fi
+          [[ -f "$checksums_file" && ! -L "$checksums_file" ]] || {
+            echo "::error title=Missing checksums::SHA256SUMS is required."
+            exit 1
+          }
+
+          validation_directory="$(mktemp -d)"
+          trap 'rm -rf "$validation_directory"' EXIT
+          checksum_names_unsorted="${validation_directory}/checksum-names.unsorted"
+          checksum_names="${validation_directory}/checksum-names"
+          actual_names="${validation_directory}/actual-names"
+          manifest_names="${validation_directory}/manifest-names"
+
+          if ! awk '
+            NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-f]+$/ ||
+              $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ || $2 == "SHA256SUMS" { exit 1 }
+            seen[$2]++ { exit 1 }
+            { print $2 }
+            END { if (NR == 0) exit 1 }
+          ' "$checksums_file" > "$checksum_names_unsorted"; then
+            echo "::error title=Invalid checksums::SHA256SUMS contains an invalid, duplicate, or unsafe entry."
+            exit 1
+          fi
+          LC_ALL=C sort "$checksum_names_unsorted" > "$checksum_names"
+          find "$asset_directory" -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+            | LC_ALL=C sort > "$actual_names"
+          if ! cmp -s "$checksum_names" "$actual_names"; then
+            echo "::error title=Unchecksummed release asset::Every downloaded asset must appear exactly once in SHA256SUMS, with no extra entries."
+            exit 1
+          fi
+          (
+            cd "$asset_directory"
+            sha256sum -c SHA256SUMS
+          )
+
+          manifest_filename="shelter-${version}-release-manifest.json"
+          manifest_path="${asset_directory}/${manifest_filename}"
+          [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || {
+            echo "::error title=Missing release manifest::The checksummed release manifest was not found."
+            exit 1
+          }
+
+          repository_lower="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image_name="ghcr.io/${repository_lower}"
+          version_reference="${image_name}:${TAG_NAME}"
+          commit_reference="${image_name}:sha-${commit_sha}"
+          repository_url="${SERVER_URL}/${REPOSITORY}"
+          release_url="${repository_url}/releases/tag/${TAG_NAME}"
+          schema_url="https://raw.githubusercontent.com/${REPOSITORY}/${TAG_NAME}/release/manifest.schema.json"
+          bundle_filename="shelter-${TAG_NAME}.tar.gz"
+
+          if ! jq -e \
+            --arg bundle "$bundle_filename" \
+            --arg commit "$commit_sha" \
+            --arg commit_reference "$commit_reference" \
+            --arg image_name "$image_name" \
+            --arg release_url "$release_url" \
+            --arg repository "$repository_url" \
+            --arg schema "$schema_url" \
+            --arg tag "$TAG_NAME" \
+            --arg version "$version" \
+            --arg version_reference "$version_reference" '
+              .schemaVersion == 1 and
+              .version == $version and
+              .release.tag == $tag and
+              .release.url == $release_url and
+              .source.repository == $repository and
+              .source.commit == $commit and
+              .["$schema"] == $schema and
+              .image.name == $image_name and
+              (.image.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              .image.reference == ($image_name + "@" + .image.digest) and
+              .image.tags == [$version_reference, $commit_reference] and
+              (.image.platforms | type == "array" and length == 2) and
+              ([.image.platforms[] | .os + "/" + .architecture] | sort) == ["linux/amd64", "linux/arm64"] and
+              all(.image.platforms[]; (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))) and
+              .checksums.algorithm == "sha256" and
+              .checksums.file == "SHA256SUMS" and
+              (.artifacts | type == "array" and length == 7) and
+              ([.artifacts[].name] | unique | length) == 7 and
+              all(.artifacts[];
+                (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+                .checksum.algorithm == "sha256" and
+                (.checksum.digest | type == "string" and test("^[0-9a-f]{64}$"))
+              ) and
+              ([.artifacts[].name] | sort) == ([
+                $bundle,
+                ("shelter-" + $version + "-linux-amd64.spdx.json"),
+                ("shelter-" + $version + "-linux-arm64.spdx.json"),
+                ("shelter-" + $version + "-provenance.sigstore.json"),
+                ("shelter-" + $version + "-linux-amd64-sbom-attestation.sigstore.json"),
+                ("shelter-" + $version + "-linux-arm64-sbom-attestation.sigstore.json"),
+                "shelter-release-manifest.schema.json"
+              ] | sort)
+            ' "$manifest_path" >/dev/null; then
+            echo "::error title=Release manifest mismatch::The manifest does not match the event commit, repository, tag, image, or exact asset contract."
+            exit 1
+          fi
+
+          {
+            jq -r '.artifacts[].name' "$manifest_path"
+            printf '%s\n' "$manifest_filename"
+          } | LC_ALL=C sort > "$manifest_names"
+          if ! cmp -s "$checksum_names" "$manifest_names"; then
+            echo "::error title=Unexpected release asset::The checksum list contains an asset not declared by the exact release manifest contract."
+            exit 1
+          fi
+
+          while IFS=$'\t' read -r artifact_digest artifact_name; do
+            checksum_digest="$(awk -v name="$artifact_name" '$2 == name { print $1 }' "$checksums_file")"
+            if [[ "$checksum_digest" != "$artifact_digest" ]]; then
+              echo "::error title=Manifest checksum mismatch::The manifest checksum for ${artifact_name} does not match SHA256SUMS."
+              exit 1
+            fi
+          done < <(jq -r '.artifacts[] | [.checksum.digest, .name] | @tsv' "$manifest_path")
+
+          image_reference="$(jq -er '.image.reference' "$manifest_path")"
+          checksums_sha256="$(sha256sum "$checksums_file" | awk '{ print $1 }')"
+          if [[ ! "$checksums_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error title=Invalid checksum identity::Unable to bind the publish operation to SHA256SUMS."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            printf 'asset_directory=%s\n' "$asset_directory"
+            printf 'checksums_sha256=%s\n' "$checksums_sha256"
+            printf 'commit_sha=%s\n' "$commit_sha"
+            printf 'image_reference=%s\n' "$image_reference"
+            printf 'prerelease=%s\n' "$prerelease"
+            printf 'version=%s\n' "$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Revalidate immutable release preconditions
+        shell: bash
+        env:
+          CHECKSUMS_SHA256: ${{ steps.metadata.outputs.checksums_sha256 }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/publish-tag"
+          remote_tag_commit="$(git rev-parse 'refs/shelter-release/publish-tag^{commit}')"
+          if [[ "$remote_tag_commit" != "$COMMIT_SHA" ]]; then
+            echo "::error title=Release tag moved::The remote tag no longer resolves to the event commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main; then
+            echo "::error title=Release commit is no longer on main::The exact event commit must remain an ancestor of origin/main."
+            exit 1
+          fi
+
+          immutable_error="$(mktemp)"
+          releases_error="$(mktemp)"
+          trap 'rm -f "$immutable_error" "$releases_error"' EXIT
+          if ! immutable_state="$(gh api "/repos/${REPOSITORY}/immutable-releases" 2> "$immutable_error")"; then
+            echo "::error title=Unable to verify immutable releases::The repository setting could not be read."
+            exit 1
+          fi
+          immutable_enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else "invalid" end' <<< "$immutable_state")"
+          case "$immutable_enabled" in
+            true) ;;
+            false)
+              echo "::error title=Immutable releases disabled::The GitHub Release will not be published."
+              exit 1
+              ;;
+            *)
+              echo "::error title=Invalid immutable-release response::GitHub returned an unexpected repository setting."
+              exit 1
+              ;;
+          esac
+
+          if ! releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100" 2> "$releases_error")"; then
+            echo "::error title=Unable to check existing releases::The GitHub Release will not be published without a definitive API response."
+            exit 1
+          fi
+          matching_releases="$(jq -c --arg tag "$TAG_NAME" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"
+          release_count="$(jq -r 'length' <<< "$matching_releases")"
+          if [[ "$release_count" == "0" ]]; then
+            exit 0
+          fi
+          if [[ "$release_count" != "1" ]]; then
+            echo "::error title=Ambiguous release state::More than one release or draft uses ${TAG_NAME}."
+            exit 1
+          fi
+
+          release="$(jq -c '.[0]' <<< "$matching_releases")"
+          marker="<!-- shelter-release:v1 run=${RUN_ID} commit=${COMMIT_SHA} checksums=${CHECKSUMS_SHA256} -->"
+          if ! jq -e --arg marker "$marker" '
+            [((.body // "") | split("\n")[]) | select(startswith("<!-- shelter-release:"))] == [$marker]
+          ' <<< "$release" >/dev/null; then
+            echo "::error title=Foreign release state::The existing release or draft is not bound to this workflow run, commit, and checksummed asset set."
+            exit 1
+          fi
+          if [[ "$(jq -r '.draft' <<< "$release")" == "true" ]]; then
+            echo "A workflow-owned draft will be resumed after its assets are reverified."
+          elif [[ "$(jq -r '.immutable' <<< "$release")" == "true" ]]; then
+            echo "The workflow-owned immutable release already exists and will be verified idempotently."
+          else
+            echo "::error title=Unsafe existing release::Only the exact workflow-owned draft or an already immutable release may be resumed."
+            exit 1
+          fi
+
+      - name: Create or resume verified draft release
+        shell: bash
+        env:
+          ASSET_DIRECTORY: ${{ steps.metadata.outputs.asset_directory }}
+          CHECKSUMS_SHA256: ${{ steps.metadata.outputs.checksums_sha256 }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REFERENCE: ${{ steps.metadata.outputs.image_reference }}
+          PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' assets < <(find "$ASSET_DIRECTORY" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
+          marker="<!-- shelter-release:v1 run=${RUN_ID} commit=${COMMIT_SHA} checksums=${CHECKSUMS_SHA256} -->"
+          notes="$(cat <<EOF
+          ${marker}
+
+          ### Verified container image
+
+          \`${IMAGE_REFERENCE}\`
+
+          The attached installer bundle and release manifest record the source commit, multi-platform image digests, SBOMs, GitHub artifact attestations, and SHA-256 checksums.
+          EOF
+          )"
+
+          expected_assets="$({
+            for asset in "${assets[@]}"; do
+              jq -n \
+                --arg digest "sha256:$(sha256sum "$asset" | awk '{ print $1 }')" \
+                --arg name "${asset##*/}" \
+                --argjson size "$(stat -c '%s' "$asset")" \
+                '{name: $name, digest: $digest, size: $size}'
+            done
+          } | jq -s 'sort_by(.name)')"
+
+          matching_releases() {
+            gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100" \
+              | jq -c --arg tag "$TAG_NAME" '[.[][] | select(.tag_name == $tag)]'
+          }
+          marker_matches() {
+            jq -e --arg marker "$marker" '
+              [((.body // "") | split("\n")[]) | select(startswith("<!-- shelter-release:"))] == [$marker]
+            ' >/dev/null
+          }
+          remote_assets() {
+            local release_id="$1"
+            gh api --paginate --slurp "/repos/${REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+              | jq -c '[.[][] | {name, digest, size}] | sort_by(.name)'
+          }
+          assets_match() {
+            local release_id="$1"
+            local remote
+            local attempt
+            for attempt in 1 2 3 4 5 6; do
+              remote="$(remote_assets "$release_id")"
+              if jq -n -e \
+                --argjson expected "$expected_assets" \
+                --argjson remote "$remote" \
+                '$remote == $expected' >/dev/null; then
+                return 0
+              fi
+              [[ "$attempt" -eq 6 ]] || sleep 5
+            done
+            return 1
+          }
+          require_owned_release() {
+            local release="$1"
+            local expected_prerelease=false
+            if [[ "$PRERELEASE" == "true" ]]; then
+              expected_prerelease=true
+            fi
+            marker_matches <<< "$release" || return 1
+            jq -e \
+              --arg title "Shelter ${VERSION}" \
+              --argjson prerelease "$expected_prerelease" '
+                .name == $title and .prerelease == $prerelease
+              ' <<< "$release" >/dev/null
+          }
+
+          releases="$(matching_releases)"
+          release_count="$(jq -r 'length' <<< "$releases")"
+          if [[ "$release_count" == "0" ]]; then
+            create_arguments=(
+              release create "$TAG_NAME"
+              --repo "$REPOSITORY"
+              --verify-tag
+              --draft
+              --title "Shelter ${VERSION}"
+              --generate-notes
+              --notes "$notes"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              create_arguments+=(--prerelease)
+            fi
+            if ! gh "${create_arguments[@]}"; then
+              echo "Draft creation returned an error; checking whether GitHub committed the exact owned draft."
+            fi
+            releases="$(matching_releases)"
+            release_count="$(jq -r 'length' <<< "$releases")"
+          fi
+
+          if [[ "$release_count" != "1" ]]; then
+            echo "::error title=Ambiguous draft state::Expected exactly one workflow-owned release or draft for ${TAG_NAME}."
+            exit 1
+          fi
+          release="$(jq -c '.[0]' <<< "$releases")"
+          if ! require_owned_release "$release"; then
+            echo "::error title=Foreign release state::The existing release or draft marker, title, or prerelease state differs. No assets were changed."
+            exit 1
+          fi
+          release_id="$(jq -er '.id' <<< "$release")"
+
+          if [[ "$(jq -r '.draft' <<< "$release")" != "true" ]]; then
+            if [[ "$(jq -r '.immutable' <<< "$release")" != "true" ]]; then
+              echo "::error title=Published release is mutable::Refusing to accept or change the existing release."
+              exit 1
+            fi
+            if ! assets_match "$release_id"; then
+              echo "::error title=Published asset mismatch::The existing immutable release does not contain the exact prepared asset set."
+              exit 1
+            fi
+            echo "The exact workflow-owned immutable release already exists; continuing to cryptographic verification."
+            exit 0
+          fi
+
+          existing_assets="$(remote_assets "$release_id")"
+          if ! jq -n -e \
+            --argjson expected "$expected_assets" \
+            --argjson remote "$existing_assets" '
+              all($remote[]; .name as $name | any($expected[]; .name == $name))
+            ' >/dev/null; then
+            echo "::error title=Unexpected draft asset::The owned draft contains an asset outside the exact prepared set. Nothing was deleted."
+            exit 1
+          fi
+
+          if ! gh release upload "$TAG_NAME" "${assets[@]}" --clobber --repo "$REPOSITORY"; then
+            echo "Draft upload returned an error; checking whether every exact asset reached GitHub."
+          fi
+          if ! assets_match "$release_id"; then
+            echo "::error title=Incomplete draft assets::The draft does not contain the exact prepared asset names, sizes, and SHA-256 digests."
+            exit 1
+          fi
+
+          # Revalidate source and immutable-release policy immediately before
+          # the only transition that makes the draft public and immutable.
+          git fetch --force --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/final-draft-tag"
+          [[ "$(git rev-parse 'refs/shelter-release/final-draft-tag^{commit}')" == "$COMMIT_SHA" ]] || {
+            echo "::error title=Release tag moved::The owned draft remains unpublished."
+            exit 1
+          }
+          git merge-base --is-ancestor "$COMMIT_SHA" refs/remotes/origin/main || {
+            echo "::error title=Release commit is no longer on main::The owned draft remains unpublished."
+            exit 1
+          }
+          [[ "$(gh api "/repos/${REPOSITORY}/immutable-releases" --jq '.enabled')" == "true" ]] || {
+            echo "::error title=Immutable releases disabled::The owned draft remains unpublished."
+            exit 1
+          }
+
+          release="$(gh api "/repos/${REPOSITORY}/releases/${release_id}")"
+          if ! require_owned_release "$release"; then
+            echo "::error title=Draft marker changed::The draft is no longer owned by this exact run and will not be published."
+            exit 1
+          fi
+          if ! assets_match "$release_id"; then
+            echo "::error title=Draft assets changed::The exact prepared asset set is no longer present; the draft remains unpublished."
+            exit 1
+          fi
+          if [[ "$(jq -r '.draft' <<< "$release")" == "true" ]]; then
+            if ! gh api \
+              --method PATCH \
+              "/repos/${REPOSITORY}/releases/${release_id}" \
+              -F draft=false >/dev/null; then
+              echo "Draft publication returned an error; checking the definitive release state."
+            fi
+          fi
+          release="$(gh api "/repos/${REPOSITORY}/releases/${release_id}")"
+          if ! require_owned_release "$release" || [[ "$(jq -r '.draft' <<< "$release")" != "false" ]]; then
+            echo "::error title=Release publication incomplete::The exact owned draft was not published."
+            exit 1
+          fi
+
+      - name: Verify immutable GitHub Release
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/published-tag"
+          published_tag_commit="$(git rev-parse 'refs/shelter-release/published-tag^{commit}')"
+          if [[ "$published_tag_commit" != "$COMMIT_SHA" ]]; then
+            echo "::error title=Published tag mismatch::The published release tag does not resolve to the exact event commit."
+            exit 1
+          fi
+
+          immutable="$(gh release view "$TAG_NAME" --repo "$REPOSITORY" --json isImmutable --jq '.isImmutable')"
+          if [[ "$immutable" != "true" ]]; then
+            echo "::error title=Release is mutable::Enable immutable releases before publishing production releases."
+            exit 1
+          fi
+
+          verified=false
+          for attempt in 1 2 3 4 5 6; do
+            if gh release verify "$TAG_NAME" --repo "$REPOSITORY"; then
+              verified=true
+              break
+            fi
+            if [[ "$attempt" -lt 6 ]]; then
+              sleep 5
+            fi
+          done
+          if [[ "$verified" != "true" ]]; then
+            echo "::error title=Release attestation unavailable::GitHub did not provide a valid immutable release attestation."
+            exit 1
+          fi
+
+      - name: Publish release digest summary
+        shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.metadata.outputs.image_reference }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## Shelter release published'
+            echo
+            printf -- '- Image: `%s`\n' "$IMAGE_REFERENCE"
+            printf -- '- Release: %s\n' "$RELEASE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

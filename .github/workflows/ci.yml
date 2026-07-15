@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: true
+
+jobs:
+  application:
+    name: Application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check, test, and build
+        run: npm run check
+
+  installer:
+    name: Installer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          dash -n install.sh \
+            ops/create-release-manifest.sh \
+            ops/download-release.sh \
+            ops/install-release-bundle.sh \
+            ops/lib/release-bundle.sh \
+            ops/verify-release-bundle.sh
+          bash -n ops/deploy.sh test/install.test.sh test/release-bundle.test.sh
+
+      - name: Test installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash test/install.test.sh
+          bash test/release-bundle.test.sh
+
+  compose:
+    name: Compose configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate Compose configuration
+        shell: bash
+        env:
+          APP_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
+        run: |
+          set -euo pipefail
+          trap 'rm -f .env' EXIT
+          cp .env.example .env
+          docker compose config --quiet
+
+  container:
+    name: Container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate Dockerfile
+        run: docker build --check .
+
+      - name: Build control-plane image
+        run: docker build --pull --tag "shelter-ci:${GITHUB_SHA}" .

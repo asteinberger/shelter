@@ -3,7 +3,7 @@ set -eu
 
 umask 077
 
-INSTALLER_VERSION="0.2.0"
+INSTALLER_VERSION="0.3.0"
 ROLLBACK_HELPER_IMAGE="shelter/control-plane:rollback"
 ROLLBACK_IMAGE_PREFIX="shelter/control-plane:rollback-"
 HEALTH_ATTEMPTS=${SHELTER_INSTALL_HEALTH_ATTEMPTS:-90}
@@ -37,6 +37,7 @@ install_log="$script_dir/.shelter-install.log"
 install_log_started=0
 control_plane_stopped=0
 rollback_fail_closed=0
+release_identity_fail_closed=0
 rollback_compose_file=
 rollback_validation_image=
 api_was_running=0
@@ -60,6 +61,22 @@ previous_revision=
 new_image_id=
 new_revision=
 prior_control_plane_found=0
+previous_image_reference=
+preloaded_control_plane_image=${SHELTER_INSTALL_PRELOADED_IMAGE:-}
+preloaded_control_plane_image_id=${SHELTER_INSTALL_PRELOADED_IMAGE_ID:-}
+release_revision=${SHELTER_INSTALL_RELEASE_REVISION:-}
+release_install=0
+release_compose_bound=0
+
+shelter_compose() {
+  if [ "$release_compose_bound" -eq 1 ]; then
+    COMPOSE_FILE="$script_dir/compose.yaml" \
+    COMPOSE_PATH_SEPARATOR=: \
+      docker compose --env-file "$script_dir/.env" -f "$script_dir/compose.yaml" "$@"
+  else
+    docker compose "$@"
+  fi
+}
 
 reset=''
 bold=''
@@ -84,9 +101,12 @@ cleanup() {
     active_pid=
   fi
 
-  if [ "$rollback_fail_closed" -eq 1 ]; then
+  if [ "$release_identity_fail_closed" -eq 1 ]; then
+    printf '\n%s[ERROR]%s The running release image identity could not be proven. API and worker are being left stopped.\n' "$red" "$reset" >&2
+    shelter_compose stop -t 30 worker api >/dev/null 2>&1 || true
+  elif [ "$rollback_fail_closed" -eq 1 ]; then
     printf '\n%s[ERROR]%s Rollback safety could not be proven. API and worker are being left stopped.\n' "$red" "$reset" >&2
-    docker compose stop -t 30 worker api >/dev/null 2>&1 || true
+    shelter_compose stop -t 30 worker api >/dev/null 2>&1 || true
     if [ -n "$rollback_compose_file" ] && [ -f "$rollback_compose_file" ]; then
       docker compose --env-file .env -f "$rollback_compose_file" stop -t 30 worker api >/dev/null 2>&1 || true
     fi
@@ -94,16 +114,16 @@ cleanup() {
   elif [ "$control_plane_stopped" -eq 1 ]; then
     printf '\n%s[WARN]%s Restoring the API and worker to their previous running or stopped state.\n' "$yellow" "$reset" >&2
     if [ "$worker_was_running" -eq 0 ]; then
-      docker compose stop -t 30 worker >/dev/null 2>&1 || true
+      shelter_compose stop -t 30 worker >/dev/null 2>&1 || true
     fi
     if [ "$api_was_running" -eq 0 ]; then
-      docker compose stop -t 30 api >/dev/null 2>&1 || true
+      shelter_compose stop -t 30 api >/dev/null 2>&1 || true
     fi
     if [ "$api_was_running" -eq 1 ]; then
-      docker compose start api >/dev/null 2>&1 || true
+      shelter_compose start api >/dev/null 2>&1 || true
     fi
     if [ "$worker_was_running" -eq 1 ]; then
-      docker compose start worker >/dev/null 2>&1 || true
+      shelter_compose start worker >/dev/null 2>&1 || true
     fi
   fi
 
@@ -256,6 +276,39 @@ if [ "$mode" != install ]; then
   [ "$no_pull" -eq 0 ] || usage_error "--no-pull is only available for installation"
 fi
 
+if [ -n "$preloaded_control_plane_image" ] || [ -n "$preloaded_control_plane_image_id" ] || [ -n "$release_revision" ]; then
+  [ "$mode" = install ] || usage_error "the internal release-image contract is only available for installation"
+  [ -n "$preloaded_control_plane_image" ] && [ -n "$preloaded_control_plane_image_id" ] && [ -n "$release_revision" ] ||
+    usage_error "the internal release-image contract is incomplete; use ops/install-release-bundle.sh"
+  case "$preloaded_control_plane_image" in
+    [A-Za-z0-9]*) ;;
+    *) usage_error "the preloaded release image must start with a letter or number" ;;
+  esac
+  case "$preloaded_control_plane_image" in
+    *[!A-Za-z0-9./:_-]*|*@*) usage_error "the preloaded release image must be a taggable local reference" ;;
+  esac
+  [ "${#preloaded_control_plane_image}" -le 256 ] || usage_error "the preloaded release image reference is too long"
+
+  preloaded_control_plane_image_hex=${preloaded_control_plane_image_id#sha256:}
+  [ "$preloaded_control_plane_image_hex" != "$preloaded_control_plane_image_id" ] ||
+    usage_error "the preloaded release image identity must use sha256"
+  case "$preloaded_control_plane_image_hex" in
+    ''|*[!0-9a-f]*) usage_error "the preloaded release image identity is invalid" ;;
+  esac
+  [ "${#preloaded_control_plane_image_hex}" -eq 64 ] || usage_error "the preloaded release image identity is invalid"
+
+  case "$release_revision" in
+    release:[A-Za-z0-9]*) ;;
+    *) usage_error "the release revision is invalid" ;;
+  esac
+  case "$release_revision" in
+    *[!A-Za-z0-9:._-]*) usage_error "the release revision is invalid" ;;
+  esac
+  [ "${#release_revision}" -le 128 ] || usage_error "the release revision is too long"
+  release_install=1
+  release_compose_bound=1
+fi
+
 if [ -r /dev/tty ] && [ -w /dev/tty ] && (: </dev/tty) 2>/dev/null; then
   terminal_available=1
 fi
@@ -307,6 +360,13 @@ die() {
   exit 1
 }
 
+check_release_sync_complete() {
+  release_sync_marker=$script_dir/.shelter-release-sync-incomplete
+  if [ -L "$release_sync_marker" ] || [ -e "$release_sync_marker" ]; then
+    die "an authenticated release payload synchronization was interrupted; rerun ops/install-release-bundle.sh with the same --installation directory before using install, rollback, or doctor"
+  fi
+}
+
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     die "$2"
@@ -350,6 +410,13 @@ env_value() {
       exit
     }
   ' .env
+}
+
+bind_verified_release_compose_if_configured() {
+  configured_release_image=$(env_value CONTROL_PLANE_IMAGE)
+  case "$configured_release_image" in
+    shelter/control-plane:release-*) release_compose_bound=1 ;;
+  esac
 }
 
 env_key_count() {
@@ -474,8 +541,9 @@ check_env_permissions() {
 set_env_value() {
   set_key=$1
   set_value=$2
-  temporary_file=$(mktemp "$script_dir/.env.tmp.XXXXXX")
-  chmod 600 "$temporary_file"
+  preserved_temporary_file=$temporary_file
+  env_temporary_file=$(mktemp "$script_dir/.env.tmp.XXXXXX")
+  chmod 600 "$env_temporary_file"
   if ! awk -v key="$set_key" -v value="$set_value" '
     BEGIN { found = 0 }
     index($0, key "=") == 1 {
@@ -485,11 +553,17 @@ set_env_value() {
     }
     { print }
     END { if (!found) print key "=" value }
-  ' .env > "$temporary_file"; then
+  ' .env > "$env_temporary_file"; then
+    rm -f "$env_temporary_file"
+    temporary_file=$preserved_temporary_file
     return 1
   fi
-  mv "$temporary_file" .env
-  temporary_file=
+  if ! mv "$env_temporary_file" .env; then
+    rm -f "$env_temporary_file"
+    temporary_file=$preserved_temporary_file
+    return 1
+  fi
+  temporary_file=$preserved_temporary_file
   chmod 600 .env
 }
 
@@ -720,21 +794,21 @@ run_step() {
 }
 
 pull_runtime_images() {
-  docker compose pull traefik cloudflared
+  shelter_compose pull traefik cloudflared
 }
 
 build_control_plane() {
   if [ "$no_pull" -eq 1 ]; then
-    docker compose build api worker
+    shelter_compose build api worker
   else
-    docker compose build --pull api worker
+    shelter_compose build --pull api worker
   fi
 }
 
 wait_for_api() {
   wait_attempt=0
   while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
-    api_id=$(docker compose ps -q api 2>/dev/null || true)
+    api_id=$(shelter_compose ps -q api 2>/dev/null || true)
     if [ -n "$api_id" ]; then
       api_health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$api_id" 2>/dev/null || true)
       [ "$api_health" = healthy ] && return 0
@@ -742,20 +816,20 @@ wait_for_api() {
     wait_attempt=$((wait_attempt + 1))
     sleep "$HEALTH_INTERVAL"
   done
-  docker compose ps api >&2 || true
+  shelter_compose ps api >&2 || true
   return 1
 }
 
 start_and_wait_for_api() {
-  docker compose up -d --force-recreate --no-deps api || return 1
+  shelter_compose up -d --force-recreate --no-deps api || return 1
   wait_for_api
 }
 
 wait_for_worker() {
   wait_attempt=0
   while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
-    worker_id=$(docker compose ps -q worker 2>/dev/null || true)
-    api_id=$(docker compose ps -q api 2>/dev/null || true)
+    worker_id=$(shelter_compose ps -q worker 2>/dev/null || true)
+    api_id=$(shelter_compose ps -q api 2>/dev/null || true)
     if [ -n "$worker_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$worker_id" 2>/dev/null || true)" = true ] && [ -n "$api_id" ] && docker exec "$api_id" node -e "fetch('http://127.0.0.1:7080/api/healthz').then(r=>r.json()).then(v=>process.exit(v.worker==='online'?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
       return 0
     fi
@@ -768,7 +842,7 @@ wait_for_worker() {
 wait_for_traefik() {
   wait_attempt=0
   while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
-    traefik_id=$(docker compose ps -q traefik 2>/dev/null || true)
+    traefik_id=$(shelter_compose ps -q traefik 2>/dev/null || true)
     if [ -n "$traefik_id" ]; then
       traefik_health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$traefik_id" 2>/dev/null || true)
       [ "$traefik_health" = healthy ] && return 0
@@ -780,7 +854,7 @@ wait_for_traefik() {
 }
 
 start_and_verify_stack() {
-  docker compose up -d || return 1
+  shelter_compose up -d || return 1
   wait_for_api || return 1
   if [ "$data_state" = ready ] && [ "$WORKER_SETTLE_SECONDS" -gt 0 ]; then
     sleep "$WORKER_SETTLE_SECONDS" || return 1
@@ -812,8 +886,8 @@ inspect_data_state() {
 }
 
 capture_control_plane_state() {
-  running_api_id=$(docker compose ps -a -q api) || return 1
-  running_worker_id=$(docker compose ps -a -q worker) || return 1
+  running_api_id=$(shelter_compose ps -a -q api) || return 1
+  running_worker_id=$(shelter_compose ps -a -q worker) || return 1
   [ -n "$running_api_id" ] && [ -n "$running_worker_id" ] || return 1
   if [ "$(docker inspect --format '{{.State.Running}}' "$running_api_id" 2>/dev/null || true)" = true ]; then
     api_was_running=1
@@ -829,7 +903,7 @@ capture_control_plane_state() {
 }
 
 stop_control_plane() {
-  docker compose stop -t 60 worker api || return 1
+  shelter_compose stop -t 60 worker api || return 1
 }
 
 backup_database() {
@@ -905,6 +979,23 @@ retain_previous_control_plane_image() {
 
 inspect_built_control_plane_image() {
   docker image inspect --format '{{.Id}}' "$control_plane_image"
+}
+
+verify_preloaded_control_plane_image() {
+  [ "$release_install" -eq 1 ] || return 0
+  inspected_preloaded_image_id=$(docker image inspect --format '{{.Id}}' "$control_plane_image" 2>/dev/null || true)
+  [ "$inspected_preloaded_image_id" = "$preloaded_control_plane_image_id" ]
+}
+
+verify_running_release_images() {
+  [ "$release_install" -eq 1 ] || return 0
+  release_api_id=$(shelter_compose ps -q api 2>/dev/null || true)
+  release_worker_id=$(shelter_compose ps -q worker 2>/dev/null || true)
+  [ -n "$release_api_id" ] && [ -n "$release_worker_id" ] || return 1
+  release_api_image_id=$(docker inspect --format '{{.Image}}' "$release_api_id" 2>/dev/null || true)
+  release_worker_image_id=$(docker inspect --format '{{.Image}}' "$release_worker_id" 2>/dev/null || true)
+  [ "$release_api_image_id" = "$preloaded_control_plane_image_id" ] &&
+    [ "$release_worker_image_id" = "$preloaded_control_plane_image_id" ]
 }
 
 run_rollback_helper() {
@@ -1192,7 +1283,7 @@ prepare_rollback_bundle() {
   run_rollback_helper prepare "$ROLLBACK_HELPER_IMAGE" rw \
     -e "PREVIOUS_IMAGE_ID=${previous_image_id}" \
     -e "PREVIOUS_IMAGE_TAG=${previous_image_tag}" \
-    -e "PREVIOUS_IMAGE_REFERENCE=${control_plane_image}" \
+    -e "PREVIOUS_IMAGE_REFERENCE=${previous_image_reference:-$control_plane_image}" \
     -e "PREVIOUS_REVISION=${previous_revision}" \
     -e "NEW_IMAGE_ID=${new_image_id}" \
     -e "NEW_REVISION=${new_revision}"
@@ -1263,7 +1354,7 @@ check_socket() {
 doctor_check_services() {
   doctor_failed=0
 
-  api_id=$(docker compose ps -q api 2>/dev/null || true)
+  api_id=$(shelter_compose ps -q api 2>/dev/null || true)
   if [ -n "$api_id" ] && [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$api_id" 2>/dev/null || true)" = healthy ]; then
     ok "API is healthy"
   else
@@ -1278,7 +1369,7 @@ doctor_check_services() {
     doctor_failed=1
   fi
 
-  traefik_id=$(docker compose ps -q traefik 2>/dev/null || true)
+  traefik_id=$(shelter_compose ps -q traefik 2>/dev/null || true)
   if [ -n "$traefik_id" ] && [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$traefik_id" 2>/dev/null || true)" = healthy ]; then
     ok "Traefik is healthy"
   else
@@ -1286,7 +1377,7 @@ doctor_check_services() {
     doctor_failed=1
   fi
 
-  cloudflared_id=$(docker compose ps -q cloudflared 2>/dev/null || true)
+  cloudflared_id=$(shelter_compose ps -q cloudflared 2>/dev/null || true)
   if [ -n "$cloudflared_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$cloudflared_id" 2>/dev/null || true)" = true ]; then
     ok "cloudflared is running"
   else
@@ -1473,6 +1564,8 @@ preflight() {
   fi
   ok "Docker daemon reachable"
 
+  # Version detection does not evaluate a Compose plan. Keep it independent of
+  # .env because a verified first install creates that file after preflight.
   if ! docker compose version >/dev/null 2>&1; then
     die "Docker Compose v2 is missing"
   fi
@@ -1480,6 +1573,8 @@ preflight() {
 
   if [ "$mode" = rollback ]; then
     note "Docker Buildx is not required for rollback"
+  elif [ "$release_install" -eq 1 ]; then
+    note "Docker Buildx is not required for a verified release image"
   elif ! docker buildx version >/dev/null 2>&1; then
     die "Docker Buildx is missing (Ubuntu package: docker-buildx-plugin)"
   else
@@ -1560,6 +1655,7 @@ start_operation_log() {
 doctor() {
   print_banner
   preflight
+  check_release_sync_complete
 
   if [ ! -e .env ] && [ ! -L .env ]; then
     heading "Checking Shelter configuration"
@@ -1577,10 +1673,11 @@ doctor() {
   [ -n "$data_volume" ] || data_volume=shelter-data
   control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
   [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
+  bind_verified_release_compose_if_configured
   ok ".env is regular and structurally valid"
   check_env_permissions
   check_socket
-  if docker compose config --quiet; then
+  if shelter_compose config --quiet; then
     ok "Docker Compose configuration is valid"
   else
     die "Docker Compose configuration is invalid"
@@ -1589,7 +1686,7 @@ doctor() {
   doctor_rollback_status
 
   heading "Current service state"
-  docker compose ps || true
+  shelter_compose ps || true
   if ! doctor_check_services; then
     fail "Core services need attention; inspect docker compose logs --tail=200 api worker traefik"
     return 1
@@ -1602,6 +1699,7 @@ doctor() {
 rollback_shelter() {
   print_banner
   preflight
+  check_release_sync_complete
   acquire_install_lock
   start_operation_log
 
@@ -1612,8 +1710,9 @@ rollback_shelter() {
   [ -n "$data_volume" ] || data_volume=shelter-data
   control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
   [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
+  bind_verified_release_compose_if_configured
   docker volume inspect "$data_volume" >/dev/null 2>&1 || die "the configured data volume does not exist"
-  if ! docker compose config --quiet; then
+  if ! shelter_compose config --quiet; then
     die "the current Compose configuration is invalid"
   fi
   ok "Runtime configuration and data volume found"
@@ -1633,7 +1732,7 @@ rollback_shelter() {
   confirm_rollback
 
   rollback_fail_closed=1
-  if ! run_step "Stopping API and worker" docker compose stop -t 60 worker api; then
+  if ! run_step "Stopping API and worker" shelter_compose stop -t 60 worker api; then
     die "the writers could not be stopped; the installer will keep attempting to leave them stopped"
   fi
 
@@ -1654,6 +1753,11 @@ rollback_shelter() {
   if ! run_step "Starting and verifying the prior control plane" start_and_verify_rollback_stack; then
     die "the prior API, worker, or Traefik did not become healthy; writers remain stopped"
   fi
+  heading "Committing the restored image reference"
+  if ! set_env_value CONTROL_PLANE_IMAGE "$rollback_previous_image_reference"; then
+    die "the prior control plane is healthy, but its image reference could not be committed to .env; writers remain stopped"
+  fi
+  ok "CONTROL_PLANE_IMAGE restored to ${rollback_previous_image_reference}"
 
   rollback_fail_closed=0
   control_plane_stopped=0
@@ -1676,6 +1780,7 @@ rollback_shelter() {
 install_shelter() {
   print_banner
   preflight
+  check_release_sync_complete
   acquire_install_lock
   start_operation_log
 
@@ -1764,10 +1869,28 @@ install_shelter() {
     ok ".env created atomically with mode 0600"
   fi
   check_socket
-  control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
-  [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
+  configured_control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
+  [ -n "$configured_control_plane_image" ] || configured_control_plane_image=shelter/control-plane:local
+  if [ "$release_install" -ne 1 ]; then
+    case "$configured_control_plane_image" in
+      shelter/control-plane:release-*)
+        die "this installation tracks a verified release image; update it with ops/install-release-bundle.sh so the digest-specific tag cannot be overwritten by a local build (to switch deliberately, first set CONTROL_PLANE_IMAGE=shelter/control-plane:local)"
+        ;;
+    esac
+  fi
+  previous_image_reference=$configured_control_plane_image
+  if [ "$release_install" -eq 1 ]; then
+    control_plane_image=$preloaded_control_plane_image
+    export CONTROL_PLANE_IMAGE=$control_plane_image
+    if ! verify_preloaded_control_plane_image; then
+      die "the preloaded release image no longer matches its verified identity"
+    fi
+    ok "Verified preloaded release image ${control_plane_image}"
+  else
+    control_plane_image=$configured_control_plane_image
+  fi
 
-  if ! run_step "Validating the Compose configuration" docker compose config --quiet; then
+  if ! run_step "Validating the Compose configuration" shelter_compose config --quiet; then
     die "fix the Compose error above and rerun ./install.sh"
   fi
 
@@ -1790,11 +1913,23 @@ install_shelter() {
     fi
   fi
 
-  if ! run_step "Building the Shelter control plane" build_control_plane; then
+  if [ "$release_install" -eq 1 ]; then
+    heading "Selecting the verified Shelter release image"
+    if ! verify_preloaded_control_plane_image; then
+      die "the preloaded release image changed before it could be selected"
+    fi
+    ok "Using ${control_plane_image} without a local build"
+  elif ! run_step "Building the Shelter control plane" build_control_plane; then
     die "the control-plane image could not be built"
   fi
   new_image_id=$(inspect_built_control_plane_image 2>/dev/null || true)
-  new_revision=$(current_source_revision)
+  if [ "$release_install" -eq 1 ]; then
+    new_revision=$release_revision
+    [ "$new_image_id" = "$preloaded_control_plane_image_id" ] ||
+      die "the selected release image identity changed before persistent data inspection"
+  else
+    new_revision=$(current_source_revision)
+  fi
   case "$new_image_id" in sha256:*) ;;
     *) die "the built control-plane image identity could not be verified" ;;
   esac
@@ -1887,6 +2022,22 @@ install_shelter() {
   if ! run_step "Starting and verifying Shelter" start_and_verify_stack; then
     die "Shelter did not become fully ready; inspect: docker compose ps && docker compose logs --tail=200 api worker traefik"
   fi
+  if [ "$release_install" -eq 1 ]; then
+    heading "Verifying the running release image"
+    if ! verify_running_release_images; then
+      release_identity_fail_closed=1
+      shelter_compose stop -t 30 worker api >/dev/null 2>&1 || true
+      die "the verified release became healthy, but the running API or worker image identity did not match the authenticated image; API and worker were stopped"
+    fi
+    ok "API and worker use the authenticated release image"
+
+    heading "Committing the verified release image"
+    if ! set_env_value CONTROL_PLANE_IMAGE "$control_plane_image"; then
+      shelter_compose stop -t 30 worker api >/dev/null 2>&1 || true
+      die "the verified release became healthy, but its image reference could not be committed to .env; API and worker were stopped"
+    fi
+    ok "CONTROL_PLANE_IMAGE now selects the digest-specific release tag"
+  fi
   rollback_fail_closed=0
   control_plane_stopped=0
 
@@ -1894,7 +2045,7 @@ install_shelter() {
     warn "Shelter is healthy, but the next update will not have a complete automatic rollback baseline until this step succeeds."
   fi
 
-  cloudflared_id=$(docker compose ps -q cloudflared 2>/dev/null || true)
+  cloudflared_id=$(shelter_compose ps -q cloudflared 2>/dev/null || true)
   if [ -n "$cloudflared_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$cloudflared_id" 2>/dev/null || true)" = true ]; then
     tunnel_state=running
   else

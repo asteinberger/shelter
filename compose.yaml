@@ -101,7 +101,7 @@ services:
         condition: service_healthy
 
   traefik:
-    image: traefik:v3.7.1
+    image: traefik:v3.7.1@sha256:6b9cbca6fac42ab0075f5437d8dc1685cfd188626d8d515839ea94f8b6271c42
     container_name: shelter-traefik
     labels:
       shelter.control-plane: traefik
@@ -147,7 +147,7 @@ services:
         condition: service_healthy
 
   cloudflared:
-    image: cloudflare/cloudflared:2026.6.0
+    image: cloudflare/cloudflared:2026.6.0@sha256:ba461b8aa9c042156dbd39c38657fe7431bafa063220eab8d5330a523863da9f
     command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/tunnel/tunnel-token"]
     user: "0:0"
     volumes:
