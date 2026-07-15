@@ -1,0 +1,12 @@
+{
+  "name": "shelter-vite-environment-smoke",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "7.3.6"
+  }
+}

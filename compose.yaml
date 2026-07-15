@@ -1,0 +1,166 @@
+name: shelter
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: "3"
+
+x-metrics-environment: &metrics-environment
+  METRICS_INTERVAL_SECONDS: ${METRICS_INTERVAL_SECONDS:-15}
+  METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-48}
+
+x-control-plane: &control-plane
+  image: shelter/control-plane:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    <<: *metrics-environment
+    NODE_ENV: production
+    HOST: 0.0.0.0
+    PORT: 7080
+    DATA_DIR: /data
+    TRAEFIK_CONFIG_PATH: /routing/dynamic.yml
+    TUNNEL_TOKEN_PATH: /tunnel/tunnel-token
+    WEB_DIST: /app/apps/web/dist
+    RUNTIME_NETWORK: ${RUNTIME_NETWORK:-shelter-runtime}
+    TRAEFIK_SERVICE_URL: http://traefik:80
+    CHROMIUM_PATH: /usr/bin/chromium-browser
+    TRUSTED_PROXY_IP: ${TRAEFIK_CONTROL_IP:-10.253.253.3}
+    TRUSTED_CLOUDFLARED_IP: ${CLOUDFLARED_CONTROL_IP:-10.253.253.4}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *default-logging
+
+services:
+  api:
+    <<: *control-plane
+    command: ["node", "--enable-source-maps", "apps/server/dist/index.js", "api"]
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${PANEL_PORT:-7080}:7080"
+    volumes:
+      - shelter-data:/data
+      - shelter-routing:/routing
+      - shelter-tunnel:/tunnel
+    networks:
+      control:
+        ipv4_address: ${API_CONTROL_IP:-10.253.253.2}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7080/api/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *control-plane
+    command: ["node", "--enable-source-maps", "apps/server/dist/index.js", "worker"]
+    stop_grace_period: 30s
+    environment:
+      <<: *metrics-environment
+      NODE_ENV: production
+      DATA_DIR: /data
+      TRAEFIK_CONFIG_PATH: /routing/dynamic.yml
+      APP_SECRET: ${APP_SECRET:?APP_SECRET must be set}
+      RUNTIME_NETWORK: ${RUNTIME_NETWORK:-shelter-runtime}
+      DEPLOYMENT_MEMORY: ${DEPLOYMENT_MEMORY:-1g}
+      DEPLOYMENT_CPUS: ${DEPLOYMENT_CPUS:-1.0}
+      HEALTHCHECK_TIMEOUT_SECONDS: ${HEALTHCHECK_TIMEOUT_SECONDS:-60}
+      BUILD_TIMEOUT_MINUTES: ${BUILD_TIMEOUT_MINUTES:-30}
+      GIT_TIMEOUT_MINUTES: ${GIT_TIMEOUT_MINUTES:-10}
+      BUILD_CACHE_MAX_GB: ${BUILD_CACHE_MAX_GB:-8}
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DOCKER_CONFIG: /tmp/.docker
+      HOME: /tmp
+    volumes:
+      - shelter-data:/data
+      - shelter-routing:/routing
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks:
+      control:
+        ipv4_address: ${WORKER_CONTROL_IP:-10.253.253.5}
+      runtime: {}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  traefik:
+    image: traefik:v3.7.1
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.forwardedHeaders.trustedIPs=${CLOUDFLARED_CONTROL_IP:-10.253.253.4}/32
+      - --providers.file.directory=/routing
+      - --providers.file.watch=true
+      - --api.dashboard=false
+      - --ping=true
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+      - --log.level=INFO
+      - --accesslog=false
+    volumes:
+      - shelter-routing:/routing:ro
+    networks:
+      control:
+        ipv4_address: ${TRAEFIK_CONTROL_IP:-10.253.253.3}
+      runtime: {}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    logging: *default-logging
+    depends_on:
+      api:
+        condition: service_healthy
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.6.0
+    command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/tunnel/tunnel-token"]
+    user: "0:0"
+    volumes:
+      - shelter-tunnel:/tunnel:ro
+    networks:
+      control:
+        ipv4_address: ${CLOUDFLARED_CONTROL_IP:-10.253.253.4}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      - traefik
+    logging: *default-logging
+
+volumes:
+  shelter-data:
+    name: ${SHELTER_DATA_VOLUME:-shelter-data}
+  shelter-routing:
+    name: ${SHELTER_ROUTING_VOLUME:-shelter-routing}
+  shelter-tunnel:
+    name: ${SHELTER_TUNNEL_VOLUME:-shelter-tunnel}
+
+networks:
+  control:
+    name: shelter-control
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CONTROL_SUBNET:-10.253.253.0/24}
+  runtime:
+    name: ${RUNTIME_NETWORK:-shelter-runtime}
+    driver: bridge

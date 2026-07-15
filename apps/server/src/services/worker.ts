@@ -1,0 +1,1138 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import extractZip from "extract-zip";
+import type { AppConfig } from "../config.js";
+import { CommandCancelledError, CommandTimeoutError, runCommand } from "../lib/command.js";
+import type { Database } from "../lib/database.js";
+import { decryptString, resolveWithin } from "../lib/security.js";
+import type { DeploymentFailureKind, DeploymentRollbackStatus, DeploymentRow, ProjectRow } from "../types/models.js";
+import { createBuildPlan } from "./build-plan.js";
+import { prepareGitSource } from "./git-source.js";
+import { GitHubService } from "./github.js";
+import { ProjectDeletionWorker } from "./project-deletion.js";
+import { analyzeProjectDirectory, type ProjectAnalysis } from "./project-analysis.js";
+import { captureProjectPreview, projectPreviewState } from "./project-preview.js";
+import { reconcileRouting } from "./routing.js";
+import { ServerMetricsCollector } from "./server-metrics.js";
+import {
+  COMPOSE_PROJECT_NAMES,
+  deploymentContainerName,
+  deploymentContainerNames,
+  imageTag as shelterImageTag,
+  isDockerDnsLabel,
+  isManagedVersionedRuntimeName,
+  isManagedImage,
+  MANAGED_LABEL_NAMESPACES,
+  stableContainerNames
+} from "./runtime-identity.js";
+
+const activeStatuses = new Set(["queued", "preparing", "building", "checking", "switching"]);
+
+class DeploymentCancelledError extends Error {
+  constructor() {
+    super("Deployment wurde vom Benutzer abgebrochen");
+    this.name = "DeploymentCancelledError";
+  }
+}
+
+class DeploymentHealthcheckError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeploymentHealthcheckError";
+  }
+}
+
+class DeploymentActivationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeploymentActivationError";
+  }
+}
+
+export function deploymentFailureKind(error: unknown, status?: DeploymentRow["status"]): DeploymentFailureKind {
+  if (error instanceof CommandTimeoutError) return "timeout";
+  if (error instanceof DeploymentCancelledError) return "cancelled";
+  if (error instanceof DeploymentHealthcheckError) return "healthcheck";
+  if (error instanceof DeploymentActivationError) return "activation";
+  if (status === "preparing" || status === "building") return "build";
+  return "worker";
+}
+
+export function healthcheckPathFor(
+  project: Pick<ProjectRow, "healthcheck_path">,
+  deployment?: Pick<DeploymentRow, "runtime_kind">
+): string {
+  return deployment?.runtime_kind === "files" ? "/" : project.healthcheck_path;
+}
+
+export function buildEnvironmentSecretArgs(secretPath: string): string[] {
+  // Existing user Dockerfiles may still mount the original secret id. Both ids
+  // point at the same short-lived file, are BuildKit-only, and never enter an
+  // image unless the Dockerfile explicitly mounts one of them.
+  return [
+    "--secret", `id=shelter_env,src=${secretPath}`,
+    "--secret", `id=portsmith_env,src=${secretPath}`
+  ];
+}
+
+export function resolveUploadArchiveForDeployment(
+  config: Pick<AppConfig, "sourcesDir">,
+  database: Pick<Database, "sqlite">,
+  project: Pick<ProjectRow, "source_archive">,
+  deployment: Pick<DeploymentRow, "source_ref">
+): string {
+  if (deployment.source_ref !== null) {
+    const referencedUpload = database.sqlite.prepare(`
+      SELECT id, archive_path FROM uploads WHERE id = ? AND status = 'complete'
+    `).get(deployment.source_ref) as { id: string; archive_path: string | null } | undefined;
+    if (!referencedUpload?.archive_path) {
+      throw new Error(`Deployment-Quellrevision '${deployment.source_ref}' ist nicht mehr als vollständiger Upload vorhanden`);
+    }
+    const expectedArchive = resolveWithin(config.sourcesDir, path.join(referencedUpload.id, "source.zip"));
+    if (path.resolve(referencedUpload.archive_path) !== expectedArchive) {
+      throw new Error("Deployment verweist auf ein nicht verwaltetes Quellarchiv");
+    }
+    return expectedArchive;
+  }
+
+  if (!project.source_archive) throw new Error("Quellarchiv fehlt");
+  return project.source_archive;
+}
+
+export class DeploymentWorker {
+  private stopping = false;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private activeDeploymentAbort: AbortController | null = null;
+  private previewBackfillPending = true;
+  private readonly projectDeletion: ProjectDeletionWorker;
+  private readonly github: GitHubService;
+  private readonly metrics: ServerMetricsCollector;
+
+  constructor(
+    private readonly config: AppConfig,
+    private readonly database: Database
+  ) {
+    this.projectDeletion = new ProjectDeletionWorker(config, database);
+    this.github = new GitHubService(config, database);
+    this.metrics = new ServerMetricsCollector(config, database);
+  }
+
+  async run(): Promise<void> {
+    await this.ensureDockerReady();
+    await this.resetWorkspaces();
+    this.projectDeletion.recoverInterrupted();
+    await this.recoverInterruptedDeployments();
+    await this.cleanupInactiveRuntimeContainers();
+    this.database.reconcileGithubStatusOutbox();
+    reconcileRouting(this.config, this.database);
+    this.database.setSetting("worker.heartbeat", new Date().toISOString());
+    this.heartbeatTimer = setInterval(() => {
+      this.database.setSetting("worker.heartbeat", new Date().toISOString());
+    }, 5_000);
+    this.heartbeatTimer.unref();
+    this.metrics.start();
+
+    try {
+      while (!this.stopping) {
+        await this.reconcileCloudflaredRestart();
+        if (await this.projectDeletion.processNext()) continue;
+        if (await this.github.processNextWebhookJob()) continue;
+        if (await this.github.processNextCommitStatus()) continue;
+        this.database.materializePendingGithubPush();
+        const deployment = this.database.claimNextQueuedDeployment();
+        if (!deployment) {
+          if (this.previewBackfillPending) {
+            this.previewBackfillPending = false;
+            await this.backfillProjectPreviews();
+            continue;
+          }
+          await wait(750);
+          continue;
+        }
+        const cancellation = this.monitorDeploymentCancellation(deployment.id);
+        this.activeDeploymentAbort = cancellation.controller;
+        try {
+          await this.reportGithubStatus(deployment, "pending", "Deployment wird von Shelter gebaut");
+          await this.process(deployment, cancellation.controller.signal);
+          const completed = this.database.getDeployment(deployment.id);
+          if (completed?.status === "ready") {
+            await this.reportGithubStatus(completed, "success", "Deployment ist bereit");
+          } else if (completed?.status === "cancelled") {
+            await this.reportGithubStatus(
+              completed,
+              "error",
+              completed.failure_kind === "superseded" ? "Durch einen neueren Push ersetzt" : "Deployment wurde abgebrochen"
+            );
+          }
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : "Unbekannter Deployment-Fehler";
+          const current = this.database.getDeployment(deployment.id);
+          if (current?.cancel_requested_at || current?.status === "cancelled") {
+            const cancelled = this.database.finalizeDeploymentCancellation(
+              deployment.id,
+              current.rollback_status ?? "not_required",
+              current.rollback_deployment_id ?? null
+            ) ?? current;
+            this.safeLog(deployment.id, "system", "Deployment-Abbruch wurde abgeschlossen.");
+            await this.reportGithubStatus(cancelled, "error", "Deployment wurde abgebrochen");
+          } else if (current?.status !== "ready") {
+            this.log(deployment.id, "stderr", message);
+            const failed = this.database.failDeploymentIfActive(
+              deployment.id,
+              current?.failure_kind ?? deploymentFailureKind(error, current?.status),
+              message,
+              new Date().toISOString()
+            );
+            if (failed) await this.reportGithubStatus(failed, "failure", "Deployment fehlgeschlagen");
+          }
+        } finally {
+          cancellation.stop();
+          this.activeDeploymentAbort = null;
+          this.database.materializePendingGithubPush(deployment.project_id);
+        }
+        try {
+          await this.pruneFailedImages(deployment.project_id);
+        } catch (error) {
+          this.safeLog(deployment.id, "stderr", `Aufräumen fehlgeschlagener Images fehlgeschlagen: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
+        }
+        this.database.pruneDeploymentLogs(deployment.project_id);
+        await this.maintainDockerStorage(deployment.id);
+      }
+    } finally {
+      await this.metrics.stop();
+    }
+  }
+
+  stop(): void {
+    this.stopping = true;
+    this.activeDeploymentAbort?.abort();
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    void this.metrics.stop();
+  }
+
+  private monitorDeploymentCancellation(deploymentId: string): {
+    controller: AbortController;
+    stop: () => void;
+  } {
+    const controller = new AbortController();
+    const check = (): void => {
+      if (!controller.signal.aborted && this.database.deploymentCancellationRequested(deploymentId)) {
+        controller.abort();
+      }
+    };
+    check();
+    const timer = setInterval(check, 250);
+    timer.unref();
+    return {
+      controller,
+      stop: () => clearInterval(timer)
+    };
+  }
+
+  private throwIfDeploymentCancelled(deploymentId: string, signal: AbortSignal): void {
+    if (signal.aborted || this.database.deploymentCancellationRequested(deploymentId)) {
+      throw new DeploymentCancelledError();
+    }
+  }
+
+  private async ensureDockerReady(): Promise<void> {
+    const dockerConfig = process.env.DOCKER_CONFIG ?? path.join(this.config.DATA_DIR, ".docker");
+    await fs.promises.mkdir(dockerConfig, { recursive: true, mode: 0o700 });
+    const version = await runCommand("docker", ["version", "--format", "{{.Server.Version}}"]);
+    if (!version.stdout) throw new Error("Docker Engine ist nicht erreichbar");
+    const buildx = await runCommand("docker", ["buildx", "version"], { allowFailure: true });
+    if (buildx.exitCode !== 0) throw new Error("Docker Buildx ist im Worker-Container nicht verfügbar");
+    const inspected = await runCommand("docker", ["network", "inspect", this.config.RUNTIME_NETWORK], { allowFailure: true });
+    if (inspected.exitCode !== 0) {
+      await runCommand("docker", ["network", "create", this.config.RUNTIME_NETWORK]);
+    }
+    await this.connectManagedContainersToRuntimeNetwork();
+  }
+
+  private async managedContainerIds(label?: { name: string; value: string }): Promise<string[]> {
+    const ids = new Set<string>();
+    for (const namespace of MANAGED_LABEL_NAMESPACES) {
+      const result = await runCommand("docker", [
+        "ps", "-aq",
+        "--filter", `label=${namespace}.managed=true`,
+        ...(label ? ["--filter", `label=${namespace}.${label.name}=${label.value}`] : [])
+      ], { allowFailure: true });
+      for (const id of result.stdout.split("\n").map((value) => value.trim()).filter(Boolean)) ids.add(id);
+    }
+    return [...ids];
+  }
+
+  private async connectManagedContainersToRuntimeNetwork(): Promise<void> {
+    for (const containerId of await this.managedContainerIds()) {
+      await runCommand(
+        "docker",
+        ["network", "connect", this.config.RUNTIME_NETWORK, containerId],
+        { allowFailure: true }
+      );
+    }
+  }
+
+  private async process(deployment: DeploymentRow, signal: AbortSignal): Promise<void> {
+    const project = this.database.getProject(deployment.project_id);
+    if (!project) throw new Error("Projekt wurde gelöscht");
+    this.log(deployment.id, "system", `Worker startet Deployment für ${project.name}.`);
+    this.throwIfDeploymentCancelled(deployment.id, signal);
+
+    let imageTag: string;
+    let internalPort: number;
+    let commitSha: string | null = deployment.commit_sha;
+    const rollbackTarget = deployment.source_ref?.startsWith("rollback:")
+      ? this.database.getDeployment(deployment.source_ref.slice("rollback:".length))
+      : undefined;
+
+    if (rollbackTarget) {
+      if (!rollbackTarget.image_tag || !rollbackTarget.internal_port) throw new Error("Rollback-Image ist unvollständig");
+      const retainedImage = await runCommand("docker", ["image", "inspect", rollbackTarget.image_tag], { allowFailure: true, signal });
+      if (retainedImage.exitCode !== 0) throw new Error("Rollback-Image wurde gemäß Retention bereits entfernt und ist nicht mehr verfügbar");
+      imageTag = rollbackTarget.image_tag;
+      internalPort = rollbackTarget.internal_port;
+      commitSha = rollbackTarget.commit_sha;
+      this.log(deployment.id, "system", `Rollback auf Image ${imageTag}.`);
+      this.database.updateDeployment(deployment.id, {
+        image_tag: imageTag,
+        internal_port: internalPort,
+        static_base_path: rollbackTarget.static_base_path,
+        runtime_kind: rollbackTarget.runtime_kind,
+        runtime_description: rollbackTarget.runtime_description,
+        commit_sha: commitSha,
+        commit_message: rollbackTarget.commit_message ?? null,
+        commit_author: rollbackTarget.commit_author ?? null,
+        commit_url: rollbackTarget.commit_url ?? null
+      });
+    } else {
+      const workspace = path.join(this.config.workspacesDir, deployment.id);
+      await fs.promises.rm(workspace, { recursive: true, force: true });
+      await fs.promises.mkdir(workspace, { recursive: true, mode: 0o700 });
+      try {
+        const sourceDirectory = await this.prepareSource(project, deployment, workspace, signal);
+        this.throwIfDeploymentCancelled(deployment.id, signal);
+        const sourceAnalysis = refreshProjectSourceAnalysis(this.database, project.id, sourceDirectory);
+        if (sourceAnalysis) {
+          this.log(deployment.id, "system", `Source erkannt: ${sourceAnalysis.applications.length} Anwendung(en).`);
+        } else {
+          this.safeLog(deployment.id, "stderr", "Source-Analyse übersprungen; das Deployment läuft weiter.");
+        }
+        const generationDirectory = path.join(workspace, "generated");
+        const plan = createBuildPlan(project, sourceDirectory, generationDirectory, deployment.static_base_path);
+        internalPort = plan.internalPort;
+        imageTag = shelterImageTag(project.slug, deployment.id);
+        this.log(deployment.id, "system", `Build erkannt: ${plan.description}; interner Port ${internalPort}.`);
+        const building = this.database.updateDeployment(deployment.id, {
+          status: "building",
+          image_tag: imageTag,
+          internal_port: internalPort,
+          runtime_kind: plan.kind,
+          runtime_description: plan.description,
+          commit_sha: commitSha
+        });
+        if (building?.cancel_requested_at) throw new DeploymentCancelledError();
+        await this.dockerBuild(
+          deployment.id,
+          imageTag,
+          plan.dockerfilePath,
+          plan.contextDirectory,
+          project,
+          plan.kind === "dockerfile",
+          plan.kind === "files",
+          signal
+        );
+        this.throwIfDeploymentCancelled(deployment.id, signal);
+        if (project.source_type === "git") {
+          const result = await runCommand("git", ["-C", sourceDirectory, "rev-parse", "HEAD"], { allowFailure: true, signal });
+          commitSha = result.exitCode === 0 ? result.stdout.trim() : null;
+          this.database.updateDeployment(deployment.id, { commit_sha: commitSha });
+          this.database.clearPendingGithubPushIfSha(project.id, commitSha);
+          const identified = this.database.getDeployment(deployment.id);
+          if (identified && !deployment.commit_sha) {
+            await this.reportGithubStatus(identified, "pending", "Deployment wird von Shelter gebaut");
+          }
+        }
+      } finally {
+        await fs.promises.rm(workspace, { recursive: true, force: true });
+      }
+    }
+
+    this.throwIfDeploymentCancelled(deployment.id, signal);
+    if (this.cancelIfSuperseded(project, deployment.id, commitSha)) return;
+
+    const previousActiveDeploymentId = project.active_deployment_id;
+    const previousRuntime = await this.currentRuntime(project, signal);
+    const previousImage = previousRuntime?.image ?? null;
+    const runtimeName = deploymentContainerName(project.slug, deployment.id);
+    this.database.updateDeployment(deployment.id, {
+      previous_image_tag: previousImage,
+      rollback_deployment_id: previousActiveDeploymentId,
+      runtime_container: runtimeName,
+      status: "checking"
+    });
+    const preparedDeployment = this.database.getDeployment(deployment.id) ?? deployment;
+    const healthcheckPath = healthcheckPathFor(project, preparedDeployment);
+    await this.removeContainer(runtimeName);
+    this.log(deployment.id, "system", "Starte versionsgebundenen Candidate-Container; die aktive Version bleibt online.");
+    try {
+      await this.startContainer(runtimeName, imageTag, project, internalPort, true, deployment.id, signal);
+      await this.waitForHealth(runtimeName, internalPort, healthcheckPath, deployment.id, signal);
+    } catch (error) {
+      await this.removeContainer(runtimeName);
+      const rollbackStatus: DeploymentRollbackStatus = previousActiveDeploymentId
+        ? previousRuntime ? "automatic_succeeded" : "automatic_failed"
+        : "not_required";
+      this.database.updateDeployment(deployment.id, {
+        rollback_status: rollbackStatus,
+        rollback_deployment_id: previousActiveDeploymentId
+      });
+      if (error instanceof CommandCancelledError || error instanceof DeploymentCancelledError || signal.aborted) throw error;
+      throw new DeploymentHealthcheckError(error instanceof Error ? error.message : "Candidate-Healthcheck fehlgeschlagen");
+    }
+
+    this.throwIfDeploymentCancelled(deployment.id, signal);
+    if (this.cancelIfSuperseded(project, deployment.id, commitSha)) {
+      await this.removeContainer(runtimeName);
+      return;
+    }
+
+    const activation = this.database.beginDeploymentActivation(deployment.id, project.id, commitSha);
+    if (activation === "superseded") {
+      await this.removeContainer(runtimeName);
+      this.safeLog(deployment.id, "system", "Ein neuerer GitHub-Push liegt bereit; diese Version wird nicht aktiviert.");
+      return;
+    }
+    if (activation !== "activation_started") {
+      this.throwIfDeploymentCancelled(deployment.id, signal);
+      throw new DeploymentActivationError("Deployment-Status hat sich vor der Aktivierung unerwartet geändert");
+    }
+    this.log(deployment.id, "system", "Healthcheck erfolgreich. Schalte das Routing atomar auf den Candidate um.");
+    let rollbackStatus: DeploymentRollbackStatus = "not_required";
+    try {
+      if (!this.database.activateDeploymentRuntime(deployment.id, project.id, previousActiveDeploymentId)) {
+        throw new DeploymentActivationError("Aktives Deployment hat sich vor dem Routing-Wechsel geändert");
+      }
+      reconcileRouting(this.config, this.database);
+      if (!this.database.completeDeploymentActivation(deployment.id, project.id, new Date().toISOString())) {
+        throw new DeploymentActivationError("Deployment konnte nach dem Routing-Wechsel nicht atomar abgeschlossen werden");
+      }
+    } catch (error) {
+      const restored = this.database.restoreProjectActiveDeployment(
+        project.id,
+        deployment.id,
+        previousActiveDeploymentId,
+        project.static_base_path
+      );
+      try {
+        if (!restored) throw new Error("Aktives Deployment konnte nicht auf die vorige Version zurückgesetzt werden");
+        reconcileRouting(this.config, this.database);
+        rollbackStatus = previousActiveDeploymentId ? "automatic_succeeded" : "not_required";
+      } catch (rollbackError) {
+        rollbackStatus = "automatic_failed";
+        this.safeLog(
+          deployment.id,
+          "stderr",
+          `Automatischer Rollback fehlgeschlagen: ${rollbackError instanceof Error ? rollbackError.message : "unbekannter Fehler"}`
+        );
+      }
+      this.database.updateDeployment(deployment.id, {
+        rollback_status: rollbackStatus,
+        rollback_deployment_id: previousActiveDeploymentId
+      });
+      if (rollbackStatus !== "automatic_failed") {
+        await this.removeContainer(runtimeName);
+      }
+      if (error instanceof DeploymentCancelledError || error instanceof CommandCancelledError) throw error;
+      throw error instanceof DeploymentActivationError
+        ? error
+        : new DeploymentActivationError(error instanceof Error ? error.message : "Routing-Aktivierung fehlgeschlagen");
+    }
+
+    const previousDeployment = previousActiveDeploymentId
+      ? this.database.getDeployment(previousActiveDeploymentId)
+      : undefined;
+    await this.removeObsoleteRuntimeContainers(
+      project,
+      runtimeName,
+      previousDeployment,
+      previousImage,
+      previousRuntime?.name
+    );
+    this.safeLog(deployment.id, "system", "Deployment ist bereit und wurde aktiviert.");
+    await this.capturePreview(project, deployment.id, runtimeName, internalPort);
+    try {
+      await this.pruneImages(project.id, imageTag);
+    } catch (error) {
+      this.safeLog(deployment.id, "stderr", `Aufräumen alter Images fehlgeschlagen (Deployment bleibt aktiv): ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
+    }
+  }
+
+  private async capturePreview(
+    project: ProjectRow,
+    deploymentId: string,
+    containerName: string,
+    port: number
+  ): Promise<void> {
+    const deployment = this.database.getDeployment(deploymentId);
+    const staticBasePath = deployment?.static_base_path ?? project.static_base_path;
+    const previewPath = staticBasePath && staticBasePath !== "/"
+      ? `${staticBasePath.replace(/\/$/, "")}/`
+      : "/";
+    try {
+      const preview = await captureProjectPreview(this.config, {
+        projectId: project.id,
+        deploymentId,
+        url: `http://${containerName}:${port}${previewPath}`
+      });
+      if (preview.status === "ready") {
+        this.safeLog(deploymentId, "system", "Website-Vorschau wurde aktualisiert.");
+      } else if (preview.reason === "not_html") {
+        this.safeLog(deploymentId, "system", "Keine Website-Vorschau erzeugt: Die Startseite liefert kein HTML.");
+      } else {
+        this.safeLog(deploymentId, "stderr", "Website-Vorschau konnte nicht erzeugt werden; das Deployment bleibt aktiv.");
+      }
+    } catch (error) {
+      this.safeLog(
+        deploymentId,
+        "stderr",
+        `Website-Vorschau konnte nicht gespeichert werden (Deployment bleibt aktiv): ${error instanceof Error ? error.message : "unbekannter Fehler"}`
+      );
+    }
+  }
+
+  private async backfillProjectPreviews(): Promise<void> {
+    for (const project of this.database.listProjects()) {
+      if (!project.active_deployment_id) continue;
+      const state = projectPreviewState(this.config, project.id, project.active_deployment_id);
+      if (state?.status !== "pending") continue;
+      const deployment = this.database.getDeployment(project.active_deployment_id);
+      if (!deployment?.image_tag || !deployment.internal_port) continue;
+      try {
+        const runtime = await this.currentRuntime(project);
+        if (!runtime) continue;
+        await this.capturePreview(project, deployment.id, runtime.name, deployment.internal_port);
+      } catch (error) {
+        this.safeLog(
+          deployment.id,
+          "stderr",
+          `Bestehende Website-Vorschau konnte nicht nachgezogen werden: ${error instanceof Error ? error.message : "unbekannter Fehler"}`
+        );
+      }
+    }
+  }
+
+  private async prepareSource(project: ProjectRow, deployment: DeploymentRow, workspace: string, signal: AbortSignal): Promise<string> {
+    const preparing = this.database.updateDeployment(deployment.id, { status: "preparing" });
+    if (preparing?.cancel_requested_at || signal.aborted) throw new DeploymentCancelledError();
+    const sourceRoot = path.join(workspace, "source");
+    if (project.source_type === "git") {
+      if (!project.repository_url || !project.repository_branch) throw new Error("Git-Quelle ist unvollständig");
+      const branch = deployment.source_ref ?? project.repository_branch;
+      this.log(deployment.id, "system", `Lade Git-Quelle (${branch}).`);
+      return prepareGitSource({
+        config: this.config,
+        project,
+        deployment,
+        workspace,
+        github: this.github,
+        signal,
+        onStdout: (line) => this.log(deployment.id, "stdout", line),
+        onStderr: (line) => this.log(deployment.id, "stderr", line)
+      });
+    }
+
+    const archivePath = resolveUploadArchiveForDeployment(this.config, this.database, project, deployment);
+    if (!fs.existsSync(archivePath)) throw new Error("Quellarchiv fehlt");
+    this.log(deployment.id, "system", "Entpacke geprüftes Quellarchiv.");
+    await fs.promises.mkdir(sourceRoot, { recursive: true, mode: 0o700 });
+    await extractZip(archivePath, { dir: sourceRoot });
+    this.throwIfDeploymentCancelled(deployment.id, signal);
+    return findContentRoot(sourceRoot, project.root_directory);
+  }
+
+  private async dockerBuild(
+    deploymentId: string,
+    imageTag: string,
+    dockerfilePath: string,
+    contextDirectory: string,
+    project: ProjectRow,
+    customDockerfile: boolean,
+    fileStorage: boolean,
+    signal: AbortSignal
+  ): Promise<void> {
+    const args = [
+      "build", "--progress", "plain",
+      "--label", "shelter.managed=true",
+      "--label", `shelter.deployment=${deploymentId}`,
+      "-t", imageTag
+    ];
+    const environment = fileStorage
+      ? {}
+      : Object.fromEntries(
+          this.database.listEnvironment(project.id).map((entry) => [
+            entry.key,
+            decryptString(entry.encrypted_value, this.config.APP_SECRET)
+          ])
+        );
+    let secretPath: string | null = null;
+    try {
+      if (Object.keys(environment).length > 0) {
+        secretPath = path.join(os.tmpdir(), `shelter-build-env-${deploymentId}-${randomUUID()}.json`);
+        await fs.promises.writeFile(secretPath, JSON.stringify(environment), { mode: 0o600, flag: "wx" });
+        args.push(...buildEnvironmentSecretArgs(secretPath));
+        if (customDockerfile) args.push("--no-cache");
+        else args.push("--build-arg", `SHELTER_CACHE_BUSTER=${deploymentId}`);
+      }
+      args.push(
+        "-f", dockerfilePath,
+        contextDirectory
+      );
+      await runCommand("docker", args, {
+        env: { ...process.env, DOCKER_BUILDKIT: "1" },
+        timeoutMs: this.config.BUILD_TIMEOUT_MINUTES * 60_000,
+        signal,
+        onStdout: (line) => this.log(deploymentId, "stdout", line),
+        onStderr: (line) => this.log(deploymentId, "stderr", line)
+      });
+    } finally {
+      if (secretPath) await fs.promises.rm(secretPath, { force: true });
+    }
+  }
+
+  private async startContainer(
+    name: string,
+    imageTag: string,
+    project: ProjectRow,
+    port: number,
+    restart: boolean,
+    deploymentId?: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const runtimeKind = deploymentId
+      ? this.database.getDeployment(deploymentId)?.runtime_kind
+      : null;
+    const environment = runtimeKind === "files"
+      ? []
+      : this.database.listEnvironment(project.id).map((entry) => [
+          entry.key,
+          decryptString(entry.encrypted_value, this.config.APP_SECRET)
+        ] as const).filter(([key]) => !["PORT", "HOSTNAME", "NODE_ENV"].includes(key));
+    const args = [
+      "run", "-d", "--name", name,
+      "--pull", "never",
+      "--network", this.config.RUNTIME_NETWORK,
+      "--restart", restart ? "unless-stopped" : "no",
+      "--memory", project.memory_limit,
+      "--cpus", project.cpu_limit,
+      "--pids-limit", "512",
+      "--security-opt", "no-new-privileges:true",
+      "--cap-drop", "ALL",
+      "--log-driver", "local",
+      "--log-opt", "max-size=10m",
+      "--log-opt", "max-file=3",
+      "--label", "shelter.managed=true",
+      "--label", `shelter.project=${project.id}`,
+      "--label", `shelter.internal-port=${port}`,
+      "--label", `shelter.candidate=${restart ? "false" : "true"}`,
+      "-e", "NODE_ENV=production",
+      "-e", `PORT=${port}`,
+      "-e", "HOSTNAME=0.0.0.0"
+    ];
+    if (deploymentId) args.push("--label", `shelter.deployment=${deploymentId}`);
+    for (const [key, value] of environment) args.push("-e", `${key}=${value}`);
+    args.push(imageTag);
+    await runCommand("docker", args, signal ? { signal } : {});
+  }
+
+  private async waitForHealth(
+    containerName: string,
+    port: number,
+    healthPath: string,
+    deploymentId: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const deadline = Date.now() + this.config.HEALTHCHECK_TIMEOUT_SECONDS * 1000;
+    const url = `http://${containerName}:${port}${healthPath}`;
+    let lastError = "keine Antwort";
+    while (Date.now() < deadline) {
+      if (signal) this.throwIfDeploymentCancelled(deploymentId, signal);
+      const remaining = Math.max(250, deadline - Date.now());
+      const inspect = await runCommand(
+        "docker",
+        ["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", containerName],
+        { allowFailure: true, timeoutMs: Math.min(2_500, remaining), ...(signal ? { signal } : {}) }
+      );
+      if (inspect.exitCode !== 0 || !inspect.stdout.startsWith("true")) {
+        const logs = await runCommand("docker", ["logs", "--tail", "40", containerName], {
+          allowFailure: true,
+          timeoutMs: Math.min(2_500, remaining),
+          ...(signal ? { signal } : {})
+        });
+        if (logs.stdout) this.log(deploymentId, "stdout", logs.stdout);
+        if (logs.stderr) this.log(deploymentId, "stderr", logs.stderr);
+        throw new Error(`Container wurde vor dem Healthcheck beendet (${inspect.stdout || inspect.stderr})`);
+      }
+      try {
+        const requestSignal = signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(Math.min(2_500, remaining))])
+          : AbortSignal.timeout(Math.min(2_500, remaining));
+        const response = await fetch(url, { redirect: "manual", signal: requestSignal });
+        if (response.status >= 200 && response.status < 400) {
+          this.log(deploymentId, "system", `Healthcheck ${healthPath}: HTTP ${response.status}.`);
+          return;
+        }
+        lastError = `HTTP ${response.status}`;
+      } catch (error) {
+        if (signal?.aborted) throw new DeploymentCancelledError();
+        lastError = error instanceof Error ? error.message : "Verbindung fehlgeschlagen";
+      }
+      await wait(1_000, signal);
+    }
+    const logs = await runCommand("docker", ["logs", "--tail", "80", containerName], { allowFailure: true, timeoutMs: 2_500 });
+    if (logs.stdout) this.log(deploymentId, "stdout", logs.stdout);
+    if (logs.stderr) this.log(deploymentId, "stderr", logs.stderr);
+    throw new Error(`Healthcheck nach ${this.config.HEALTHCHECK_TIMEOUT_SECONDS}s fehlgeschlagen: ${lastError}. Prüfe, ob die App auf 0.0.0.0:${port} lauscht.`);
+  }
+
+  private async currentRuntime(project: ProjectRow, signal?: AbortSignal): Promise<{ name: string; image: string } | null> {
+    const activeDeployment = project.active_deployment_id
+      ? this.database.getDeployment(project.active_deployment_id)
+      : undefined;
+    const names = activeDeployment
+      ? [
+          ...deploymentContainerNames(project.slug, activeDeployment.id, activeDeployment.runtime_container),
+          ...stableContainerNames(project.slug, activeDeployment.image_tag)
+        ]
+      : stableContainerNames(project.slug);
+    for (const name of names) {
+      const result = await runCommand("docker", ["inspect", "-f", "{{.Config.Image}}", name], {
+        allowFailure: true,
+        ...(signal ? { signal } : {})
+      });
+      if (result.exitCode === 0 && result.stdout.trim()) {
+        if (isManagedVersionedRuntimeName(name) && !isDockerDnsLabel(name)) continue;
+        if (
+          activeDeployment &&
+          isManagedVersionedRuntimeName(name) &&
+          activeDeployment.runtime_container !== name
+        ) this.database.updateDeployment(activeDeployment.id, { runtime_container: name });
+        return { name, image: result.stdout.trim() };
+      }
+    }
+    return null;
+  }
+
+  private async containerExists(name: string): Promise<boolean> {
+    const result = await runCommand("docker", ["inspect", name], { allowFailure: true });
+    return result.exitCode === 0;
+  }
+
+  private async containerDeploymentId(name: string): Promise<string | null> {
+    return this.containerManagedLabel(name, "deployment");
+  }
+
+  private async containerManagedLabel(name: string, label: "deployment" | "project"): Promise<string | null> {
+    for (const namespace of MANAGED_LABEL_NAMESPACES) {
+      const result = await runCommand(
+        "docker",
+        ["inspect", "-f", `{{ index .Config.Labels \"${namespace}.${label}\" }}`, name],
+        { allowFailure: true }
+      );
+      if (result.exitCode === 0 && result.stdout.trim()) return result.stdout.trim();
+    }
+    return null;
+  }
+
+  private async removeContainer(name: string): Promise<void> {
+    await runCommand("docker", ["rm", "-f", name], { allowFailure: true });
+  }
+
+  private async pruneImages(projectId: string, activeImage: string): Promise<void> {
+    const keep = new Set(
+      this.database.listReadyDeployments(projectId, 3)
+        .filter((deployment) => deployment.image_tag)
+        .map((deployment) => deployment.image_tag as string)
+    );
+    keep.add(activeImage);
+    for (const image of this.database.listRollbackLeasedImages(projectId)) keep.add(image);
+    const old = this.database.listDeployments(projectId, 100)
+      .map((deployment) => deployment.image_tag)
+      .filter((image): image is string => Boolean(image) && !keep.has(image as string));
+    for (const image of new Set(old)) await runCommand("docker", ["image", "rm", image], { allowFailure: true });
+  }
+
+  private async pruneFailedImages(projectId: string): Promise<void> {
+    const keep = new Set(
+      this.database.listReadyDeployments(projectId, 3)
+        .map((deployment) => deployment.image_tag)
+        .filter((image): image is string => Boolean(image))
+    );
+    const project = this.database.getProject(projectId);
+    if (project?.active_deployment_id) {
+      const activeImage = this.database.getDeployment(project.active_deployment_id)?.image_tag;
+      if (activeImage) keep.add(activeImage);
+    }
+    for (const image of this.database.listRollbackLeasedImages(projectId)) keep.add(image);
+    const prunable = this.database.listDeployments(projectId, 10_000)
+      .filter((deployment) => deployment.status === "failed" || deployment.status === "cancelled")
+      .map((deployment) => deployment.image_tag)
+      .filter((image): image is string => typeof image === "string" && isManagedImage(image) && !keep.has(image));
+    for (const image of new Set(prunable)) {
+      await runCommand("docker", ["image", "rm", image], { allowFailure: true });
+    }
+  }
+
+  private log(deploymentId: string, stream: "system" | "stdout" | "stderr", message: string): void {
+    this.database.addLog(deploymentId, stream, message);
+  }
+
+  private safeLog(deploymentId: string, stream: "system" | "stdout" | "stderr", message: string): void {
+    try {
+      this.log(deploymentId, stream, message);
+    } catch {
+      // Post-commit diagnostics must never revert an already active deployment.
+    }
+  }
+
+  private async reportGithubStatus(
+    deployment: DeploymentRow,
+    state: "pending" | "success" | "failure" | "error",
+    description: string
+  ): Promise<void> {
+    const project = this.database.getProject(deployment.project_id);
+    if (!project?.github_installation_id || !project.github_repository_id || !deployment.commit_sha) return;
+    this.database.queueGithubStatus(deployment.id, state, description);
+    await this.github.processNextCommitStatus(deployment.id);
+  }
+
+  private cancelIfSuperseded(project: ProjectRow, deploymentId: string, commitSha: string | null): boolean {
+    if (!project.github_repository_id || !this.database.hasPendingGithubWork(project.id, commitSha)) return false;
+    this.database.updateDeployment(deploymentId, {
+      status: "cancelled",
+      failure_kind: "superseded",
+      rollback_status: project.active_deployment_id ? "automatic_succeeded" : "not_required",
+      rollback_deployment_id: project.active_deployment_id,
+      error: "Deployment wurde durch einen neueren GitHub-Push ersetzt",
+      finished_at: new Date().toISOString()
+    });
+    this.safeLog(deploymentId, "system", "Ein neuerer GitHub-Push liegt bereit; diese Version wird nicht aktiviert.");
+    return true;
+  }
+
+  private async recoverInterruptedDeployments(): Promise<void> {
+    for (const containerId of await this.managedContainerIds({ name: "candidate", value: "true" })) {
+      await this.removeContainer(containerId);
+    }
+
+    for (const deployment of this.database.listInterruptedDeployments()) {
+      const project = this.database.getProject(deployment.project_id);
+      if (!project) {
+        this.database.updateDeployment(deployment.id, {
+          status: "failed",
+          error: "Project disappeared while recovering an interrupted deployment",
+          finished_at: new Date().toISOString()
+        });
+        continue;
+      }
+
+      const runtimeNames = [
+        ...deploymentContainerNames(project.slug, deployment.id, deployment.runtime_container),
+        ...stableContainerNames(project.slug, deployment.image_tag)
+      ];
+      let runtimeName = runtimeNames[0] ?? deploymentContainerName(project.slug, deployment.id);
+      let runtimeDeploymentId: string | null = null;
+      for (const candidateName of new Set(runtimeNames)) {
+        const candidateDeploymentId = await this.containerDeploymentId(candidateName);
+        if (candidateDeploymentId === deployment.id) {
+          runtimeName = candidateName;
+          runtimeDeploymentId = candidateDeploymentId;
+          break;
+        }
+      }
+      const previousDeploymentId = deployment.rollback_deployment_id ?? null;
+      const previousDeployment = previousDeploymentId
+        ? this.database.getDeployment(previousDeploymentId)
+        : undefined;
+
+      if (
+        deployment.status === "switching" &&
+        runtimeDeploymentId === deployment.id &&
+        (!isManagedVersionedRuntimeName(runtimeName) || isDockerDnsLabel(runtimeName)) &&
+        deployment.image_tag &&
+        deployment.internal_port
+      ) {
+        let rollbackStatus: DeploymentRollbackStatus = previousDeploymentId ? "automatic_failed" : "not_required";
+        let candidateHealthy = false;
+        try {
+          this.log(deployment.id, "system", "Worker wurde während des Umschaltens neu gestartet; prüfe den versionsgebundenen Container.");
+          await this.waitForHealth(runtimeName, deployment.internal_port, healthcheckPathFor(project, deployment), deployment.id);
+          candidateHealthy = true;
+
+          const currentProject = this.database.getProject(project.id);
+          if (!currentProject) throw new DeploymentActivationError("Projekt ist während der Recovery nicht mehr verfügbar");
+          if (currentProject.active_deployment_id !== deployment.id) {
+            if (currentProject.active_deployment_id !== previousDeploymentId) {
+              throw new DeploymentActivationError("Aktives Deployment hat sich während der Recovery geändert");
+            }
+            if (!this.database.activateDeploymentRuntime(deployment.id, project.id, previousDeploymentId)) {
+              throw new DeploymentActivationError("Deployment konnte während der Recovery nicht aktiviert werden");
+            }
+          }
+
+          reconcileRouting(this.config, this.database);
+          if (!this.database.completeDeploymentActivation(deployment.id, project.id, new Date().toISOString())) {
+            throw new DeploymentActivationError("Deployment-Recovery konnte nicht atomar abgeschlossen werden");
+          }
+          await this.removeObsoleteRuntimeContainers(project, runtimeName, previousDeployment, deployment.previous_image_tag);
+          this.log(deployment.id, "system", "Unterbrochenes Umschalten wurde erfolgreich wiederhergestellt.");
+          continue;
+        } catch (error) {
+          const latestProject = this.database.getProject(project.id);
+          const restored = latestProject?.active_deployment_id === deployment.id
+            ? this.database.restoreProjectActiveDeployment(
+                project.id,
+                deployment.id,
+                previousDeploymentId,
+                project.static_base_path
+              )
+            : latestProject?.active_deployment_id === previousDeploymentId;
+          try {
+            if (!restored) throw new Error("Aktives Deployment konnte nicht auf die vorige Version zurückgesetzt werden");
+            const previousRuntime = previousDeployment
+              ? await this.ensureDeploymentRuntime(project, previousDeployment, deployment.id)
+              : null;
+            if (previousDeploymentId && !previousRuntime) {
+              throw new Error("Vorige Runtime ist nicht mehr verfügbar");
+            }
+            reconcileRouting(this.config, this.database);
+            rollbackStatus = previousDeploymentId ? "automatic_succeeded" : "not_required";
+          } catch (rollbackError) {
+            rollbackStatus = "automatic_failed";
+            this.safeLog(
+              deployment.id,
+              "stderr",
+              `Automatischer Recovery-Rollback fehlgeschlagen: ${rollbackError instanceof Error ? rollbackError.message : "unbekannter Fehler"}`
+            );
+          }
+          this.database.updateDeployment(deployment.id, {
+            status: "failed",
+            failure_kind: candidateHealthy ? "activation" : "healthcheck",
+            rollback_status: rollbackStatus,
+            rollback_deployment_id: previousDeploymentId,
+            error: error instanceof Error ? error.message : "Recovery-Aktivierung fehlgeschlagen",
+            finished_at: new Date().toISOString()
+          });
+          if (rollbackStatus !== "automatic_failed") await this.removeContainer(runtimeName);
+          this.safeLog(deployment.id, "stderr", error instanceof Error ? error.message : "Recovery-Aktivierung fehlgeschlagen");
+          continue;
+        }
+      }
+
+      if (runtimeDeploymentId === deployment.id) await this.removeContainer(runtimeName);
+      let interruptionRollbackStatus: DeploymentRollbackStatus = previousDeploymentId
+        ? "automatic_failed"
+        : "not_required";
+      if (deployment.status === "switching" || previousDeploymentId) {
+        try {
+          const latestProject = this.database.getProject(project.id);
+          if (!latestProject) throw new Error("Projekt ist während der Recovery nicht mehr verfügbar");
+          if (latestProject.active_deployment_id === deployment.id) {
+            if (!this.database.restoreProjectActiveDeployment(
+              project.id,
+              deployment.id,
+              previousDeploymentId,
+              project.static_base_path
+            )) throw new Error("Aktives Deployment konnte nicht zurückgesetzt werden");
+          } else if (latestProject.active_deployment_id !== previousDeploymentId) {
+            throw new Error("Aktives Deployment hat sich während der Recovery geändert");
+          }
+          const previousRuntime = previousDeployment
+            ? await this.ensureDeploymentRuntime(project, previousDeployment, deployment.id)
+            : null;
+          if (previousDeploymentId && !previousRuntime) throw new Error("Vorige Runtime ist nicht mehr verfügbar");
+          reconcileRouting(this.config, this.database);
+          interruptionRollbackStatus = previousDeploymentId ? "automatic_succeeded" : "not_required";
+        } catch (rollbackError) {
+          interruptionRollbackStatus = "automatic_failed";
+          this.safeLog(
+            deployment.id,
+            "stderr",
+            `Recovery-Rollback fehlgeschlagen: ${rollbackError instanceof Error ? rollbackError.message : "unbekannter Fehler"}`
+          );
+        }
+      }
+      if (deployment.cancel_requested_at) {
+        this.database.finalizeDeploymentCancellation(
+          deployment.id,
+          interruptionRollbackStatus,
+          previousDeploymentId
+        );
+        this.safeLog(deployment.id, "system", "Angefordertes Deployment wurde nach dem Worker-Neustart abgebrochen.");
+        continue;
+      }
+
+      this.database.updateDeployment(deployment.id, {
+        status: "failed",
+        failure_kind: deployment.status === "switching" ? "activation" : "worker",
+        rollback_status: interruptionRollbackStatus,
+        rollback_deployment_id: previousDeploymentId,
+        error: "Deployment wurde durch einen Worker-Neustart unterbrochen",
+        finished_at: new Date().toISOString()
+      });
+      this.safeLog(deployment.id, "stderr", "Deployment wurde durch einen Worker-Neustart beendet; die vorige aktive Version bleibt online.");
+    }
+  }
+
+  private async ensureDeploymentRuntime(
+    project: ProjectRow,
+    deployment: DeploymentRow,
+    recoveryDeploymentId: string
+  ): Promise<string | null> {
+    const names = [
+      ...deploymentContainerNames(project.slug, deployment.id, deployment.runtime_container),
+      ...stableContainerNames(project.slug, deployment.image_tag)
+    ];
+    for (const name of new Set(names)) {
+      if (await this.containerExists(name)) {
+        if (isManagedVersionedRuntimeName(name) && !isDockerDnsLabel(name)) {
+          await this.removeContainer(name);
+          continue;
+        }
+        if (isManagedVersionedRuntimeName(name) && deployment.runtime_container !== name) {
+          this.database.updateDeployment(deployment.id, { runtime_container: name });
+        }
+        return name;
+      }
+    }
+    if (!deployment.image_tag || !deployment.internal_port) return null;
+
+    const name = deploymentContainerName(project.slug, deployment.id);
+    await this.startContainer(name, deployment.image_tag, project, deployment.internal_port, true, deployment.id);
+    await this.waitForHealth(
+      name,
+      deployment.internal_port,
+      healthcheckPathFor(project, deployment),
+      recoveryDeploymentId
+    );
+    if (deployment.runtime_container !== name) this.database.updateDeployment(deployment.id, { runtime_container: name });
+    return name;
+  }
+
+  private async removeObsoleteRuntimeContainers(
+    project: ProjectRow,
+    activeRuntimeName: string,
+    previousDeployment?: DeploymentRow,
+    previousImage?: string | null,
+    observedRuntimeName?: string
+  ): Promise<void> {
+    const names = new Set([
+      ...(observedRuntimeName ? [observedRuntimeName] : []),
+      ...(previousDeployment
+        ? deploymentContainerNames(project.slug, previousDeployment.id, previousDeployment.runtime_container)
+        : []),
+      ...stableContainerNames(project.slug, previousDeployment?.image_tag ?? previousImage)
+    ]);
+    names.delete(activeRuntimeName);
+    for (const name of names) await this.removeContainer(name);
+  }
+
+  private async cleanupInactiveRuntimeContainers(): Promise<void> {
+    for (const containerId of await this.managedContainerIds()) {
+      const [projectId, deploymentId] = await Promise.all([
+        this.containerManagedLabel(containerId, "project"),
+        this.containerManagedLabel(containerId, "deployment")
+      ]);
+      if (!projectId || !deploymentId) continue;
+      const project = this.database.getProject(projectId);
+      if (project && project.active_deployment_id !== deploymentId) await this.removeContainer(containerId);
+    }
+  }
+
+  private async reconcileCloudflaredRestart(): Promise<void> {
+    const requested = this.database.getSetting("worker.cloudflared_restart_requested");
+    if (!requested || requested === this.database.getSetting("worker.cloudflared_restart_completed")) return;
+    const ids = new Set<string>();
+    for (const projectName of COMPOSE_PROJECT_NAMES) {
+      const containers = await runCommand("docker", [
+        "ps", "-aq",
+        "--filter", `label=com.docker.compose.project=${projectName}`,
+        "--filter", "label=com.docker.compose.service=cloudflared"
+      ], { allowFailure: true });
+      for (const id of containers.stdout.split("\n").map((value) => value.trim()).filter(Boolean)) ids.add(id);
+    }
+    if (ids.size === 0) return;
+    for (const id of ids) await runCommand("docker", ["restart", id]);
+    this.database.setSetting("worker.cloudflared_restart_completed", requested);
+  }
+
+  private async resetWorkspaces(): Promise<void> {
+    await fs.promises.rm(this.config.workspacesDir, { recursive: true, force: true });
+    await fs.promises.mkdir(this.config.workspacesDir, { recursive: true, mode: 0o700 });
+  }
+
+  private async maintainDockerStorage(deploymentId: string): Promise<void> {
+    try {
+      await runCommand("docker", ["builder", "prune", "-f", "--max-used-space", `${this.config.BUILD_CACHE_MAX_GB}gb`], {
+        timeoutMs: 5 * 60_000
+      });
+      for (const namespace of MANAGED_LABEL_NAMESPACES) {
+        await runCommand("docker", ["image", "prune", "-f", "--filter", `label=${namespace}.managed=true`], {
+          timeoutMs: 5 * 60_000
+        });
+      }
+      this.database.setSetting("worker.storage_maintenance", new Date().toISOString());
+    } catch (error) {
+      this.safeLog(deploymentId, "stderr", `Docker-Speicherbereinigung fehlgeschlagen: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
+    }
+  }
+}
+
+export function findContentRoot(sourceRoot: string, projectRoot = "."): string {
+  const ignoredRootMetadata = new Set([".ds_store", "__macosx", "desktop.ini", "thumbs.db"]);
+  const entries = fs.readdirSync(sourceRoot, { withFileTypes: true })
+    .filter((entry) => !ignoredRootMetadata.has(entry.name.toLowerCase()));
+  if (entries.length !== 1 || !entries[0]?.isDirectory()) return sourceRoot;
+  const wrapper = resolveWithin(sourceRoot, entries[0].name);
+  if (projectRoot === ".") return wrapper;
+  const rawProjectRoot = resolveWithin(sourceRoot, projectRoot);
+  const wrappedProjectRoot = resolveWithin(wrapper, projectRoot);
+  // Preserve explicit archive-level paths. If both interpretations happen to
+  // exist, the manual/raw meaning wins deterministically.
+  if (fs.existsSync(rawProjectRoot)) return sourceRoot;
+  if (fs.existsSync(wrappedProjectRoot)) return wrapper;
+  return sourceRoot;
+}
+
+export function refreshProjectSourceAnalysis(
+  database: Database,
+  projectId: string,
+  sourceDirectory: string
+): ProjectAnalysis | null {
+  try {
+    const analysis = analyzeProjectDirectory(sourceDirectory);
+    return database.updateProjectSourceAnalysis(projectId, JSON.stringify(analysis)) ? analysis : null;
+  } catch {
+    return null;
+  }
+}
+
+function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DeploymentCancelledError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abortHandler);
+      resolve();
+    }, milliseconds);
+    const abortHandler = (): void => {
+      clearTimeout(timer);
+      reject(new DeploymentCancelledError());
+    };
+    signal?.addEventListener("abort", abortHandler, { once: true });
+  });
+}
+
+export function hasActiveDeployment(database: Database, projectId: string): boolean {
+  return database.listDeployments(projectId, 10).some((deployment) => activeStatuses.has(deployment.status));
+}

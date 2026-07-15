@@ -1,0 +1,66 @@
+name: Fehler melden
+description: Melde einen reproduzierbaren Fehler in Shelter.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Danke für die Meldung. Bitte teile keine Secrets oder vollständigen `.env`-Dateien. Sicherheitslücken gehören in den privaten Prozess aus `SECURITY.md`.
+  - type: input
+    id: version
+    attributes:
+      label: Shelter-Version
+      description: Commit-SHA, Tag oder Zeitpunkt des letzten Updates.
+      placeholder: z. B. 1a2b3c4
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Umgebung
+      description: Betriebssystem, Browser sowie Docker- und Compose-Version, soweit relevant.
+      placeholder: Ubuntu 24.04, Docker 28.x, Compose v2.x, Firefox 128
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Schritte zum Reproduzieren
+      placeholder: |
+        1. Öffne …
+        2. Wähle …
+        3. Beobachte …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Erwartetes Verhalten
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Tatsächliches Verhalten
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Bereinigte Logs oder Screenshots
+      description: Kürze die Ausgabe und entferne Tokens, Cookies, Domains, IPs, E-Mails und private Repository-URLs.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Vor dem Absenden
+      options:
+        - label: Ich habe nach bestehenden Issues gesucht.
+          required: true
+        - label: Ich habe geprüft, dass keine Zugangsdaten oder anderen Secrets enthalten sind.
+          required: true
+        - label: Dies ist keine öffentlich gemeldete Sicherheitslücke.
+          required: true
+

@@ -1,0 +1,51 @@
+name: Feature vorschlagen
+description: Beschreibe eine Verbesserung und den zugrunde liegenden Anwendungsfall.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Welches Problem soll gelöst werden?
+      description: Beschreibe den konkreten Ablauf und warum die heutige Lösung nicht ausreicht.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Gewünschte Lösung
+      description: Beschreibe das Ergebnis aus Sicht der Nutzer, nicht nur eine technische Umsetzung.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativen
+      description: Welche Workarounds oder anderen Lösungen hast du erwogen?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Bereich
+      options:
+        - Projekte und Deployments
+        - GitHub und Git-Quellen
+        - Uploads und Build-Erkennung
+        - Domains und Cloudflare
+        - Dashboard und Bedienung
+        - Installation und Betrieb
+        - Sicherheit
+        - Dokumentation
+        - Anderer Bereich
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Vor dem Absenden
+      options:
+        - label: Ich habe nach bestehenden Issues und Pull Requests gesucht.
+          required: true
+        - label: Die Idee passt zum Single-VPS- und Single-Admin-Fokus von Shelter oder begründet eine bewusste Erweiterung.
+          required: true
+

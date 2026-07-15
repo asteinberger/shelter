@@ -1,0 +1,31 @@
+{
+  "name": "@shelter/cli",
+  "version": "0.1.0",
+  "description": "Command-line client for self-hosted Shelter installations.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "bin": {
+    "shelter": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

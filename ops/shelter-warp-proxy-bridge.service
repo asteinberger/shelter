@@ -1,0 +1,26 @@
+[Unit]
+Description=Shelter OAuth proxy bridge to the local Cloudflare WARP client
+Documentation=https://developers.cloudflare.com/cloudflare-one/team-and-resources/devices/cloudflare-one-client/configure/modes/
+After=network-online.target docker.service warp-svc.service
+Wants=network-online.target
+Requires=docker.service warp-svc.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/socat TCP-LISTEN:40001,bind=10.253.253.1,reuseaddr,fork TCP:127.0.0.1:40000
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

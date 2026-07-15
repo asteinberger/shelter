@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.vite/
+.env
+.env.*
+!.env.example
+!.env.server.example
+data/*
+!data/.gitkeep
+apps/server/data/
+traefik/dynamic.yml
+coverage/
+*.log
+.DS_Store
+*.tsbuildinfo
