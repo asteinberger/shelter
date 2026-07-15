@@ -495,9 +495,9 @@ run its release installer:
 ```sh
 ./ops/download-release.sh \
   --repo asteinberger/shelter \
-  --tag v0.2.0 \
-  --destination ../shelter-v0.2.0
-cd ../shelter-v0.2.0
+  --tag v0.2.1 \
+  --destination ../shelter-v0.2.1
+cd ../shelter-v0.2.1
 ./ops/install-release-bundle.sh \
   --installation /opt/shelter \
   -- --non-interactive
