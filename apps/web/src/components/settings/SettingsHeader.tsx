@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
-import { Braces, Cloud, Github, ShieldCheck } from 'lucide-react';
+import { Braces, Cloud, ShieldCheck } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useI18n } from '@/i18n';
 import { Button, PageIntro } from '@/components/ui';
+import { GitHubIcon } from '@/components/GitHubIcon';
 
 export type SettingsSection = 'cloudflare' | 'github' | 'api' | 'security';
 
@@ -47,7 +48,7 @@ export function SettingsHeader({
 
   const items = [
     { key: 'cloudflare' as const, to: '/settings/cloudflare', label: 'Cloudflare & Routing', icon: Cloud },
-    { key: 'github' as const, to: '/settings/github', label: 'GitHub', icon: Github },
+    { key: 'github' as const, to: '/settings/github', label: 'GitHub', icon: GitHubIcon },
     { key: 'api' as const, to: '/settings/api', label: 'API & CLI', icon: Braces },
     { key: 'security' as const, to: '/settings/security', label: t('Security', 'Sicherheit'), icon: ShieldCheck },
   ];
