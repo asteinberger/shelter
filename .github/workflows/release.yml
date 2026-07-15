@@ -44,7 +44,7 @@ jobs:
           fi
           prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
           semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
-          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+          if ! [[ "$TAG_NAME" =~ $semver_pattern ]]; then
             echo "::error title=Invalid release tag::Release tags must use vMAJOR.MINOR.PATCH with an optional SemVer prerelease suffix; numeric prerelease identifiers must not have leading zeros."
             exit 1
           fi
@@ -126,7 +126,7 @@ jobs:
           fi
           prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
           semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
-          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+          if ! [[ "$TAG_NAME" =~ $semver_pattern ]]; then
             echo "::error title=Invalid release tag::Release tags must use vMAJOR.MINOR.PATCH with an optional SemVer prerelease suffix; numeric prerelease identifiers must not have leading zeros."
             exit 1
           fi
@@ -811,7 +811,7 @@ jobs:
           fi
           prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
           semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
-          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+          if ! [[ "$TAG_NAME" =~ $semver_pattern ]]; then
             echo "::error title=Invalid release tag::The promotion tag must use strict SemVer."
             exit 1
           fi
@@ -1167,7 +1167,7 @@ jobs:
           fi
           prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
           semver_pattern="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
-          if [[ ! "$TAG_NAME" =~ $semver_pattern ]]; then
+          if ! [[ "$TAG_NAME" =~ $semver_pattern ]]; then
             echo "::error title=Invalid release tag::Release tags must use strict SemVer without numeric prerelease leading zeros."
             exit 1
           fi
@@ -1651,6 +1651,6 @@ jobs:
           {
             echo '## Shelter release published'
             echo
-            printf -- '- Image: `%s`\n' "$IMAGE_REFERENCE"
+            printf -- '%s\n' "- Image: \`$IMAGE_REFERENCE\`"
             printf -- '- Release: %s\n' "$RELEASE_URL"
           } >> "$GITHUB_STEP_SUMMARY"
