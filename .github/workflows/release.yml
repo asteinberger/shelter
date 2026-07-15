@@ -188,31 +188,19 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_REQUIRED: ${{ vars.SHELTER_IMMUTABLE_RELEASES_REQUIRED }}
           REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          immutable_error="$(mktemp)"
-          releases_error="$(mktemp)"
-          trap 'rm -f "$immutable_error" "$releases_error"' EXIT
-
-          if ! immutable_state="$(gh api "/repos/${REPOSITORY}/immutable-releases" 2> "$immutable_error")"; then
-            echo "::error title=Unable to verify immutable releases::The repository immutable-release setting could not be read. Refusing to push a release image."
+          if [[ "$IMMUTABLE_RELEASES_REQUIRED" != "true" ]]; then
+            echo "::error title=Immutable releases not acknowledged::An administrator must first enable immutable releases and then set SHELTER_IMMUTABLE_RELEASES_REQUIRED to exactly true. Refusing to push a release image."
             exit 1
           fi
-          immutable_enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else "invalid" end' <<< "$immutable_state")"
-          case "$immutable_enabled" in
-            true) ;;
-            false)
-              echo "::error title=Immutable releases disabled::Enable immutable releases for this repository before publishing. No registry content has been pushed."
-              exit 1
-              ;;
-            *)
-              echo "::error title=Invalid immutable-release response::GitHub returned an unexpected immutable-release setting. Refusing to push a release image."
-              exit 1
-              ;;
-          esac
+
+          releases_error="$(mktemp)"
+          trap 'rm -f "$releases_error"' EXIT
 
           if ! releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100" 2> "$releases_error")"; then
             echo "::error title=Unable to check existing releases::The releases API did not return a definitive state. Refusing to push a release image."
@@ -789,6 +777,7 @@ jobs:
     env:
       DOCKER_CONFIG: /tmp/shelter-docker-config-${{ github.run_id }}-${{ github.run_attempt }}-promote
     permissions:
+      attestations: read
       contents: read
       packages: write
 
@@ -1043,6 +1032,7 @@ jobs:
         env:
           COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_REQUIRED: ${{ vars.SHELTER_IMMUTABLE_RELEASES_REQUIRED }}
           REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
@@ -1057,8 +1047,8 @@ jobs:
             echo "::error title=Release commit is no longer on main::Promotion was refused."
             exit 1
           }
-          [[ "$(gh api "/repos/${REPOSITORY}/immutable-releases" --jq '.enabled')" == "true" ]] || {
-            echo "::error title=Immutable releases disabled::Promotion was refused."
+          [[ "$IMMUTABLE_RELEASES_REQUIRED" == "true" ]] || {
+            echo "::error title=Immutable releases not acknowledged::An administrator must first enable immutable releases and then set SHELTER_IMMUTABLE_RELEASES_REQUIRED to exactly true. Promotion was refused."
             exit 1
           }
           releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100")"
@@ -1139,6 +1129,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      attestations: read
       contents: write
 
     steps:
@@ -1366,6 +1357,7 @@ jobs:
           CHECKSUMS_SHA256: ${{ steps.metadata.outputs.checksums_sha256 }}
           COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_REQUIRED: ${{ vars.SHELTER_IMMUTABLE_RELEASES_REQUIRED }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           TAG_NAME: ${{ github.ref_name }}
@@ -1384,25 +1376,13 @@ jobs:
             exit 1
           fi
 
-          immutable_error="$(mktemp)"
-          releases_error="$(mktemp)"
-          trap 'rm -f "$immutable_error" "$releases_error"' EXIT
-          if ! immutable_state="$(gh api "/repos/${REPOSITORY}/immutable-releases" 2> "$immutable_error")"; then
-            echo "::error title=Unable to verify immutable releases::The repository setting could not be read."
+          if [[ "$IMMUTABLE_RELEASES_REQUIRED" != "true" ]]; then
+            echo "::error title=Immutable releases not acknowledged::An administrator must first enable immutable releases and then set SHELTER_IMMUTABLE_RELEASES_REQUIRED to exactly true. The GitHub Release will not be published."
             exit 1
           fi
-          immutable_enabled="$(jq -r 'if (.enabled | type) == "boolean" then .enabled else "invalid" end' <<< "$immutable_state")"
-          case "$immutable_enabled" in
-            true) ;;
-            false)
-              echo "::error title=Immutable releases disabled::The GitHub Release will not be published."
-              exit 1
-              ;;
-            *)
-              echo "::error title=Invalid immutable-release response::GitHub returned an unexpected repository setting."
-              exit 1
-              ;;
-          esac
+
+          releases_error="$(mktemp)"
+          trap 'rm -f "$releases_error"' EXIT
 
           if ! releases="$(gh api --paginate --slurp "/repos/${REPOSITORY}/releases?per_page=100" 2> "$releases_error")"; then
             echo "::error title=Unable to check existing releases::The GitHub Release will not be published without a definitive API response."
@@ -1443,6 +1423,7 @@ jobs:
           COMMIT_SHA: ${{ steps.metadata.outputs.commit_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_REFERENCE: ${{ steps.metadata.outputs.image_reference }}
+          IMMUTABLE_RELEASES_REQUIRED: ${{ vars.SHELTER_IMMUTABLE_RELEASES_REQUIRED }}
           PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -1582,8 +1563,8 @@ jobs:
             exit 1
           fi
 
-          # Revalidate source and immutable-release policy immediately before
-          # the only transition that makes the draft public and immutable.
+          # Revalidate source and the administrator's immutable-release
+          # acknowledgement immediately before the only public transition.
           git fetch --force --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           git fetch --force --no-tags origin "refs/tags/${TAG_NAME}:refs/shelter-release/final-draft-tag"
           [[ "$(git rev-parse 'refs/shelter-release/final-draft-tag^{commit}')" == "$COMMIT_SHA" ]] || {
@@ -1594,8 +1575,8 @@ jobs:
             echo "::error title=Release commit is no longer on main::The owned draft remains unpublished."
             exit 1
           }
-          [[ "$(gh api "/repos/${REPOSITORY}/immutable-releases" --jq '.enabled')" == "true" ]] || {
-            echo "::error title=Immutable releases disabled::The owned draft remains unpublished."
+          [[ "$IMMUTABLE_RELEASES_REQUIRED" == "true" ]] || {
+            echo "::error title=Immutable releases not acknowledged::An administrator must first enable immutable releases and then set SHELTER_IMMUTABLE_RELEASES_REQUIRED to exactly true. The owned draft remains unpublished."
             exit 1
           }
 

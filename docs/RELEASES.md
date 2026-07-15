@@ -23,9 +23,17 @@ A published release has all of the following properties:
 - GitHub Release immutability locks the release tag and assets after the draft
   has been populated and published.
 
-Repository administrators must keep **Settings → Releases → Immutable
-releases** enabled. Do not publish Shelter releases from another workflow or by
-uploading assets manually.
+Before the first production release, a repository administrator must first
+enable **Settings → Releases → Immutable releases** and then create the Actions
+repository variable `SHELTER_IMMUTABLE_RELEASES_REQUIRED` with the exact value
+`true` under **Settings → Secrets and variables → Actions → Variables**. The
+variable is a fail-closed administrator acknowledgement because the workflow's
+`GITHUB_TOKEN` cannot read the administrative immutable-release setting. It is
+not a substitute for enabling the setting itself. After publication, the
+workflow verifies the real GitHub state through `isImmutable` and
+`gh release verify`; the job fails unless both confirm an immutable, signed
+release. Do not publish Shelter releases from another workflow or by uploading
+assets manually.
 
 These guarantees protect the distribution of Shelter itself. They do not make
 Docker builds of deployed projects safe for hostile tenants; see
