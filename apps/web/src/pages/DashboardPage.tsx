@@ -45,6 +45,7 @@ import { formatRelative } from '../utils/format';
 import { isFileStorageProject, projectRuntimeSearchTerms } from '../utils/project-runtime';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/i18n';
+import { ProductionSafetyAlert } from '../components/ProductionSafetyAlert';
 
 const INITIAL_PROJECT_COUNT = 8;
 const PROJECT_VIEW_STORAGE_KEY = 'shelter-project-view';
@@ -355,6 +356,8 @@ export function DashboardPage() {
           </div>
         </Alert>
       )}
+
+      <ProductionSafetyAlert accessProtection={data?.system?.accessProtection} />
 
       {infrastructureIssue && (
         <Alert variant={infrastructureIssue.kind === 'worker' ? 'destructive' : 'default'} className="items-start p-4">

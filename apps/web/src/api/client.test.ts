@@ -139,6 +139,55 @@ describe('deployment api', () => {
   });
 });
 
+describe('cloudflare access protection api', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('confirms the exact panel hostname and unwraps the returned posture', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      accessProtection: {
+        status: 'confirmed_by_admin',
+        panelDomain: 'hosting.example.com',
+        confirmedHostname: 'hosting.example.com',
+        confirmedAt: '2026-07-15T08:30:00.000Z',
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.confirmCloudflareAccessProtection('hosting.example.com')).resolves.toMatchObject({
+      status: 'confirmed_by_admin',
+      panelDomain: 'hosting.example.com',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/settings/cloudflare/access-protection/confirmation',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ panelDomain: 'hosting.example.com' }),
+        credentials: 'include',
+      }),
+    );
+  });
+
+  it('revokes only the Shelter administrator confirmation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      accessProtection: {
+        status: 'action_required',
+        panelDomain: 'hosting.example.com',
+        confirmedHostname: null,
+        confirmedAt: null,
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.revokeCloudflareAccessProtection()).resolves.toMatchObject({ status: 'action_required' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/settings/cloudflare/access-protection/confirmation',
+      expect.objectContaining({ method: 'DELETE', credentials: 'include' }),
+    );
+  });
+});
+
 describe('github api', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

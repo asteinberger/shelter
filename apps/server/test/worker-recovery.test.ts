@@ -16,7 +16,8 @@ const defaultCandidateDeploymentId = "dep_recovery_candidate";
 const docker = vi.hoisted(() => ({
   candidateName: "shelter-run-recovery-candidate",
   candidateDeploymentId: "dep_recovery_candidate",
-  removed: [] as string[]
+  removed: [] as string[],
+  probed: [] as string[]
 }));
 
 vi.mock("../src/lib/command.js", async () => {
@@ -26,6 +27,10 @@ vi.mock("../src/lib/command.js", async () => {
     runCommand: vi.fn(async (command: string, args: string[]) => {
       if (command !== "docker") return { stdout: "", stderr: "", exitCode: 0 };
       if (args[0] === "ps") return { stdout: "", stderr: "", exitCode: 0 };
+      if (args[0] === "run" && args.includes("shelter.helper=probe")) {
+        docker.probed.push(args.at(-1) ?? "");
+        return { stdout: JSON.stringify({ status: 200 }), stderr: "", exitCode: 0 };
+      }
       if (args[0] === "inspect" && args[1] === "-f") {
         const template = args[2] ?? "";
         const name = args[3] ?? "";
@@ -41,10 +46,10 @@ vi.mock("../src/lib/command.js", async () => {
         }
       }
       if (args[0] === "inspect") {
-        return { stdout: "", stderr: "not found", exitCode: 1 };
+        return { stdout: "", stderr: "Error: No such container: missing", exitCode: 1 };
       }
-      if (args[0] === "rm" && args[1] === "-f" && args[2]) {
-        docker.removed.push(args[2]);
+      if (args[0] === "rm" && args[1] === "-f" && args.at(-1)) {
+        docker.removed.push(args.at(-1)!);
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       return { stdout: "", stderr: "", exitCode: 0 };
@@ -107,6 +112,7 @@ afterEach(() => {
   docker.candidateName = defaultCandidateName;
   docker.candidateDeploymentId = defaultCandidateDeploymentId;
   docker.removed.length = 0;
+  docker.probed.length = 0;
   for (const database of databases.splice(0)) {
     if (database.sqlite.open) database.close();
   }
@@ -161,9 +167,6 @@ describe("deployment recovery", () => {
       error: null,
       created_at: new Date().toISOString()
     });
-    const fetchMock = vi.fn(async () => new Response("ok", { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
-
     const worker = new DeploymentWorker(config, database);
     await (worker as unknown as { recoverInterruptedDeployments(): Promise<void> }).recoverInterruptedDeployments();
 
@@ -177,10 +180,7 @@ describe("deployment recovery", () => {
       static_base_path: "/new"
     });
     expect(fs.readFileSync(config.traefikConfigPath, "utf8")).toContain(`http://${docker.candidateName}:3000`);
-    expect(fetchMock).toHaveBeenCalledWith(
-      `http://${docker.candidateName}:3000/health`,
-      expect.objectContaining({ redirect: "manual" })
-    );
+    expect(docker.probed).toContain(`http://${docker.candidateName}:3000/health`);
     expect(docker.removed).toContain("shelter-run-recovery-old");
     expect(docker.removed).not.toContain(docker.candidateName);
   });

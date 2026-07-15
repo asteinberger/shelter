@@ -389,7 +389,9 @@ describe("project deletion worker", () => {
     expect(database.queueProjectDeletion(row.id)).toBe(true);
     const command = vi.fn<ProjectDeletionCommandRunner>()
       .mockRejectedValueOnce(new Error("Docker is unavailable"))
-      .mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+      .mockImplementation(async (_command, args) => args[0] === "network" && args[1] === "inspect"
+        ? { stdout: "", stderr: `Error response from daemon: network ${args.at(-1)} not found`, exitCode: 1 }
+        : { stdout: "", stderr: "", exitCode: 0 });
     const worker = new ProjectDeletionWorker(config, database, command);
 
     await expect(worker.processNext()).resolves.toBe(true);
@@ -437,14 +439,28 @@ describe("project deletion worker", () => {
     const calls: string[][] = [];
     const command: ProjectDeletionCommandRunner = vi.fn(async (_command: string, args: string[]) => {
       calls.push([...args]);
+      if (args[0] === "network" && args[1] === "inspect") {
+        return { stdout: "", stderr: `Error response from daemon: network ${args.at(-1)} not found`, exitCode: 1 };
+      }
       if (args[0] === "ps") {
         return { stdout: containerPresent ? containerId : "", stderr: "", exitCode: 0 };
+      }
+      if (args[0] === "inspect" && args.some((value) => value.includes('"name"'))) {
+        return {
+          stdout: JSON.stringify({
+            name: "/portsmith-app-worker-partial",
+            image: "portsmith/worker-partial:ready",
+            labels: { "portsmith.managed": "true", "portsmith.project": row.id }
+          }),
+          stderr: "",
+          exitCode: 0
+        };
       }
       if (args[0] === "rm") {
         containerPresent = false;
         return { stdout: "", stderr: "", exitCode: 0 };
       }
-      if (args.slice(0, 3).join(" ") === "image ls -q") {
+      if (args[0] === "image" && args[1] === "inspect") {
         return { stdout: imageId, stderr: "", exitCode: 0 };
       }
       if (args[0] === "image" && args[1] === "rm") {
@@ -567,6 +583,9 @@ describe("project deletion worker", () => {
     const calls: string[][] = [];
     const command: ProjectDeletionCommandRunner = vi.fn(async (_command: string, args: string[]) => {
       calls.push(args);
+      if (args[0] === "network" && args[1] === "inspect") {
+        return { stdout: "", stderr: `Error response from daemon: network ${args.at(-1)} not found`, exitCode: 1 };
+      }
       if (args[0] === "ps") {
         return {
           stdout: args.includes(`label=portsmith.project=${first.id}`) ? ownedContainer : "",
@@ -574,10 +593,20 @@ describe("project deletion worker", () => {
           exitCode: 0
         };
       }
-      if (args.slice(0, 3).join(" ") === "image ls -q") {
-        const deploymentFilter = args.find((value) => value.startsWith("label=portsmith.deployment="));
+      if (args[0] === "inspect" && args.some((value) => value.includes('"name"'))) {
         return {
-          stdout: deploymentFilter?.endsWith("dep_cleanup_ready") ? readyImage : failedImage,
+          stdout: JSON.stringify({
+            name: "/portsmith-app-cleanup-one",
+            image: "portsmith/cleanup-one:ready",
+            labels: { "portsmith.managed": "true", "portsmith.project": first.id }
+          }),
+          stderr: "",
+          exitCode: 0
+        };
+      }
+      if (args[0] === "image" && args[1] === "inspect") {
+        return {
+          stdout: args.at(-1) === "portsmith/cleanup-one:ready" ? readyImage : failedImage,
           stderr: "",
           exitCode: 0
         };
@@ -608,7 +637,7 @@ describe("project deletion worker", () => {
       "--filter", "label=shelter.managed=true",
       "--filter", `label=shelter.project=${first.id}`
     ]);
-    expect(calls).toContainEqual(["rm", "-f", ownedContainer]);
+    expect(calls).toContainEqual(["rm", "-f", "-v", ownedContainer]);
     expect(calls).toContainEqual(["image", "rm", readyImage]);
     expect(calls).toContainEqual(["image", "rm", failedImage]);
     expect(calls.flat()).not.toContain(foreignContainer);
@@ -620,5 +649,76 @@ describe("project deletion worker", () => {
     expect(fs.existsSync(sourceDirectory)).toBe(false);
     expect(fs.existsSync(chunkDirectory)).toBe(false);
     expect(database.sqlite.prepare("SELECT id FROM uploads WHERE id = ?").get(uploadId)).toBeUndefined();
+  });
+
+  it("does not delete a current Shelter container that only forges legacy ownership of the victim", async () => {
+    const { config, database } = context();
+    const victim = project("prj_delete_victim", "Delete Victim");
+    database.createProject(victim);
+    const attackerContainer = "c".repeat(12);
+    const calls: string[][] = [];
+    const command = vi.fn<ProjectDeletionCommandRunner>(async (_binary, args) => {
+      calls.push([...args]);
+      if (args[0] === "ps" && args.includes(`label=portsmith.project=${victim.id}`)) {
+        return { stdout: attackerContainer, stderr: "", exitCode: 0 };
+      }
+      if (args[0] === "ps") return { stdout: "", stderr: "", exitCode: 0 };
+      if (args[0] === "inspect" && args.some((value) => value.includes('"name"'))) {
+        return {
+          stdout: JSON.stringify({
+            name: "/shelter-run-attacker",
+            image: "shelter/attacker:latest",
+            labels: {
+              "shelter.managed": "true",
+              "shelter.project": "prj_attacker",
+              "portsmith.managed": "true",
+              "portsmith.project": victim.id
+            }
+          }),
+          stderr: "",
+          exitCode: 0
+        };
+      }
+      if (args[0] === "network" && args[1] === "inspect") {
+        return { stdout: "", stderr: `Error response from daemon: network ${args.at(-1)} not found`, exitCode: 1 };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const worker = new ProjectDeletionWorker(config, database, command);
+    expect(database.prepareProjectDeletion(victim.id, victim.name).kind).toBe("started");
+    expect(database.queueProjectDeletion(victim.id)).toBe(true);
+
+    await expect(worker.processNext()).resolves.toBe(true);
+
+    expect(database.getProjectForDeletion(victim.id)).toBeUndefined();
+    expect(calls.some((args) => args[0] === "rm" && args.at(-1) === attackerContainer)).toBe(false);
+  });
+
+  it("keeps deletion retryable when a managed image cannot be inspected safely", async () => {
+    const { config, database } = context();
+    const projectRow = project("prj_image_inspect_failure", "Image Inspect Failure");
+    database.createProject(projectRow);
+    database.createDeployment(deployment("dep_image_inspect_failure", projectRow.id, "failed", {
+      image_tag: "shelter/image-inspect-failure:dep"
+    }));
+    const command = vi.fn<ProjectDeletionCommandRunner>(async (_binary, args) => {
+      if (args[0] === "ps") return { stdout: "", stderr: "", exitCode: 0 };
+      if (args[0] === "image" && args[1] === "inspect") {
+        return { stdout: "", stderr: "Cannot connect to the Docker daemon", exitCode: 1 };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const worker = new ProjectDeletionWorker(config, database, command);
+    expect(database.prepareProjectDeletion(projectRow.id, projectRow.name).kind).toBe("started");
+    expect(database.queueProjectDeletion(projectRow.id)).toBe(true);
+
+    await expect(worker.processNext()).resolves.toBe(true);
+
+    expect(database.getProjectForDeletion(projectRow.id)?.id).toBe(projectRow.id);
+    expect(database.getProjectDeletion(projectRow.id)).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("Cannot connect to the Docker daemon")
+    });
+    expect(command.mock.calls.some(([, args]) => args[0] === "image" && args[1] === "rm")).toBe(false);
   });
 });

@@ -265,6 +265,7 @@ export interface Overview {
   system?: {
     workerOnline?: boolean;
     tunnelConfigured?: boolean;
+    accessProtection?: CloudflareAccessProtection;
   };
 }
 
@@ -410,6 +411,14 @@ export interface CloudflareSettings {
   tunnelName: string | null;
   panelDomain: string | null;
   hasApiToken: boolean;
+  accessProtection: CloudflareAccessProtection;
+}
+
+export interface CloudflareAccessProtection {
+  status: 'not_applicable' | 'action_required' | 'confirmed_by_admin';
+  panelDomain: string | null;
+  confirmedHostname: string | null;
+  confirmedAt: string | null;
 }
 
 export interface CloudflareTestResult {

@@ -46,7 +46,7 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 - **Git-native:** private and public GitHub repositories through a minimally scoped GitHub App, with optional push-to-deploy and manual redeploy.
 - **Upload-friendly:** ZIP files and complete folders are uploaded in chunks, validated, and versioned.
 - **Useful defaults:** live source analysis for Next.js, React, Astro, Node.js, Vite, static exports, and safe file collections, with custom Dockerfile support when needed.
-- **Safe activation:** a candidate container must pass its health check before Traefik receives the new route.
+- **Safe activation:** a disposable, resource-bounded helper probes each candidate on its project-only network before Traefik receives the new route.
 - **Cloudflare integration:** OAuth, tunnels, zones, DNS, hostname availability, apex domains, and multiple project domains in one place.
 - **Instant context:** successful website deployments receive an automatic screenshot preview in the project overview.
 - **Operator-ready:** dashboard, live deployment logs, rollbacks, project deletion, encrypted variables, and resource limits.
@@ -99,7 +99,7 @@ flowchart LR
     CF -->|"Outbound tunnel"| CFD["cloudflared"]
     CFD --> TR["Traefik · file provider"]
     TR --> API["API + web panel"]
-    TR --> APP["active application containers"]
+    APP["active application containers"]
     API <--> DATA["shelter-data · database, sources, previews"]
     API --> ROUTING["shelter-routing"]
     API --> TUNNEL["shelter-tunnel"]
@@ -108,7 +108,11 @@ flowchart LR
     ROUTING --> TR
     TUNNEL --> CFD
     WORKER -->|"Docker socket"| DOCKER["Docker Engine"]
-    DOCKER --> APP
+    DOCKER --> BUILDER["Dedicated bounded BuildKit builder"]
+    DOCKER --> HELPER["Disposable health / preview helper"]
+    TR --> PNET["Per-project bridge network"]
+    HELPER --> PNET
+    PNET --> APP
 ```
 
 | Component | Responsibility | Docker socket |
@@ -124,7 +128,9 @@ API and worker share a WAL-enabled SQLite database in `shelter-data`. Persistent
 - `shelter-routing`: generated Traefik configuration,
 - `shelter-tunnel`: Cloudflare connector token.
 
-Only the worker mounts `/var/run/docker.sock`. Traefik uses its file provider and also needs no socket. TLS terminates at Cloudflare Edge. The panel remains available on `127.0.0.1:${PANEL_PORT}` for bootstrap and emergency access through SSH.
+Only the worker mounts `/var/run/docker.sock`. The worker stays on the control network and is not attached to application networks. Every project receives its own managed bridge network containing only that project's runtime generation, short-lived helpers when needed, and the current Shelter Traefik generation; projects cannot address one another through a shared Shelter runtime network. Traefik uses its file provider and needs no socket. TLS terminates at Cloudflare Edge. The panel remains available on `127.0.0.1:${PANEL_PORT}` for bootstrap and emergency access through SSH.
+
+Candidate health probes and screenshot captures run in disposable containers on the matching project network. They have no Docker socket or host bind mount, use a read-only root filesystem, drop all capabilities, enforce memory/CPU/PID/time bounds, and are ownership-checked before removal. Builds use Shelter's dedicated Docker-container BuildKit builder with independently configured memory, swap, CPU, PID, and maximum-parallelism bounds plus a builder-cache GC target. A continuously sampled free-space guard cancels cancellable source/build work and refuses completion when the data filesystem falls below `BUILD_MIN_FREE_GB`.
 
 The worker samples host capacity and managed-container aggregates every 15 seconds. It stores at most the configured retention window in SQLite; Docker stats are limited to Shelter-labelled containers and refreshed no more than once per minute. The session-only metrics endpoint never receives the Docker socket.
 
@@ -266,7 +272,7 @@ docker compose up -d --force-recreate api
 5. Save, run the connection test, and open the new HTTPS panel URL.
 6. Replace the loopback callback in both the Cloudflare OAuth client and `.env` with `https://panel.example.com/api/settings/cloudflare/oauth/callback`.
 7. Recreate the API with `docker compose up -d --force-recreate api`, sign in at the final HTTPS origin, and test **Connect Cloudflare** once more.
-8. Put a restrictive Cloudflare Access policy in front of the panel before treating it as production-ready.
+8. Put a restrictive Cloudflare Access policy in front of the panel, review the exact hostname, and save the hostname-bound administrator confirmation in Shelter before treating it as production-ready.
 
 Shelter creates a dedicated remotely managed tunnel with a catch-all origin of `http://traefik:80` and a proxied CNAME to `<tunnel-id>.cfargotunnel.com`. It refuses to take over an unrelated tunnel with the same name or overwrite a conflicting DNS record.
 
@@ -278,7 +284,7 @@ If OAuth is unavailable, create a narrowly scoped Cloudflare API token with the 
 
 ### Cloudflare Access
 
-Shelter does not configure Cloudflare Access automatically. For a public production panel, create an Access application and restrictive policy for the panel domain in Cloudflare Zero Trust. Shelter authentication remains the second layer.
+Shelter does not configure or inspect Cloudflare Access policies automatically. For a public production panel, create an Access application and restrictive policy for the panel domain in Cloudflare Zero Trust, review the exact hostname, and then save the administrator confirmation under **Settings → Cloudflare**. The confirmation is bound to that hostname and is invalidated when the panel hostname changes. Until it exists, the dashboard and overview show a red **Production unsafe** status; deployments remain available. This is an operator acknowledgement, not automatic proof that the Cloudflare policy is correct. Shelter authentication remains the second layer.
 
 ## Deploy projects
 
@@ -336,6 +342,8 @@ The project root, build type, Dockerfile path, application port, and health-chec
 
 Variables are encrypted under `APP_SECRET` at rest. Saved values are not returned to the browser. The worker supplies them to automatic builds using a BuildKit secret and to running containers as environment variables.
 
+Builds run through Shelter's dedicated `docker-container` BuildKit builder rather than the unbounded default builder. The builder enforces configured memory, swap, CPU, PID, and maximum-parallelism limits and applies a cache-GC target; supported Buildx versions also receive the same per-build resource limits. Shelter checks free space throughout source preparation and the build, cancels cancellable work, and refuses completion below `BUILD_MIN_FREE_GB`.
+
 File-storage runtimes never receive project environment variables because they do not execute application code.
 
 `NEXT_PUBLIC_*` and similar variables are public by design and must not contain secrets. Trusted build code can still print or persist any value it receives; see [SECURITY.md](SECURITY.md#project-variables).
@@ -362,7 +370,7 @@ Each domain is routed through the same Cloudflare Tunnel to Traefik. A domain ne
 - **Rollback:** reactivate a previously successful deployment.
 - **Delete project:** remove routes, project containers and images, stored source, previews, deployments, and owned DNS associations after confirmation.
 
-Each deployment runs in a version-bound container. The current runtime stays online while its candidate is built and health-checked; Shelter then changes the persisted active deployment and Traefik routing atomically, and removes the previous runtime only after the switch commits. A failed candidate or routing update keeps or restores the previous deployment. Deployment logs are streamed in the panel.
+Each deployment runs in a version-bound container on its project's own bridge network. The current runtime stays online while its candidate is built and probed by a disposable bounded helper on that same project network; the worker itself never joins the network. Shelter then changes the persisted active deployment and Traefik routing atomically, and removes the previous runtime only after the switch commits. Screenshot capture uses a separate bounded helper with the same isolation. A failed candidate or routing update keeps or restores the previous deployment. Deployment logs are streamed in the panel.
 
 ## Configuration
 
@@ -379,7 +387,13 @@ Start from `.env.example`. The most commonly changed settings are:
 | `HEALTHCHECK_TIMEOUT_SECONDS` | `60` | Candidate health-check window |
 | `BUILD_TIMEOUT_MINUTES` | `30` | Docker build timeout |
 | `GIT_TIMEOUT_MINUTES` | `10` | Git clone timeout |
-| `BUILD_CACHE_MAX_GB` | `8` | Daemon-wide builder-cache target after deployments |
+| `BUILD_CACHE_MAX_GB` | `8` | Dedicated BuildKit builder-cache target |
+| `BUILD_MEMORY` | `2g` | Dedicated BuildKit builder memory limit |
+| `BUILD_MEMORY_SWAP` | `2g` | Dedicated BuildKit builder memory-plus-swap limit |
+| `BUILD_CPUS` | `1.0` | Dedicated BuildKit builder CPU limit |
+| `BUILD_PIDS_LIMIT` | `1024` | Dedicated BuildKit builder PID limit |
+| `BUILD_MAX_PARALLELISM` | `2` | Maximum concurrent BuildKit solver work per builder |
+| `BUILD_MIN_FREE_GB` | `5` | Minimum free data-filesystem space required before a build |
 | `METRICS_INTERVAL_SECONDS` | `15` | Server-metrics sample interval |
 | `METRICS_RETENTION_HOURS` | `48` | Raw server-metrics retention window |
 | `SESSION_TTL_HOURS` | `24` | Administrator session lifetime |
@@ -470,7 +484,20 @@ git pull --ff-only
 ./install.sh doctor
 ```
 
-An existing `.env` is validated and reused; the administrator, `APP_SECRET`, projects, and named volumes remain unchanged. Before replacing a ready control plane, the installer briefly pauses API and worker and writes a validated `shelter-before-update.sqlite` snapshot through an atomic rename inside the configured data volume. Project containers, Traefik, and the tunnel remain running during that pause. The snapshot is replaced by the next update and is not a substitute for the complete backup above.
+An existing `.env` is validated and reused; the administrator, `APP_SECRET`, projects, and named volumes remain unchanged. Before building over the configured mutable control-plane tag, the installer retains the running API/worker image under a content-derived rollback tag and verifies its image ID. Before the new revision can write to SQLite, it then pauses API and worker, creates and `quick_check`s `shelter-before-update.sqlite`, and atomically records restricted rollback metadata in the configured data volume. The metadata binds the previous and new revision/image IDs, SQLite schema, snapshot, and saved prior Compose file. Project containers, Traefik, and the tunnel remain running during that pause.
+
+`./install.sh doctor` reports the rollback bundle as **ready** only when the snapshot, retained image ID, metadata, and prior Compose digest all validate; the check is read-only. To restore the last ready control-plane generation:
+
+```sh
+./install.sh rollback
+./install.sh doctor
+```
+
+Rollback validates every artifact before stopping a writer, validates them again after API and worker are stopped, saves the current database as `shelter-before-rollback.sqlite`, restores the pre-update snapshot through an atomic rename, selects the retained prior image, and requires the prior API, worker, and Traefik to become healthy. Any uncertainty after writers are stopped leaves both writers stopped. Never start an older binary manually against a database that may have been migrated by a newer revision.
+
+The first update performed after introducing this mechanism can report **rollback incomplete**: older installations have no trustworthy saved Compose baseline, and the current source checkout may already contain the new Compose file. The installer still retains the old image and validated snapshot, but deliberately refuses to claim that combination is automatically restorable. A successful run records the current baseline in the data volume, so the following update can become rollback-ready. This limitation remains while the Compose file uses a mutable local image reference and the image has no immutable release/revision label; adopting immutable release image references would remove that bootstrap gap.
+
+The rollback snapshot is replaced by the next update and covers only SQLite and the control plane. It is not a substitute for the complete backup above. Do not delete the content-derived `shelter/control-plane:rollback-*` image needed by a bundle that `doctor` reports as ready.
 
 For unattended updates:
 
@@ -483,7 +510,7 @@ The installer updates the checked-out revision; it never runs `git pull` itself.
 
 ### Portsmith migration
 
-The first Shelter deployment detects an existing Portsmith installation, preserves its runtime `.env`, explicitly reuses its volumes and runtime network, and pauses the legacy API and worker while the installer snapshots and migrates SQLite. The retired control-plane containers are removed only after Shelter is healthy. Keep the existing `APP_SECRET` unchanged.
+The first Shelter deployment detects an existing Portsmith installation, preserves its runtime `.env`, explicitly reuses its volumes and legacy runtime network during the additive migration, and pauses the legacy API and worker while the installer snapshots and migrates SQLite. The worker then verifies a dedicated network for each project and the current Shelter Traefik attachment before removing that runtime's legacy shared-network attachment. The retired control-plane containers are removed only after Shelter is healthy. Keep the existing `APP_SECRET` unchanged.
 
 Legacy internal resource names such as `portsmith-data`, `portsmith-routing`, `portsmith-tunnel`, `portsmith-runtime`, and `portsmith-app-*` may remain until each resource is safely replaced. They are not a visible product name and must not be renamed blindly, because attaching a new empty volume can appear as complete data loss.
 
@@ -505,7 +532,7 @@ The helper refuses group- or world-readable configuration, verifies the SSH host
 
 - Build only repositories and archives you fully trust.
 - Treat administrator access as root access to the VPS.
-- Put Cloudflare Access in front of the panel.
+- Put Cloudflare Access in front of the panel, verify the exact hostname, and save Shelter's hostname-bound administrator confirmation; Shelter does not verify the policy automatically.
 - Allow inbound SSH only. Shelter needs no public ports 80, 443, or 7080.
 - Prefer SSH keys, restrict root login, and update the host, Docker Engine, and images regularly.
 - Never share `.env`, volume backups, Cloudflare credentials, or unredacted deployment logs.
@@ -534,7 +561,7 @@ docker compose logs --tail=200 api worker traefik cloudflared
 - **Interrupted first bootstrap:** rerun `./install.sh`. When still required, the one-time Base64 transport value remains protected in `.env` until the API becomes healthy; the installer then removes it and restarts the API. Do not edit bootstrap markers by hand while recovering.
 - **`.env` is missing but `shelter-data` exists:** restore the matching `.env`. Never generate a new `APP_SECRET` for existing encrypted data.
 - **`.env` exists but its configured data volume is empty:** restore the expected volume. Use `--bootstrap-empty-volume` only after verifying that the empty volume is intentional; provide a new password through the prompt or `--password-stdin`.
-- **An update paused the control plane:** project containers can continue through Traefik. If needed while investigating, run `docker compose start api worker`; retain `shelter-before-update.sqlite` and the failed revision before attempting manual database recovery.
+- **An update left the control plane stopped:** project containers can continue through Traefik. Run `./install.sh doctor`. If it reports a ready bundle, use `./install.sh rollback`; otherwise preserve the data volume, retained image, failed revision, and installer output for recovery. Do not run `docker compose start api worker` after a possible migration, because that can pair an older binary with a newer schema.
 - **A Portsmith migration failed after a Shelter API container was created:** the deploy helper deliberately leaves both generations of API and worker stopped. Rerun the Shelter installer to finish the forward migration, or restore the verified pre-update snapshot before starting legacy binaries. Never run both generations against the same volume.
 - **Image pull is temporarily unavailable:** retry normally first. `--no-pull` is only appropriate when every required runtime and base image is already present and trusted locally.
 - **A stale operation lock remains after a hard crash:** verify that no `install.sh` or `ops/deploy.sh` process is running. Remove only the `pid`, `owner`, and `kind` files that exist inside `.shelter-install.lock`, remove the empty directory, and retry.
@@ -611,7 +638,7 @@ A real end-to-end smoke test requires a disposable VPS, an active Cloudflare zon
 - one VPS only; no cluster, replication, or high availability,
 - local SQLite database and no distributed queue,
 - no hostile multi-tenancy or sandbox for untrusted Docker builds,
-- daemon-wide builder-cache cleanup,
+- one dedicated local BuildKit builder and cache per Shelter installation,
 - GitHub App support for private repositories, but no other private Git providers, SSH keys, or deploy tokens,
 - no pull-request preview deployments or branch-per-environment model,
 - no Shelter-managed persistent application volumes or database services,

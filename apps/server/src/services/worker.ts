@@ -1,10 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import extractZip from "extract-zip";
-import type { AppConfig } from "../config.js";
-import { CommandCancelledError, CommandTimeoutError, runCommand } from "../lib/command.js";
+import { parseDockerMemoryBytes, type AppConfig } from "../config.js";
+import {
+  CommandCancelledError,
+  CommandTimeoutError,
+  runCommand,
+  type CommandOptions,
+  type CommandResult
+} from "../lib/command.js";
 import type { Database } from "../lib/database.js";
 import { decryptString, resolveWithin } from "../lib/security.js";
 import type { DeploymentFailureKind, DeploymentRollbackStatus, DeploymentRow, ProjectRow } from "../types/models.js";
@@ -12,6 +18,8 @@ import { createBuildPlan } from "./build-plan.js";
 import { prepareGitSource } from "./git-source.js";
 import { GitHubService } from "./github.js";
 import { ProjectDeletionWorker } from "./project-deletion.js";
+import { ProjectNetworkReconciler } from "./project-network-reconciler.js";
+import { probeProjectContainer } from "./project-runtime-helper.js";
 import { analyzeProjectDirectory, type ProjectAnalysis } from "./project-analysis.js";
 import { captureProjectPreview, projectPreviewState } from "./project-preview.js";
 import { reconcileRouting } from "./routing.js";
@@ -29,6 +37,26 @@ import {
 } from "./runtime-identity.js";
 
 const activeStatuses = new Set(["queued", "preparing", "building", "checking", "switching"]);
+const BUILDX_BUILDER_NAME = "shelter-builder";
+const BUILDX_BUILDER_NODE = `${BUILDX_BUILDER_NAME}0`;
+const BUILDX_BUILDER_CONTAINER = `buildx_buildkit_${BUILDX_BUILDER_NODE}`;
+const BUILDX_CONFIG_MARKER = "SHELTER_BUILDER_CONFIG";
+const BUILD_CPU_PERIOD = 100_000;
+const BUILD_GIB = 1024n ** 3n;
+const PROJECT_NETWORK_RECONCILE_INTERVAL_MS = 15_000;
+
+export type WorkerCommandRunner = (
+  command: string,
+  args: string[],
+  options?: CommandOptions
+) => Promise<CommandResult>;
+
+export type WorkerDiskStatProvider = (target: string) => Promise<fs.BigIntStatsFs>;
+
+interface BuildxContainerState {
+  owned: boolean;
+  matches: boolean;
+}
 
 class DeploymentCancelledError extends Error {
   constructor() {
@@ -109,18 +137,25 @@ export class DeploymentWorker {
   private readonly projectDeletion: ProjectDeletionWorker;
   private readonly github: GitHubService;
   private readonly metrics: ServerMetricsCollector;
+  private readonly projectNetworks: ProjectNetworkReconciler;
+  private buildResourceLimitsSupported = false;
+  private lastProjectNetworkReconcile = 0;
 
   constructor(
     private readonly config: AppConfig,
-    private readonly database: Database
+    private readonly database: Database,
+    private readonly command: WorkerCommandRunner = runCommand,
+    private readonly diskStat: WorkerDiskStatProvider = async (target) => fs.promises.statfs(target, { bigint: true })
   ) {
     this.projectDeletion = new ProjectDeletionWorker(config, database);
     this.github = new GitHubService(config, database);
     this.metrics = new ServerMetricsCollector(config, database);
+    this.projectNetworks = new ProjectNetworkReconciler(config, database, command);
   }
 
   async run(): Promise<void> {
     await this.ensureDockerReady();
+    await this.reconcileProjectNetworks(true);
     await this.resetWorkspaces();
     this.projectDeletion.recoverInterrupted();
     await this.recoverInterruptedDeployments();
@@ -136,6 +171,7 @@ export class DeploymentWorker {
 
     try {
       while (!this.stopping) {
+        await this.reconcileProjectNetworks();
         await this.reconcileCloudflaredRestart();
         if (await this.projectDeletion.processNext()) continue;
         if (await this.github.processNextWebhookJob()) continue;
@@ -237,24 +273,215 @@ export class DeploymentWorker {
     }
   }
 
+  private buildxDirectory(): string {
+    return path.join(this.config.DATA_DIR, "buildx");
+  }
+
+  private buildxEnvironment(): NodeJS.ProcessEnv {
+    return { ...process.env, BUILDX_CONFIG: this.buildxDirectory() };
+  }
+
+  private buildCpuQuota(): number {
+    return Math.round(Number(this.config.BUILD_CPUS) * BUILD_CPU_PERIOD);
+  }
+
+  private buildxFingerprint(): string {
+    return createHash("sha256").update(JSON.stringify({
+      version: 1,
+      memory: this.config.BUILD_MEMORY,
+      memorySwap: this.config.BUILD_MEMORY_SWAP,
+      cpus: this.config.BUILD_CPUS,
+      pidsLimit: this.config.BUILD_PIDS_LIMIT,
+      maxParallelism: this.config.BUILD_MAX_PARALLELISM,
+      cacheMaxGb: this.config.BUILD_CACHE_MAX_GB,
+      minFreeGb: this.config.BUILD_MIN_FREE_GB
+    })).digest("hex");
+  }
+
+  private async writeBuildkitdConfig(): Promise<string> {
+    const directory = this.buildxDirectory();
+    const target = path.join(directory, "buildkitd.toml");
+    const temporary = path.join(directory, `.buildkitd.${randomUUID()}.tmp`);
+    const contents = [
+      "[worker.oci]",
+      "  gc = true",
+      `  max-parallelism = ${this.config.BUILD_MAX_PARALLELISM}`,
+      "",
+      "[[worker.oci.gcpolicy]]",
+      "  all = true",
+      '  reservedSpace = "1GB"',
+      `  maxUsedSpace = "${this.config.BUILD_CACHE_MAX_GB}GB"`,
+      `  minFreeSpace = "${this.config.BUILD_MIN_FREE_GB}GB"`,
+      ""
+    ].join("\n");
+    await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.promises.chmod(directory, 0o700);
+    try {
+      await fs.promises.writeFile(temporary, contents, { mode: 0o600, flag: "wx" });
+      await fs.promises.rename(temporary, target);
+      await fs.promises.chmod(target, 0o600);
+    } finally {
+      await fs.promises.rm(temporary, { force: true });
+    }
+    return target;
+  }
+
+  private async inspectBuildxContainer(fingerprint: string): Promise<BuildxContainerState | null> {
+    const format = [
+      "{{.HostConfig.Memory}}",
+      "{{.HostConfig.MemorySwap}}",
+      "{{.HostConfig.CpuPeriod}}",
+      "{{.HostConfig.CpuQuota}}",
+      "{{.HostConfig.PidsLimit}}",
+      "{{json .Config.Env}}"
+    ].join("\n");
+    const inspected = await this.command(
+      "docker",
+      ["inspect", "--format", format, BUILDX_BUILDER_CONTAINER],
+      { allowFailure: true, env: this.buildxEnvironment(), timeoutMs: 15_000 }
+    );
+    if (inspected.exitCode !== 0) return null;
+    const [memory, memorySwap, cpuPeriod, cpuQuota, pidsLimit, ...environmentLines] = inspected.stdout.split("\n");
+    let environment: unknown;
+    try {
+      environment = JSON.parse(environmentLines.join("\n"));
+    } catch {
+      throw new Error("Shelter could not validate the BuildKit container environment safely");
+    }
+    if (!Array.isArray(environment) || !environment.every((entry) => typeof entry === "string")) {
+      throw new Error("Shelter received an invalid BuildKit container environment");
+    }
+    const markerPrefix = `${BUILDX_CONFIG_MARKER}=`;
+    const marker = environment.find((entry) => entry.startsWith(markerPrefix));
+    const owned = marker !== undefined;
+    return {
+      owned,
+      matches: marker === `${markerPrefix}${fingerprint}`
+        && Number(memory) === parseDockerMemoryBytes(this.config.BUILD_MEMORY)
+        && Number(memorySwap) === parseDockerMemoryBytes(this.config.BUILD_MEMORY_SWAP)
+        && Number(cpuPeriod) === BUILD_CPU_PERIOD
+        && Number(cpuQuota) === this.buildCpuQuota()
+        && Number(pidsLimit) === this.config.BUILD_PIDS_LIMIT
+    };
+  }
+
+  private async createBuildxBuilder(buildkitdConfigPath: string, fingerprint: string): Promise<void> {
+    await this.command("docker", [
+      "buildx", "create",
+      "--name", BUILDX_BUILDER_NAME,
+      "--node", BUILDX_BUILDER_NODE,
+      "--driver", "docker-container",
+      "--driver-opt", `memory=${this.config.BUILD_MEMORY}`,
+      "--driver-opt", `memory-swap=${this.config.BUILD_MEMORY_SWAP}`,
+      "--driver-opt", `cpu-period=${BUILD_CPU_PERIOD}`,
+      "--driver-opt", `cpu-quota=${this.buildCpuQuota()}`,
+      "--driver-opt", "default-load=true",
+      "--driver-opt", `env.${BUILDX_CONFIG_MARKER}=${fingerprint}`,
+      "--buildkitd-config", buildkitdConfigPath
+    ], { env: this.buildxEnvironment(), timeoutMs: 60_000 });
+  }
+
+  private async bootstrapAndValidateBuildxBuilder(fingerprint: string): Promise<BuildxContainerState> {
+    await this.command(
+      "docker",
+      ["buildx", "inspect", "--bootstrap", BUILDX_BUILDER_NAME],
+      { env: this.buildxEnvironment(), timeoutMs: 60_000 }
+    );
+    let state = await this.inspectBuildxContainer(fingerprint);
+    if (!state) throw new Error("Shelter's BuildKit container was not created");
+    if (state.owned) {
+      await this.command("docker", [
+        "update", "--pids-limit", String(this.config.BUILD_PIDS_LIMIT), BUILDX_BUILDER_CONTAINER
+      ], { env: this.buildxEnvironment(), timeoutMs: 15_000 });
+      state = await this.inspectBuildxContainer(fingerprint);
+      if (!state) throw new Error("Shelter's BuildKit container disappeared while applying its PID limit");
+    }
+    return state;
+  }
+
+  private async reconcileBuildxBuilder(): Promise<void> {
+    const buildkitdConfigPath = await this.writeBuildkitdConfig();
+    const fingerprint = this.buildxFingerprint();
+    const environment = this.buildxEnvironment();
+    const definition = await this.command(
+      "docker",
+      ["buildx", "inspect", BUILDX_BUILDER_NAME],
+      { allowFailure: true, env: environment, timeoutMs: 15_000 }
+    );
+
+    if (definition.exitCode !== 0) {
+      const orphan = await this.inspectBuildxContainer(fingerprint);
+      if (orphan && !orphan.owned) {
+        throw new Error(`Docker container '${BUILDX_BUILDER_CONTAINER}' already exists but is not owned by Shelter`);
+      }
+      if (orphan && !orphan.matches) {
+        await this.command("docker", ["rm", "-f", BUILDX_BUILDER_CONTAINER], {
+          env: environment,
+          timeoutMs: 60_000
+        });
+      }
+      await this.createBuildxBuilder(buildkitdConfigPath, fingerprint);
+      const created = await this.bootstrapAndValidateBuildxBuilder(fingerprint);
+      if (!created.matches) throw new Error("Shelter's BuildKit resource limits do not match the requested configuration");
+      return;
+    }
+
+    const driver = definition.stdout.match(/^Driver:\s*(\S+)\s*$/m)?.[1];
+    if (driver !== "docker-container") {
+      throw new Error(`Buildx builder '${BUILDX_BUILDER_NAME}' already exists with an unsupported driver`);
+    }
+
+    const current = await this.bootstrapAndValidateBuildxBuilder(fingerprint);
+    if (current.matches) return;
+    if (!current.owned) {
+      throw new Error(`Buildx builder '${BUILDX_BUILDER_NAME}' already exists but is not owned by Shelter`);
+    }
+
+    await this.command(
+      "docker",
+      ["buildx", "rm", "--force", "--keep-state", BUILDX_BUILDER_NAME],
+      { env: environment, timeoutMs: 60_000 }
+    );
+    await this.createBuildxBuilder(buildkitdConfigPath, fingerprint);
+    const reconciled = await this.bootstrapAndValidateBuildxBuilder(fingerprint);
+    if (!reconciled.matches) throw new Error("Shelter's BuildKit resource limits could not be reconciled safely");
+  }
+
+  private async ensureBuildxReady(): Promise<void> {
+    const environment = this.buildxEnvironment();
+    const version = await this.command("docker", ["buildx", "version"], {
+      allowFailure: true,
+      env: environment,
+      timeoutMs: 15_000
+    });
+    if (version.exitCode !== 0) throw new Error("Docker Buildx ist im Worker-Container nicht verfügbar");
+    const help = await this.command("docker", ["buildx", "build", "--help"], {
+      allowFailure: true,
+      env: environment,
+      timeoutMs: 15_000
+    });
+    this.buildResourceLimitsSupported = help.exitCode === 0 && /(^|\s)--resource(?:\s|$)/m.test(`${help.stdout}\n${help.stderr}`);
+    await this.reconcileBuildxBuilder();
+  }
+
   private async ensureDockerReady(): Promise<void> {
     const dockerConfig = process.env.DOCKER_CONFIG ?? path.join(this.config.DATA_DIR, ".docker");
     await fs.promises.mkdir(dockerConfig, { recursive: true, mode: 0o700 });
-    const version = await runCommand("docker", ["version", "--format", "{{.Server.Version}}"]);
+    const version = await this.command("docker", ["version", "--format", "{{.Server.Version}}"]).catch((error) => {
+      throw new Error(`Docker Engine ist nicht erreichbar: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
+    });
     if (!version.stdout) throw new Error("Docker Engine ist nicht erreichbar");
-    const buildx = await runCommand("docker", ["buildx", "version"], { allowFailure: true });
-    if (buildx.exitCode !== 0) throw new Error("Docker Buildx ist im Worker-Container nicht verfügbar");
-    const inspected = await runCommand("docker", ["network", "inspect", this.config.RUNTIME_NETWORK], { allowFailure: true });
+    await this.ensureBuildxReady();
+    const inspected = await this.command("docker", ["network", "inspect", this.config.RUNTIME_NETWORK], { allowFailure: true });
     if (inspected.exitCode !== 0) {
-      await runCommand("docker", ["network", "create", this.config.RUNTIME_NETWORK]);
+      await this.command("docker", ["network", "create", this.config.RUNTIME_NETWORK]);
     }
-    await this.connectManagedContainersToRuntimeNetwork();
   }
 
   private async managedContainerIds(label?: { name: string; value: string }): Promise<string[]> {
     const ids = new Set<string>();
     for (const namespace of MANAGED_LABEL_NAMESPACES) {
-      const result = await runCommand("docker", [
+      const result = await this.command("docker", [
         "ps", "-aq",
         "--filter", `label=${namespace}.managed=true`,
         ...(label ? ["--filter", `label=${namespace}.${label.name}=${label.value}`] : [])
@@ -264,14 +491,11 @@ export class DeploymentWorker {
     return [...ids];
   }
 
-  private async connectManagedContainersToRuntimeNetwork(): Promise<void> {
-    for (const containerId of await this.managedContainerIds()) {
-      await runCommand(
-        "docker",
-        ["network", "connect", this.config.RUNTIME_NETWORK, containerId],
-        { allowFailure: true }
-      );
-    }
+  private async reconcileProjectNetworks(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastProjectNetworkReconcile < PROJECT_NETWORK_RECONCILE_INTERVAL_MS) return;
+    await this.projectNetworks.reconcileAll();
+    this.lastProjectNetworkReconcile = now;
   }
 
   private async process(deployment: DeploymentRow, signal: AbortSignal): Promise<void> {
@@ -311,7 +535,10 @@ export class DeploymentWorker {
       await fs.promises.rm(workspace, { recursive: true, force: true });
       await fs.promises.mkdir(workspace, { recursive: true, mode: 0o700 });
       try {
-        const sourceDirectory = await this.prepareSource(project, deployment, workspace, signal);
+        const sourceDirectory = await this.runWithDiskCapacityGuard(
+          signal,
+          (guardedSignal) => this.prepareSource(project, deployment, workspace, guardedSignal)
+        );
         this.throwIfDeploymentCancelled(deployment.id, signal);
         const sourceAnalysis = refreshProjectSourceAnalysis(this.database, project.id, sourceDirectory);
         if (sourceAnalysis) {
@@ -484,7 +711,9 @@ export class DeploymentWorker {
       const preview = await captureProjectPreview(this.config, {
         projectId: project.id,
         deploymentId,
-        url: `http://${containerName}:${port}${previewPath}`
+        url: `http://${containerName}:${port}${previewPath}`,
+        networkName: this.projectNetworks.networkName(project.id),
+        helperImage: this.config.CONTROL_PLANE_IMAGE
       });
       if (preview.status === "ready") {
         this.safeLog(deploymentId, "system", "Website-Vorschau wurde aktualisiert.");
@@ -552,6 +781,59 @@ export class DeploymentWorker {
     return findContentRoot(sourceRoot, project.root_directory);
   }
 
+  private async assertBuildDiskCapacity(): Promise<void> {
+    let stats: fs.BigIntStatsFs;
+    try {
+      stats = await this.diskStat(this.config.DATA_DIR);
+    } catch {
+      throw new Error("Build blocked because free disk space could not be determined safely");
+    }
+    const availableBytes = stats.bavail * stats.bsize;
+    const requiredBytes = BigInt(this.config.BUILD_MIN_FREE_GB) * BUILD_GIB;
+    if (availableBytes < requiredBytes) {
+      const availableGiB = Number(availableBytes / (BUILD_GIB / 10n)) / 10;
+      throw new Error(
+        `Build blocked because only ${availableGiB.toFixed(1)} GiB is free; `
+        + `${this.config.BUILD_MIN_FREE_GB} GiB is required`
+      );
+    }
+  }
+
+  private async runWithDiskCapacityGuard<T>(
+    signal: AbortSignal,
+    operation: (signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    await this.assertBuildDiskCapacity();
+    const diskAbort = new AbortController();
+    const guardedSignal = AbortSignal.any([signal, diskAbort.signal]);
+    let diskFailure: Error | null = null;
+    let checking = false;
+    const timer = setInterval(() => {
+      if (checking || diskFailure || guardedSignal.aborted) return;
+      checking = true;
+      void this.assertBuildDiskCapacity()
+        .catch((error: unknown) => {
+          diskFailure = error instanceof Error ? error : new Error("Build disk capacity guard failed");
+          diskAbort.abort();
+        })
+        .finally(() => {
+          checking = false;
+        });
+    }, 500);
+    timer.unref();
+    try {
+      const result = await operation(guardedSignal);
+      if (diskFailure) throw diskFailure;
+      await this.assertBuildDiskCapacity();
+      return result;
+    } catch (error) {
+      if (diskFailure) throw diskFailure;
+      throw error;
+    } finally {
+      clearInterval(timer);
+    }
+  }
+
   private async dockerBuild(
     deploymentId: string,
     imageTag: string,
@@ -563,11 +845,24 @@ export class DeploymentWorker {
     signal: AbortSignal
   ): Promise<void> {
     const args = [
-      "build", "--progress", "plain",
+      "buildx", "build",
+      "--builder", BUILDX_BUILDER_NAME,
+      "--load",
+      "--progress", "plain",
       "--label", "shelter.managed=true",
       "--label", `shelter.deployment=${deploymentId}`,
+      "--label", "portsmith.managed=false",
+      "--label", "portsmith.deployment=",
       "-t", imageTag
     ];
+    if (this.buildResourceLimitsSupported) {
+      args.push(
+        "--resource", `memory=${this.config.BUILD_MEMORY}`,
+        "--resource", `memory-swap=${this.config.BUILD_MEMORY_SWAP}`,
+        "--resource", `cpu-period=${BUILD_CPU_PERIOD}`,
+        "--resource", `cpu-quota=${this.buildCpuQuota()}`
+      );
+    }
     const environment = fileStorage
       ? {}
       : Object.fromEntries(
@@ -589,13 +884,13 @@ export class DeploymentWorker {
         "-f", dockerfilePath,
         contextDirectory
       );
-      await runCommand("docker", args, {
-        env: { ...process.env, DOCKER_BUILDKIT: "1" },
+      await this.runWithDiskCapacityGuard(signal, (guardedSignal) => this.command("docker", args, {
+        env: this.buildxEnvironment(),
         timeoutMs: this.config.BUILD_TIMEOUT_MINUTES * 60_000,
-        signal,
+        signal: guardedSignal,
         onStdout: (line) => this.log(deploymentId, "stdout", line),
         onStderr: (line) => this.log(deploymentId, "stderr", line)
-      });
+      }));
     } finally {
       if (secretPath) await fs.promises.rm(secretPath, { force: true });
     }
@@ -619,10 +914,11 @@ export class DeploymentWorker {
           entry.key,
           decryptString(entry.encrypted_value, this.config.APP_SECRET)
         ] as const).filter(([key]) => !["PORT", "HOSTNAME", "NODE_ENV"].includes(key));
+    const projectNetwork = await this.projectNetworks.prepareProject(project.id);
     const args = [
       "run", "-d", "--name", name,
       "--pull", "never",
-      "--network", this.config.RUNTIME_NETWORK,
+      "--network", projectNetwork,
       "--restart", restart ? "unless-stopped" : "no",
       "--memory", project.memory_limit,
       "--cpus", project.cpu_limit,
@@ -636,6 +932,13 @@ export class DeploymentWorker {
       "--label", `shelter.project=${project.id}`,
       "--label", `shelter.internal-port=${port}`,
       "--label", `shelter.candidate=${restart ? "false" : "true"}`,
+      // Image labels are project-controlled. Neutralize identifiers that could
+      // otherwise impersonate a legacy runtime or a Compose control service.
+      "--label", "portsmith.managed=false",
+      "--label", "portsmith.project=",
+      "--label", "portsmith.deployment=",
+      "--label", "com.docker.compose.project=",
+      "--label", "com.docker.compose.service=",
       "-e", "NODE_ENV=production",
       "-e", `PORT=${port}`,
       "-e", "HOSTNAME=0.0.0.0"
@@ -643,7 +946,7 @@ export class DeploymentWorker {
     if (deploymentId) args.push("--label", `shelter.deployment=${deploymentId}`);
     for (const [key, value] of environment) args.push("-e", `${key}=${value}`);
     args.push(imageTag);
-    await runCommand("docker", args, signal ? { signal } : {});
+    await this.command("docker", args, signal ? { signal } : {});
   }
 
   private async waitForHealth(
@@ -654,18 +957,20 @@ export class DeploymentWorker {
     signal?: AbortSignal
   ): Promise<void> {
     const deadline = Date.now() + this.config.HEALTHCHECK_TIMEOUT_SECONDS * 1000;
-    const url = `http://${containerName}:${port}${healthPath}`;
+    const deployment = this.database.getDeployment(deploymentId);
+    if (!deployment) throw new Error(`Deployment ${deploymentId} wurde vor dem Healthcheck entfernt`);
+    const networkName = this.projectNetworks.networkName(deployment.project_id);
     let lastError = "keine Antwort";
     while (Date.now() < deadline) {
       if (signal) this.throwIfDeploymentCancelled(deploymentId, signal);
       const remaining = Math.max(250, deadline - Date.now());
-      const inspect = await runCommand(
+      const inspect = await this.command(
         "docker",
         ["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", containerName],
         { allowFailure: true, timeoutMs: Math.min(2_500, remaining), ...(signal ? { signal } : {}) }
       );
       if (inspect.exitCode !== 0 || !inspect.stdout.startsWith("true")) {
-        const logs = await runCommand("docker", ["logs", "--tail", "40", containerName], {
+        const logs = await this.command("docker", ["logs", "--tail", "40", containerName], {
           allowFailure: true,
           timeoutMs: Math.min(2_500, remaining),
           ...(signal ? { signal } : {})
@@ -675,22 +980,28 @@ export class DeploymentWorker {
         throw new Error(`Container wurde vor dem Healthcheck beendet (${inspect.stdout || inspect.stderr})`);
       }
       try {
-        const requestSignal = signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(Math.min(2_500, remaining))])
-          : AbortSignal.timeout(Math.min(2_500, remaining));
-        const response = await fetch(url, { redirect: "manual", signal: requestSignal });
-        if (response.status >= 200 && response.status < 400) {
-          this.log(deploymentId, "system", `Healthcheck ${healthPath}: HTTP ${response.status}.`);
+        const probe = await probeProjectContainer({
+          projectId: deployment.project_id,
+          deploymentId,
+          networkName,
+          targetContainer: containerName,
+          port,
+          path: healthPath,
+          helperImage: this.config.CONTROL_PLANE_IMAGE,
+          ...(signal ? { signal } : {})
+        }, this.command);
+        if (probe.ok) {
+          this.log(deploymentId, "system", `Healthcheck ${healthPath}: ${probe.detail}.`);
           return;
         }
-        lastError = `HTTP ${response.status}`;
+        lastError = probe.detail;
       } catch (error) {
         if (signal?.aborted) throw new DeploymentCancelledError();
         lastError = error instanceof Error ? error.message : "Verbindung fehlgeschlagen";
       }
       await wait(1_000, signal);
     }
-    const logs = await runCommand("docker", ["logs", "--tail", "80", containerName], { allowFailure: true, timeoutMs: 2_500 });
+    const logs = await this.command("docker", ["logs", "--tail", "80", containerName], { allowFailure: true, timeoutMs: 2_500 });
     if (logs.stdout) this.log(deploymentId, "stdout", logs.stdout);
     if (logs.stderr) this.log(deploymentId, "stderr", logs.stderr);
     throw new Error(`Healthcheck nach ${this.config.HEALTHCHECK_TIMEOUT_SECONDS}s fehlgeschlagen: ${lastError}. Prüfe, ob die App auf 0.0.0.0:${port} lauscht.`);
@@ -746,7 +1057,7 @@ export class DeploymentWorker {
   }
 
   private async removeContainer(name: string): Promise<void> {
-    await runCommand("docker", ["rm", "-f", name], { allowFailure: true });
+    await runCommand("docker", ["rm", "-f", "-v", name], { allowFailure: true });
   }
 
   private async pruneImages(projectId: string, activeImage: string): Promise<void> {
@@ -1074,11 +1385,17 @@ export class DeploymentWorker {
 
   private async maintainDockerStorage(deploymentId: string): Promise<void> {
     try {
-      await runCommand("docker", ["builder", "prune", "-f", "--max-used-space", `${this.config.BUILD_CACHE_MAX_GB}gb`], {
+      await this.command("docker", [
+        "buildx", "prune",
+        "--builder", BUILDX_BUILDER_NAME,
+        "-f",
+        "--max-used-space", `${this.config.BUILD_CACHE_MAX_GB}gb`
+      ], {
+        env: this.buildxEnvironment(),
         timeoutMs: 5 * 60_000
       });
       for (const namespace of MANAGED_LABEL_NAMESPACES) {
-        await runCommand("docker", ["image", "prune", "-f", "--filter", `label=${namespace}.managed=true`], {
+        await this.command("docker", ["image", "prune", "-f", "--filter", `label=${namespace}.managed=true`], {
           timeoutMs: 5 * 60_000
         });
       }

@@ -12,6 +12,30 @@ const optionalUrl = z.preprocess(
   z.url().optional()
 );
 
+export function parseDockerMemoryBytes(value: string): number {
+  const normalized = value.trim().toLowerCase();
+  const unit = normalized.at(-1);
+  const amount = Number(unit && /[bkmg]/.test(unit) ? normalized.slice(0, -1) : normalized);
+  const multiplier = unit === "g" ? 1024 ** 3 : unit === "m" ? 1024 ** 2 : unit === "k" ? 1024 : 1;
+  return amount * multiplier;
+}
+
+const DockerMemoryLimit = z.string()
+  .trim()
+  .regex(/^\d+(?:\.\d+)?[bkmgBKMG]?$/)
+  .refine((value) => {
+    const bytes = parseDockerMemoryBytes(value);
+    return Number.isFinite(bytes) && bytes >= 64 * 1024 ** 2 && bytes <= 64 * 1024 ** 3;
+  }, "memory limit must be between 64 MiB and 64 GiB");
+
+const DockerCpuLimit = z.string()
+  .trim()
+  .regex(/^\d+(?:\.\d+)?$/)
+  .refine((value) => {
+    const cpus = Number(value);
+    return Number.isFinite(cpus) && cpus >= 0.1 && cpus <= 64;
+  }, "CPU limit must be between 0.1 and 64");
+
 const ConfigSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   HOST: z.string().default("127.0.0.1"),
@@ -26,6 +50,9 @@ const ConfigSchema = z.object({
   APP_SECRET: z.string().min(32).default("local-development-secret-change-me-please"),
   SESSION_TTL_HOURS: z.coerce.number().int().min(1).max(720).default(24),
   MAX_UPLOAD_MB: z.coerce.number().int().min(1).max(4096).default(500),
+  CONTROL_PLANE_IMAGE: z.string().trim().min(1).max(255)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/)
+    .default("shelter/control-plane:local"),
   RUNTIME_NETWORK: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/).default("shelter-runtime"),
   TRAEFIK_SERVICE_URL: z.url().default("http://traefik:80"),
   TRUSTED_PROXY_IP: z.ipv4().default("10.253.253.3"),
@@ -36,6 +63,12 @@ const ConfigSchema = z.object({
   BUILD_TIMEOUT_MINUTES: z.coerce.number().int().min(1).max(240).default(30),
   GIT_TIMEOUT_MINUTES: z.coerce.number().int().min(1).max(60).default(10),
   BUILD_CACHE_MAX_GB: z.coerce.number().int().min(1).max(1000).default(8),
+  BUILD_MEMORY: DockerMemoryLimit.default("2g"),
+  BUILD_MEMORY_SWAP: DockerMemoryLimit.default("2g"),
+  BUILD_CPUS: DockerCpuLimit.default("1.0"),
+  BUILD_PIDS_LIMIT: z.coerce.number().int().min(64).max(65_536).default(1024),
+  BUILD_MAX_PARALLELISM: z.coerce.number().int().min(1).max(16).default(2),
+  BUILD_MIN_FREE_GB: z.coerce.number().int().min(1).max(1024).default(5),
   METRICS_INTERVAL_SECONDS: z.coerce.number().int().min(10).max(300).default(15),
   METRICS_RETENTION_HOURS: z.coerce.number().int().min(1).max(720).default(48),
   CHROMIUM_PATH: z.string().min(1).default("/usr/bin/chromium-browser"),
@@ -55,6 +88,14 @@ const ConfigSchema = z.object({
       .regex(/^[A-Za-z0-9._:-]+(?:\s+[A-Za-z0-9._:-]+)*$/)
       .default("account-settings.read zone.read dns.write argotunnel.write")
   )
+}).superRefine((config, context) => {
+  if (parseDockerMemoryBytes(config.BUILD_MEMORY_SWAP) < parseDockerMemoryBytes(config.BUILD_MEMORY)) {
+    context.addIssue({
+      code: "custom",
+      path: ["BUILD_MEMORY_SWAP"],
+      message: "BUILD_MEMORY_SWAP must be greater than or equal to BUILD_MEMORY"
+    });
+  }
 });
 
 export type AppConfig = Omit<z.infer<typeof ConfigSchema>, "ADMIN_PASSWORD"> & {

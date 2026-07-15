@@ -4,6 +4,8 @@ set -eu
 umask 077
 
 INSTALLER_VERSION="0.2.0"
+ROLLBACK_HELPER_IMAGE="shelter/control-plane:rollback"
+ROLLBACK_IMAGE_PREFIX="shelter/control-plane:rollback-"
 HEALTH_ATTEMPTS=${SHELTER_INSTALL_HEALTH_ATTEMPTS:-90}
 HEALTH_INTERVAL=${SHELTER_INSTALL_HEALTH_INTERVAL:-2}
 WORKER_SETTLE_SECONDS=${SHELTER_INSTALL_WORKER_SETTLE_SECONDS:-16}
@@ -34,6 +36,9 @@ temporary_file=
 install_log="$script_dir/.shelter-install.log"
 install_log_started=0
 control_plane_stopped=0
+rollback_fail_closed=0
+rollback_compose_file=
+rollback_validation_image=
 api_was_running=0
 worker_was_running=0
 installation_succeeded=0
@@ -47,7 +52,14 @@ bootstrap_needed=0
 bootstrap_values_invalid=0
 data_state=unknown
 data_volume=shelter-data
+control_plane_image=shelter/control-plane:local
 tunnel_state=pending
+previous_image_id=
+previous_image_tag=
+previous_revision=
+new_image_id=
+new_revision=
+prior_control_plane_found=0
 
 reset=''
 bold=''
@@ -72,12 +84,14 @@ cleanup() {
     active_pid=
   fi
 
-  if [ -n "$temporary_file" ]; then
-    rm -f "$temporary_file"
-    temporary_file=
-  fi
-
-  if [ "$control_plane_stopped" -eq 1 ]; then
+  if [ "$rollback_fail_closed" -eq 1 ]; then
+    printf '\n%s[ERROR]%s Rollback safety could not be proven. API and worker are being left stopped.\n' "$red" "$reset" >&2
+    docker compose stop -t 30 worker api >/dev/null 2>&1 || true
+    if [ -n "$rollback_compose_file" ] && [ -f "$rollback_compose_file" ]; then
+      docker compose --env-file .env -f "$rollback_compose_file" stop -t 30 worker api >/dev/null 2>&1 || true
+    fi
+    printf '%s[ERROR]%s Do not start either writer manually. Preserve the data volume, run ./install.sh doctor, and use ./install.sh rollback only when it reports a ready bundle.\n' "$red" "$reset" >&2
+  elif [ "$control_plane_stopped" -eq 1 ]; then
     printf '\n%s[WARN]%s Restoring the API and worker to their previous running or stopped state.\n' "$yellow" "$reset" >&2
     if [ "$worker_was_running" -eq 0 ]; then
       docker compose stop -t 30 worker >/dev/null 2>&1 || true
@@ -91,6 +105,11 @@ cleanup() {
     if [ "$worker_was_running" -eq 1 ]; then
       docker compose start worker >/dev/null 2>&1 || true
     fi
+  fi
+
+  if [ -n "$temporary_file" ]; then
+    rm -f "$temporary_file"
+    temporary_file=
   fi
 
   if [ "$lock_acquired" -eq 1 ] && [ "$lock_managed_externally" -eq 0 ]; then
@@ -130,10 +149,12 @@ Shelter installer
 
 Usage:
   ./install.sh [install] [options]
+  ./install.sh rollback [options]
   ./install.sh doctor [options]
 
 Commands:
   install                      Install, resume, or update Shelter (default)
+  rollback                     Restore the last validated control-plane revision
   doctor                       Run read-only server and configuration checks
 
 Options:
@@ -151,11 +172,13 @@ Options:
 
 Examples:
   ./install.sh
+  ./install.sh rollback
   ./install.sh doctor
   ./install.sh --non-interactive --email admin@example.com \
     --panel-port 7080 --password-stdin < /run/secrets/shelter-admin-password
 
 Passwords are never accepted as command-line arguments or environment variables.
+Rollback restores the last validated pre-update database snapshot and prior control plane.
 EOF
 }
 
@@ -167,7 +190,7 @@ usage_error() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    install|doctor)
+    install|rollback|doctor)
       mode=$1
       ;;
     --email)
@@ -225,11 +248,12 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ "$mode" = doctor ]; then
+if [ "$mode" != install ]; then
   [ -z "$admin_email_arg" ] || usage_error "--email is only available for installation"
   [ "$panel_port_given" -eq 0 ] || usage_error "--panel-port is only available for installation"
   [ "$password_stdin" -eq 0 ] || usage_error "--password-stdin is only available for installation"
   [ "$bootstrap_empty_volume" -eq 0 ] || usage_error "--bootstrap-empty-volume is only available for installation"
+  [ "$no_pull" -eq 0 ] || usage_error "--no-pull is only available for installation"
 fi
 
 if [ -r /dev/tty ] && [ -w /dev/tty ] && (: </dev/tty) 2>/dev/null; then
@@ -343,7 +367,7 @@ validate_env_file() {
 
   noncanonical_key=$(awk '
     BEGIN {
-      count = split("ADMIN_EMAIL APP_SECRET PANEL_PORT SHELTER_DATA_VOLUME DOCKER_SOCKET ADMIN_PASSWORD ADMIN_PASSWORD_B64 BOOTSTRAP_PENDING", keys, " ")
+      count = split("ADMIN_EMAIL APP_SECRET PANEL_PORT SHELTER_DATA_VOLUME CONTROL_PLANE_IMAGE DOCKER_SOCKET ADMIN_PASSWORD ADMIN_PASSWORD_B64 BOOTSTRAP_PENDING", keys, " ")
     }
     {
       raw = $0
@@ -366,7 +390,7 @@ validate_env_file() {
     [ "$env_required_count" -eq 1 ] || die ".env must contain exactly one ${env_required_key} entry"
   done
 
-  for env_optional_key in ADMIN_PASSWORD ADMIN_PASSWORD_B64 BOOTSTRAP_PENDING; do
+  for env_optional_key in CONTROL_PLANE_IMAGE ADMIN_PASSWORD ADMIN_PASSWORD_B64 BOOTSTRAP_PENDING; do
     env_optional_count=$(env_key_count "$env_optional_key")
     [ "$env_optional_count" -le 1 ] || die ".env contains duplicate ${env_optional_key} entries"
   done
@@ -394,6 +418,18 @@ validate_env_file() {
     case "$configured_volume" in
       *[!A-Za-z0-9_.-]*) die "SHELTER_DATA_VOLUME in .env is invalid" ;;
     esac
+  fi
+
+  configured_control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
+  if [ -n "$configured_control_plane_image" ]; then
+    case "$configured_control_plane_image" in
+      [A-Za-z0-9]*) ;;
+      *) die "CONTROL_PLANE_IMAGE in .env must start with a letter or number" ;;
+    esac
+    case "$configured_control_plane_image" in
+      *[!A-Za-z0-9./:_-]*|*@*) die "CONTROL_PLANE_IMAGE in .env must be a taggable Docker image reference" ;;
+    esac
+    [ "${#configured_control_plane_image}" -le 256 ] || die "CONTROL_PLANE_IMAGE in .env is too long"
   fi
 
   bootstrap_values_invalid=0
@@ -604,7 +640,7 @@ acquire_install_lock() {
   lock_owner_token=$(openssl rand -hex 16)
   if mkdir "$install_lock" 2>/dev/null; then
     lock_acquired=1
-    if ! printf '%s\n' "$$" > "$install_lock/pid" || ! printf '%s\n' "$lock_owner_token" > "$install_lock/owner" || ! printf '%s\n' install > "$install_lock/kind"; then
+    if ! printf '%s\n' "$$" > "$install_lock/pid" || ! printf '%s\n' "$lock_owner_token" > "$install_lock/owner" || ! printf '%s\n' "$mode" > "$install_lock/kind"; then
       rm -f "$install_lock/pid" "$install_lock/owner" "$install_lock/kind"
       rmdir "$install_lock" 2>/dev/null || true
       lock_acquired=0
@@ -619,6 +655,9 @@ acquire_install_lock() {
   fi
   if [ "$existing_lock_kind" = deploy ]; then
     die "another Shelter deploy operation is currently synchronizing or installing this checkout"
+  fi
+  if [ "$existing_lock_kind" = rollback ]; then
+    die "another Shelter rollback is already running"
   fi
 
   existing_pid=
@@ -756,9 +795,9 @@ inspect_data_state() {
     return 0
   fi
 
-  docker run --rm --read-only --tmpfs /tmp \
+  docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp \
     -v "${data_volume}:/data:ro" \
-    --entrypoint node shelter/control-plane:local \
+    --entrypoint node "$control_plane_image" \
     --input-type=module -e '
       const fs = await import("node:fs");
       const { default: Database } = await import("better-sqlite3");
@@ -773,14 +812,20 @@ inspect_data_state() {
 }
 
 capture_control_plane_state() {
-  running_api_id=$(docker compose ps -q api) || return 1
-  running_worker_id=$(docker compose ps -q worker) || return 1
-  if [ -n "$running_api_id" ]; then
+  running_api_id=$(docker compose ps -a -q api) || return 1
+  running_worker_id=$(docker compose ps -a -q worker) || return 1
+  [ -n "$running_api_id" ] && [ -n "$running_worker_id" ] || return 1
+  if [ "$(docker inspect --format '{{.State.Running}}' "$running_api_id" 2>/dev/null || true)" = true ]; then
     api_was_running=1
   fi
-  if [ -n "$running_worker_id" ]; then
+  if [ "$(docker inspect --format '{{.State.Running}}' "$running_worker_id" 2>/dev/null || true)" = true ]; then
     worker_was_running=1
   fi
+  api_image_id=$(docker inspect --format '{{.Image}}' "$running_api_id" 2>/dev/null || true)
+  worker_image_id=$(docker inspect --format '{{.Image}}' "$running_worker_id" 2>/dev/null || true)
+  [ -n "$api_image_id" ] && [ "$api_image_id" = "$worker_image_id" ] || return 1
+  previous_image_id=$api_image_id
+  previous_revision="image:${previous_image_id}"
 }
 
 stop_control_plane() {
@@ -788,9 +833,10 @@ stop_control_plane() {
 }
 
 backup_database() {
-  docker run --rm --read-only --tmpfs /tmp \
+  backup_helper_image=${1:-shelter/control-plane:local}
+  docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp \
     -v "${data_volume}:/data" \
-    --entrypoint node shelter/control-plane:local \
+    --entrypoint node "$backup_helper_image" \
     --input-type=module -e '
       const fs = await import("node:fs");
       const { default: Database } = await import("better-sqlite3");
@@ -815,6 +861,7 @@ backup_database() {
         }
         const stat = fs.statSync(temporary);
         if (!stat.isFile() || stat.size === 0) throw new Error("SQLite snapshot is empty");
+        fs.chmodSync(temporary, 0o600);
         const fd = fs.openSync(temporary, "r");
         try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
         fs.renameSync(temporary, target);
@@ -825,6 +872,358 @@ backup_database() {
         throw error;
       }
     '
+}
+
+current_source_revision() {
+  source_revision=
+  if command -v git >/dev/null 2>&1; then
+    source_revision=$(git -C "$script_dir" rev-parse --verify HEAD 2>/dev/null || true)
+  fi
+  case "$source_revision" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) printf 'git:%s\n' "$source_revision" ;;
+    *) printf 'source:unknown\n' ;;
+  esac
+}
+
+retain_previous_control_plane_image() {
+  [ -n "$previous_image_id" ] || return 1
+  image_hex=${previous_image_id#sha256:}
+  case "$previous_image_id" in
+    sha256:*) ;;
+    *) return 1 ;;
+  esac
+  case "$image_hex" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#image_hex}" -eq 64 ] || return 1
+  previous_image_tag="${ROLLBACK_IMAGE_PREFIX}${image_hex}"
+  docker tag "$previous_image_id" "$previous_image_tag" || return 1
+  docker tag "$previous_image_id" "$ROLLBACK_HELPER_IMAGE" || return 1
+  retained_id=$(docker image inspect --format '{{.Id}}' "$previous_image_tag" 2>/dev/null || true)
+  [ "$retained_id" = "$previous_image_id" ]
+}
+
+inspect_built_control_plane_image() {
+  docker image inspect --format '{{.Id}}' "$control_plane_image"
+}
+
+run_rollback_helper() {
+  rollback_action=$1
+  rollback_helper_image=$2
+  rollback_volume_mode=$3
+  shift 3
+
+  if [ "$rollback_volume_mode" = ro ]; then
+    rollback_volume_mount="${data_volume}:/data:ro"
+  else
+    rollback_volume_mount="${data_volume}:/data"
+  fi
+
+  docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp \
+    -v "$rollback_volume_mount" \
+    -e "SHELTER_ROLLBACK_ACTION=${rollback_action}" \
+    "$@" \
+    --entrypoint node "$rollback_helper_image" \
+    --input-type=module -e '
+      const fs = await import("node:fs");
+      const crypto = await import("node:crypto");
+      const { default: Database } = await import("better-sqlite3");
+
+      const root = "/data/.shelter-control-plane";
+      const rollbackMetaPath = `${root}/rollback.meta`;
+      const rollbackComposePath = `${root}/rollback-compose.yaml`;
+      const baselineMetaPath = `${root}/baseline.meta`;
+      const baselineComposePath = `${root}/baseline-compose.yaml`;
+      const snapshotPath = "/data/shelter-before-update.sqlite";
+      const rollbackKeys = [
+        "FORMAT_VERSION", "STATE", "REASON", "PREVIOUS_REVISION", "NEW_REVISION",
+        "PREVIOUS_IMAGE_ID", "PREVIOUS_IMAGE_TAG", "PREVIOUS_IMAGE_REFERENCE", "NEW_IMAGE_ID", "SNAPSHOT_PATH",
+        "SNAPSHOT_STATUS", "SNAPSHOT_SCHEMA", "COMPOSE_PATH", "COMPOSE_STATUS", "COMPOSE_SHA256"
+      ];
+      const baselineKeys = ["FORMAT_VERSION", "STATE", "REVISION", "IMAGE_ID", "IMAGE_REFERENCE", "SCHEMA_VERSION", "COMPOSE_SHA256"];
+      const imageIdPattern = /^sha256:[0-9a-f]{64}$/;
+      const imageTagPattern = /^shelter\/control-plane:rollback-[0-9a-f]{64}$/;
+      const imageReferencePattern = /^[A-Za-z0-9][A-Za-z0-9./:_-]{0,255}$/;
+      const revisionPattern = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
+      const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
+
+      function regularFile(path, maximumBytes = 4 * 1024 * 1024, restricted = true) {
+        const stat = fs.lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("required rollback artifact is not a regular file");
+        if (restricted && (stat.mode & 0o077) !== 0) throw new Error("rollback artifact permissions are too broad");
+        if (stat.size <= 0 || stat.size > maximumBytes) throw new Error("rollback artifact size is invalid");
+        return stat;
+      }
+
+      function ensureRoot() {
+        if (fs.existsSync(root)) {
+          const stat = fs.lstatSync(root);
+          if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("rollback root is unsafe");
+          fs.chmodSync(root, 0o700);
+        } else {
+          fs.mkdirSync(root, { mode: 0o700 });
+        }
+      }
+
+      function syncDirectory(path) {
+        const descriptor = fs.openSync(path, "r");
+        try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+      }
+
+      function atomicWrite(path, contents) {
+        ensureRoot();
+        const temporary = `${root}/.${path.split("/").at(-1)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+        const descriptor = fs.openSync(temporary, "wx", 0o600);
+        try {
+          fs.writeFileSync(descriptor, contents, { encoding: "utf8" });
+          fs.fsyncSync(descriptor);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        fs.chmodSync(temporary, 0o600);
+        fs.renameSync(temporary, path);
+        syncDirectory(root);
+      }
+
+      function readMetadata(path, keys) {
+        regularFile(path, 64 * 1024);
+        const raw = fs.readFileSync(path, "utf8");
+        if (!raw.endsWith("\n") || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(raw)) throw new Error("metadata encoding is invalid");
+        const allowed = new Set(keys);
+        const values = Object.create(null);
+        for (const line of raw.slice(0, -1).split("\n")) {
+          const separator = line.indexOf("=");
+          if (separator < 1) throw new Error("metadata line is invalid");
+          const key = line.slice(0, separator);
+          const value = line.slice(separator + 1);
+          if (!allowed.has(key) || Object.hasOwn(values, key)) throw new Error("metadata key is invalid");
+          values[key] = value;
+        }
+        for (const key of keys) if (!Object.hasOwn(values, key)) throw new Error("metadata field is missing");
+        if (Object.keys(values).length !== keys.length) throw new Error("metadata field count is invalid");
+        return values;
+      }
+
+      function serialize(keys, values) {
+        return `${keys.map((key) => `${key}=${values[key]}`).join("\n")}\n`;
+      }
+
+      function validateRevision(value) {
+        if (!revisionPattern.test(value)) throw new Error("revision identifier is invalid");
+      }
+
+      function inspectSqlite(path, restricted = false) {
+        regularFile(path, 1024 * 1024 * 1024 * 8, restricted);
+        const database = new Database(path, { readonly: true, fileMustExist: true });
+        try {
+          const result = database.pragma("quick_check", { simple: true });
+          if (result !== "ok") throw new Error("SQLite quick_check failed");
+          const schema = Number(database.pragma("user_version", { simple: true }));
+          if (!Number.isSafeInteger(schema) || schema < 0) throw new Error("SQLite schema version is invalid");
+          return schema;
+        } finally {
+          database.close();
+        }
+      }
+
+      function readCompose(path, restricted = true) {
+        regularFile(path, 4 * 1024 * 1024, restricted);
+        return fs.readFileSync(path);
+      }
+
+      function validateRollback() {
+        const meta = readMetadata(rollbackMetaPath, rollbackKeys);
+        if (meta.FORMAT_VERSION !== "1" || meta.STATE !== "ready" || meta.REASON !== "none") throw new Error("rollback bundle is not ready");
+        validateRevision(meta.PREVIOUS_REVISION);
+        validateRevision(meta.NEW_REVISION);
+        if (!imageIdPattern.test(meta.PREVIOUS_IMAGE_ID) || !imageIdPattern.test(meta.NEW_IMAGE_ID)) throw new Error("image identifier is invalid");
+        if (!imageTagPattern.test(meta.PREVIOUS_IMAGE_TAG)) throw new Error("image tag is invalid");
+        if (!imageReferencePattern.test(meta.PREVIOUS_IMAGE_REFERENCE)) throw new Error("image reference is invalid");
+        if (meta.SNAPSHOT_PATH !== snapshotPath || meta.SNAPSHOT_STATUS !== "valid") throw new Error("snapshot metadata is invalid");
+        if (meta.COMPOSE_PATH !== rollbackComposePath || meta.COMPOSE_STATUS !== "valid" || !/^[0-9a-f]{64}$/.test(meta.COMPOSE_SHA256)) throw new Error("Compose metadata is invalid");
+        if (!/^(0|[1-9][0-9]*)$/.test(meta.SNAPSHOT_SCHEMA)) throw new Error("snapshot schema is invalid");
+        const schema = inspectSqlite(snapshotPath, true);
+        if (String(schema) !== meta.SNAPSHOT_SCHEMA) throw new Error("snapshot schema changed");
+        const compose = readCompose(rollbackComposePath);
+        if (digest(compose) !== meta.COMPOSE_SHA256) throw new Error("saved Compose file changed");
+        return meta;
+      }
+
+      async function sqliteBackup(sourcePath, destinationPath) {
+        fs.rmSync(destinationPath, { force: true });
+        const database = new Database(sourcePath, { readonly: true, fileMustExist: true });
+        try { await database.backup(destinationPath); } finally { database.close(); }
+        fs.chmodSync(destinationPath, 0o600);
+        inspectSqlite(destinationPath, true);
+        const descriptor = fs.openSync(destinationPath, "r");
+        try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+      }
+
+      const action = process.env.SHELTER_ROLLBACK_ACTION;
+      if (action === "prepare") {
+        const previousImageId = process.env.PREVIOUS_IMAGE_ID || "";
+        const previousImageTag = process.env.PREVIOUS_IMAGE_TAG || "";
+        const fallbackImageReference = process.env.PREVIOUS_IMAGE_REFERENCE || "";
+        const newImageId = process.env.NEW_IMAGE_ID || "";
+        const fallbackPreviousRevision = process.env.PREVIOUS_REVISION || "";
+        const newRevision = process.env.NEW_REVISION || "";
+        if (!imageIdPattern.test(previousImageId) || !imageIdPattern.test(newImageId) || !imageTagPattern.test(previousImageTag) || !imageReferencePattern.test(fallbackImageReference)) throw new Error("prepared image metadata is invalid");
+        validateRevision(fallbackPreviousRevision);
+        validateRevision(newRevision);
+        const snapshotSchema = inspectSqlite(snapshotPath, true);
+        let state = "incomplete";
+        let reason = "baseline_missing";
+        let previousRevision = fallbackPreviousRevision;
+        let previousImageReference = fallbackImageReference;
+        let composeStatus = "missing";
+        let composeSha = "none";
+        try {
+          const baseline = readMetadata(baselineMetaPath, baselineKeys);
+          if (baseline.FORMAT_VERSION !== "1" || baseline.STATE !== "baseline") throw new Error("baseline state is invalid");
+          validateRevision(baseline.REVISION);
+          if (baseline.IMAGE_ID !== previousImageId || !imageIdPattern.test(baseline.IMAGE_ID)) throw new Error("baseline image does not match the running control plane");
+          if (!imageReferencePattern.test(baseline.IMAGE_REFERENCE)) throw new Error("baseline image reference is invalid");
+          if (!/^(0|[1-9][0-9]*)$/.test(baseline.SCHEMA_VERSION) || !/^[0-9a-f]{64}$/.test(baseline.COMPOSE_SHA256)) throw new Error("baseline metadata is invalid");
+          if (baseline.SCHEMA_VERSION !== String(snapshotSchema)) throw new Error("baseline schema does not match the pre-update snapshot");
+          const compose = readCompose(baselineComposePath);
+          if (digest(compose) !== baseline.COMPOSE_SHA256) throw new Error("baseline Compose file changed");
+          atomicWrite(rollbackComposePath, compose);
+          state = "ready";
+          reason = "none";
+          previousRevision = baseline.REVISION;
+          previousImageReference = baseline.IMAGE_REFERENCE;
+          composeStatus = "valid";
+          composeSha = baseline.COMPOSE_SHA256;
+        } catch {
+          fs.rmSync(rollbackComposePath, { force: true });
+        }
+        const metadata = {
+          FORMAT_VERSION: "1", STATE: state, REASON: reason,
+          PREVIOUS_REVISION: previousRevision, NEW_REVISION: newRevision,
+          PREVIOUS_IMAGE_ID: previousImageId, PREVIOUS_IMAGE_TAG: previousImageTag,
+          PREVIOUS_IMAGE_REFERENCE: previousImageReference,
+          NEW_IMAGE_ID: newImageId, SNAPSHOT_PATH: snapshotPath, SNAPSHOT_STATUS: "valid",
+          SNAPSHOT_SCHEMA: String(snapshotSchema), COMPOSE_PATH: rollbackComposePath,
+          COMPOSE_STATUS: composeStatus, COMPOSE_SHA256: composeSha
+        };
+        atomicWrite(rollbackMetaPath, serialize(rollbackKeys, metadata));
+        if (state === "ready") validateRollback();
+        console.log(state);
+      } else if (action === "record-baseline") {
+        const imageId = process.env.CURRENT_IMAGE_ID || "";
+        const imageReference = process.env.CURRENT_IMAGE_REFERENCE || "";
+        const revision = process.env.CURRENT_REVISION || "";
+        if (!imageIdPattern.test(imageId) || !imageReferencePattern.test(imageReference)) throw new Error("baseline image identifier is invalid");
+        validateRevision(revision);
+        const sourceCompose = "/source/compose.yaml";
+        const compose = readCompose(sourceCompose, false);
+        const source = ["/data/shelter.sqlite", "/data/portsmith.sqlite"].find((path) => fs.existsSync(path));
+        if (!source) throw new Error("database is missing");
+        const schema = inspectSqlite(source);
+        atomicWrite(baselineComposePath, compose);
+        const metadata = {
+          FORMAT_VERSION: "1", STATE: "baseline", REVISION: revision, IMAGE_ID: imageId, IMAGE_REFERENCE: imageReference,
+          SCHEMA_VERSION: String(schema), COMPOSE_SHA256: digest(compose)
+        };
+        atomicWrite(baselineMetaPath, serialize(baselineKeys, metadata));
+        console.log("recorded");
+      } else if (action === "invalidate") {
+        ensureRoot();
+        fs.rmSync(rollbackMetaPath, { force: true });
+        fs.rmSync(rollbackComposePath, { force: true });
+        syncDirectory(root);
+        console.log("invalidated");
+      } else if (action === "validate") {
+        const meta = validateRollback();
+        for (const key of ["PREVIOUS_REVISION", "NEW_REVISION", "PREVIOUS_IMAGE_ID", "PREVIOUS_IMAGE_TAG", "PREVIOUS_IMAGE_REFERENCE", "NEW_IMAGE_ID", "SNAPSHOT_SCHEMA", "COMPOSE_SHA256"]) {
+          console.log(`${key}=${meta[key]}`);
+        }
+      } else if (action === "extract-compose") {
+        validateRollback();
+        process.stdout.write(readCompose(rollbackComposePath));
+      } else if (action === "restore") {
+        const meta = validateRollback();
+        const target = ["/data/shelter.sqlite", "/data/portsmith.sqlite"].find((path) => fs.existsSync(path));
+        if (!target) throw new Error("current database is missing");
+        const targetStat = regularFile(target, 1024 * 1024 * 1024 * 8, false);
+        const diagnosticTemporary = `/data/.shelter-before-rollback.${process.pid}.tmp`;
+        const diagnosticTarget = "/data/shelter-before-rollback.sqlite";
+        const restoreTemporary = `/data/.shelter-restore.${process.pid}.tmp`;
+        try {
+          await sqliteBackup(target, diagnosticTemporary);
+          fs.renameSync(diagnosticTemporary, diagnosticTarget);
+          fs.chmodSync(diagnosticTarget, 0o600);
+          await sqliteBackup(snapshotPath, restoreTemporary);
+          if (String(inspectSqlite(restoreTemporary)) !== meta.SNAPSHOT_SCHEMA) throw new Error("restored schema does not match metadata");
+          fs.chownSync(restoreTemporary, targetStat.uid, targetStat.gid);
+          fs.chmodSync(restoreTemporary, targetStat.mode & 0o777);
+          const restoreDescriptor = fs.openSync(restoreTemporary, "r");
+          try { fs.fsyncSync(restoreDescriptor); } finally { fs.closeSync(restoreDescriptor); }
+          fs.rmSync(`${target}-wal`, { force: true });
+          fs.rmSync(`${target}-shm`, { force: true });
+          fs.renameSync(restoreTemporary, target);
+          syncDirectory("/data");
+        } catch (error) {
+          fs.rmSync(diagnosticTemporary, { force: true });
+          fs.rmSync(restoreTemporary, { force: true });
+          throw error;
+        }
+        console.log("restored");
+      } else if (action === "promote") {
+        const meta = validateRollback();
+        const compose = readCompose(rollbackComposePath);
+        atomicWrite(baselineComposePath, compose);
+        atomicWrite(baselineMetaPath, serialize(baselineKeys, {
+          FORMAT_VERSION: "1", STATE: "baseline", REVISION: meta.PREVIOUS_REVISION,
+          IMAGE_ID: meta.PREVIOUS_IMAGE_ID, IMAGE_REFERENCE: meta.PREVIOUS_IMAGE_REFERENCE, SCHEMA_VERSION: meta.SNAPSHOT_SCHEMA,
+          COMPOSE_SHA256: meta.COMPOSE_SHA256
+        }));
+        meta.STATE = "applied";
+        meta.REASON = "already_applied";
+        atomicWrite(rollbackMetaPath, serialize(rollbackKeys, meta));
+        console.log("applied");
+      } else {
+        throw new Error("unknown rollback helper action");
+      }
+    '
+}
+
+prepare_rollback_bundle() {
+  run_rollback_helper prepare "$ROLLBACK_HELPER_IMAGE" rw \
+    -e "PREVIOUS_IMAGE_ID=${previous_image_id}" \
+    -e "PREVIOUS_IMAGE_TAG=${previous_image_tag}" \
+    -e "PREVIOUS_IMAGE_REFERENCE=${control_plane_image}" \
+    -e "PREVIOUS_REVISION=${previous_revision}" \
+    -e "NEW_IMAGE_ID=${new_image_id}" \
+    -e "NEW_REVISION=${new_revision}"
+}
+
+record_current_baseline() {
+  run_rollback_helper record-baseline "$control_plane_image" rw \
+    -v "${script_dir}/compose.yaml:/source/compose.yaml:ro" \
+    -e "CURRENT_IMAGE_ID=${new_image_id}" \
+    -e "CURRENT_IMAGE_REFERENCE=${control_plane_image}" \
+    -e "CURRENT_REVISION=${new_revision}"
+}
+
+invalidate_rollback_bundle() {
+  run_rollback_helper invalidate "$ROLLBACK_HELPER_IMAGE" rw
+}
+
+validate_rollback_bundle() {
+  run_rollback_helper validate "${rollback_validation_image:-$ROLLBACK_HELPER_IMAGE}" ro
+}
+
+extract_rollback_compose() {
+  run_rollback_helper extract-compose "${rollback_validation_image:-$ROLLBACK_HELPER_IMAGE}" ro
+}
+
+restore_rollback_database() {
+  run_rollback_helper restore "${rollback_validation_image:-$ROLLBACK_HELPER_IMAGE}" rw
+}
+
+promote_applied_rollback() {
+  run_rollback_helper promote "${rollback_validation_image:-$ROLLBACK_HELPER_IMAGE}" rw
 }
 
 add_bootstrap_password() {
@@ -897,6 +1296,159 @@ doctor_check_services() {
   [ "$doctor_failed" -eq 0 ]
 }
 
+rollback_metadata_value() {
+  rollback_metadata_key=$1
+  printf '%s\n' "$validated_rollback_metadata" | awk -F= -v key="$rollback_metadata_key" '
+    index($0, key "=") == 1 { print substr($0, length(key) + 2); found += 1 }
+    END { if (found != 1) exit 1 }
+  '
+}
+
+load_validated_rollback_metadata() {
+  validated_rollback_metadata=$(validate_rollback_bundle 2>/dev/null) || return 1
+  rollback_metadata_count=$(printf '%s\n' "$validated_rollback_metadata" | awk '
+    /^(PREVIOUS_REVISION|NEW_REVISION|PREVIOUS_IMAGE_ID|PREVIOUS_IMAGE_TAG|PREVIOUS_IMAGE_REFERENCE|NEW_IMAGE_ID|SNAPSHOT_SCHEMA|COMPOSE_SHA256)=/ { valid += 1; next }
+    { invalid += 1 }
+    END { if (invalid > 0) exit 1; print valid + 0 }
+  ') || return 1
+  [ "$rollback_metadata_count" -eq 8 ] || return 1
+
+  rollback_previous_revision=$(rollback_metadata_value PREVIOUS_REVISION) || return 1
+  rollback_new_revision=$(rollback_metadata_value NEW_REVISION) || return 1
+  rollback_previous_image_id=$(rollback_metadata_value PREVIOUS_IMAGE_ID) || return 1
+  rollback_previous_image_tag=$(rollback_metadata_value PREVIOUS_IMAGE_TAG) || return 1
+  rollback_previous_image_reference=$(rollback_metadata_value PREVIOUS_IMAGE_REFERENCE) || return 1
+  rollback_new_image_id=$(rollback_metadata_value NEW_IMAGE_ID) || return 1
+  rollback_snapshot_schema=$(rollback_metadata_value SNAPSHOT_SCHEMA) || return 1
+  rollback_compose_sha=$(rollback_metadata_value COMPOSE_SHA256) || return 1
+
+  rollback_previous_image_hex=${rollback_previous_image_id#sha256:}
+  rollback_new_image_hex=${rollback_new_image_id#sha256:}
+  case "$rollback_previous_image_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+  case "$rollback_new_image_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#rollback_previous_image_id}" -eq 71 ] && [ "${#rollback_new_image_id}" -eq 71 ] || return 1
+  rollback_tag_hex=${rollback_previous_image_tag#shelter/control-plane:rollback-}
+  [ "$rollback_tag_hex" != "$rollback_previous_image_tag" ] || return 1
+  case "$rollback_tag_hex" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#rollback_previous_image_tag}" -eq 95 ] || return 1
+  case "$rollback_previous_image_reference" in
+    ''|*[!A-Za-z0-9./:_-]*|*@*) return 1 ;;
+  esac
+  case "$rollback_previous_image_reference" in [A-Za-z0-9]*) ;; *) return 1 ;; esac
+  [ "${#rollback_previous_image_reference}" -le 256 ] || return 1
+  case "$rollback_snapshot_schema" in ''|*[!0-9]*) return 1 ;; esac
+  case "$rollback_compose_sha" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#rollback_compose_sha}" -eq 64 ] || return 1
+
+  inspected_rollback_image_id=$(docker image inspect --format '{{.Id}}' "$rollback_previous_image_tag" 2>/dev/null || true)
+  [ "$inspected_rollback_image_id" = "$rollback_previous_image_id" ] || return 1
+  rollback_validation_image=$rollback_previous_image_tag
+}
+
+extract_and_validate_rollback_compose() {
+  temporary_file=$(mktemp "$script_dir/.rollback-compose.XXXXXX") || return 1
+  rollback_compose_file=$temporary_file
+  chmod 600 "$rollback_compose_file"
+  if ! extract_rollback_compose > "$rollback_compose_file"; then
+    return 1
+  fi
+  extracted_compose_sha=$(openssl dgst -sha256 "$rollback_compose_file" 2>/dev/null | awk '{ print $NF }') || return 1
+  [ "$extracted_compose_sha" = "$rollback_compose_sha" ] || return 1
+  CONTROL_PLANE_IMAGE="$rollback_previous_image_reference" docker compose --env-file .env -f "$rollback_compose_file" config --quiet
+}
+
+rollback_compose() {
+  CONTROL_PLANE_IMAGE="$rollback_previous_image_reference" docker compose --env-file .env -f "$rollback_compose_file" "$@"
+}
+
+rollback_wait_for_api() {
+  wait_attempt=0
+  while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
+    api_id=$(rollback_compose ps -q api 2>/dev/null || true)
+    if [ -n "$api_id" ]; then
+      api_health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$api_id" 2>/dev/null || true)
+      [ "$api_health" = healthy ] && return 0
+    fi
+    wait_attempt=$((wait_attempt + 1))
+    sleep "$HEALTH_INTERVAL"
+  done
+  return 1
+}
+
+rollback_wait_for_worker() {
+  wait_attempt=0
+  while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
+    worker_id=$(rollback_compose ps -q worker 2>/dev/null || true)
+    api_id=$(rollback_compose ps -q api 2>/dev/null || true)
+    if [ -n "$worker_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$worker_id" 2>/dev/null || true)" = true ] && [ -n "$api_id" ] && docker exec "$api_id" node -e "fetch('http://127.0.0.1:7080/api/healthz').then(r=>r.json()).then(v=>process.exit(v.worker==='online'?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+      return 0
+    fi
+    wait_attempt=$((wait_attempt + 1))
+    sleep "$HEALTH_INTERVAL"
+  done
+  return 1
+}
+
+rollback_wait_for_traefik() {
+  wait_attempt=0
+  while [ "$wait_attempt" -lt "$HEALTH_ATTEMPTS" ]; do
+    traefik_id=$(rollback_compose ps -q traefik 2>/dev/null || true)
+    if [ -n "$traefik_id" ]; then
+      traefik_health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$traefik_id" 2>/dev/null || true)
+      [ "$traefik_health" = healthy ] && return 0
+    fi
+    wait_attempt=$((wait_attempt + 1))
+    sleep "$HEALTH_INTERVAL"
+  done
+  return 1
+}
+
+start_and_verify_rollback_stack() {
+  rollback_compose up -d --no-build --force-recreate --no-deps api || return 1
+  rollback_wait_for_api || return 1
+  rollback_compose up -d --no-build --force-recreate --no-deps worker || return 1
+  rollback_compose up -d --no-build traefik || return 1
+  rollback_wait_for_worker || return 1
+  rollback_wait_for_traefik
+}
+
+doctor_rollback_status() {
+  heading "Rollback readiness"
+  if ! docker volume inspect "$data_volume" >/dev/null 2>&1; then
+    note "Rollback incomplete — the configured data volume does not exist"
+    return 0
+  fi
+  if ! docker image inspect "$ROLLBACK_HELPER_IMAGE" >/dev/null 2>&1; then
+    note "Rollback incomplete — no retained control-plane image is available"
+    return 0
+  fi
+  if load_validated_rollback_metadata; then
+    if rollback_doctor_compose=$(extract_rollback_compose 2>/dev/null) && printf '%s\n' "$rollback_doctor_compose" | CONTROL_PLANE_IMAGE="$rollback_previous_image_reference" docker compose --env-file .env -f - config --quiet >/dev/null 2>&1; then
+      ok "Rollback ready: ${rollback_new_revision} → ${rollback_previous_revision} (SQLite schema ${rollback_snapshot_schema})"
+    else
+      note "Rollback incomplete — the saved prior Compose revision is not usable with the current runtime configuration"
+    fi
+  else
+    note "Rollback incomplete — a validated snapshot, prior image, and matching prior Compose revision are all required"
+  fi
+}
+
+confirm_rollback() {
+  [ "$assume_yes" -eq 1 ] && return 0
+  [ "$terminal_available" -eq 1 ] || die "rollback confirmation requires a TTY; use --yes or --non-interactive"
+  printf '     Restore the validated snapshot and prior control plane? [y/N]: ' >/dev/tty
+  rollback_confirmation=
+  IFS= read -r rollback_confirmation </dev/tty || die "rollback confirmation input ended unexpectedly"
+  case "$rollback_confirmation" in
+    y|Y|yes|YES|Yes) ;;
+    *)
+      note "Nothing was changed"
+      installation_succeeded=1
+      exit 0
+      ;;
+  esac
+}
+
 preflight() {
   heading "Checking this server"
 
@@ -926,10 +1478,13 @@ preflight() {
   fi
   ok "Docker Compose v2"
 
-  if ! docker buildx version >/dev/null 2>&1; then
+  if [ "$mode" = rollback ]; then
+    note "Docker Buildx is not required for rollback"
+  elif ! docker buildx version >/dev/null 2>&1; then
     die "Docker Buildx is missing (Ubuntu package: docker-buildx-plugin)"
+  else
+    ok "Docker Buildx"
   fi
-  ok "Docker Buildx"
 
   host_arch=$(uname -m 2>/dev/null || printf unknown)
   case "$host_arch" in
@@ -990,6 +1545,18 @@ show_review() {
   confirm_installation
 }
 
+start_operation_log() {
+  if [ -L "$install_log" ]; then
+    die "installer log must not be a symbolic link: ${install_log}"
+  fi
+  if [ -e "$install_log" ] && [ ! -f "$install_log" ]; then
+    die "installer log path exists but is not a regular file: ${install_log}"
+  fi
+  : > "$install_log"
+  chmod 600 "$install_log"
+  install_log_started=1
+}
+
 doctor() {
   print_banner
   preflight
@@ -1008,6 +1575,8 @@ doctor() {
   panel_port=$(env_value PANEL_PORT)
   data_volume=$(env_value SHELTER_DATA_VOLUME)
   [ -n "$data_volume" ] || data_volume=shelter-data
+  control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
+  [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
   ok ".env is regular and structurally valid"
   check_env_permissions
   check_socket
@@ -1016,6 +1585,8 @@ doctor() {
   else
     die "Docker Compose configuration is invalid"
   fi
+
+  doctor_rollback_status
 
   heading "Current service state"
   docker compose ps || true
@@ -1028,19 +1599,85 @@ doctor() {
   printf '\n%sDoctor completed.%s No configuration or container was changed.\n' "$bold" "$reset"
 }
 
+rollback_shelter() {
+  print_banner
+  preflight
+  acquire_install_lock
+  start_operation_log
+
+  heading "Checking rollback configuration"
+  [ -e .env ] || die "rollback requires the matching .env for this installation"
+  validate_env_file
+  data_volume=$(env_value SHELTER_DATA_VOLUME)
+  [ -n "$data_volume" ] || data_volume=shelter-data
+  control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
+  [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
+  docker volume inspect "$data_volume" >/dev/null 2>&1 || die "the configured data volume does not exist"
+  if ! docker compose config --quiet; then
+    die "the current Compose configuration is invalid"
+  fi
+  ok "Runtime configuration and data volume found"
+
+  heading "Validating the rollback bundle"
+  if ! load_validated_rollback_metadata; then
+    die "rollback is incomplete or invalid; no writer was stopped"
+  fi
+  initial_rollback_metadata=$validated_rollback_metadata
+  if ! extract_and_validate_rollback_compose; then
+    die "the saved prior Compose revision is invalid; no writer was stopped"
+  fi
+  ok "Snapshot, prior image, and prior Compose revision agree"
+  note "Revision: ${rollback_new_revision} → ${rollback_previous_revision}"
+  note "Database: validated SQLite schema ${rollback_snapshot_schema}"
+  warn "Rollback replaces the current database with the pre-update snapshot. A diagnostic copy of the current database will be retained."
+  confirm_rollback
+
+  rollback_fail_closed=1
+  if ! run_step "Stopping API and worker" docker compose stop -t 60 worker api; then
+    die "the writers could not be stopped; the installer will keep attempting to leave them stopped"
+  fi
+
+  heading "Revalidating rollback artifacts with writers stopped"
+  if ! load_validated_rollback_metadata || [ "$validated_rollback_metadata" != "$initial_rollback_metadata" ]; then
+    die "rollback metadata changed during the safety boundary"
+  fi
+  extracted_compose_sha=$(openssl dgst -sha256 "$rollback_compose_file" 2>/dev/null | awk '{ print $NF }') || die "the saved Compose digest could not be recalculated"
+  [ "$extracted_compose_sha" = "$rollback_compose_sha" ] || die "the extracted prior Compose revision changed"
+  ok "Rollback artifacts are still valid"
+
+  if ! run_step "Selecting the retained control-plane image" docker tag "$rollback_previous_image_tag" "$rollback_previous_image_reference"; then
+    die "the retained prior image could not be selected"
+  fi
+  if ! run_step "Restoring the validated database snapshot" restore_rollback_database; then
+    die "the atomic database restore failed; API and worker remain stopped"
+  fi
+  if ! run_step "Starting and verifying the prior control plane" start_and_verify_rollback_stack; then
+    die "the prior API, worker, or Traefik did not become healthy; writers remain stopped"
+  fi
+
+  rollback_fail_closed=0
+  control_plane_stopped=0
+  if ! run_step "Recording the restored baseline" promote_applied_rollback; then
+    if invalidate_rollback_bundle >/dev/null 2>&1; then
+      warn "The rollback succeeded, but its restored baseline could not be recorded. The consumed bundle was invalidated to prevent an accidental repeat."
+    else
+      warn "The rollback succeeded, but its consumed marker could not be recorded or invalidated; do not repeat it without reviewing the retained snapshot."
+    fi
+  fi
+
+  installation_succeeded=1
+  printf '\n%sRollback completed safely.%s\n' "$bold" "$reset"
+  printf '  %s[OK]%s API             healthy on %s\n' "$green" "$reset" "$rollback_previous_revision"
+  printf '  %s[OK]%s Worker          online\n' "$green" "$reset"
+  printf '  %s[OK]%s Traefik         healthy\n' "$green" "$reset"
+  printf '\nDiagnostic pre-rollback database: %s:/data/shelter-before-rollback.sqlite\n\n' "$data_volume"
+}
+
 install_shelter() {
   print_banner
   preflight
   acquire_install_lock
-  if [ -L "$install_log" ]; then
-    die "installer log must not be a symbolic link: ${install_log}"
-  fi
-  if [ -e "$install_log" ] && [ ! -f "$install_log" ]; then
-    die "installer log path exists but is not a regular file: ${install_log}"
-  fi
-  : > "$install_log"
-  chmod 600 "$install_log"
-  install_log_started=1
+  start_operation_log
 
   if [ -e .env ] || [ -L .env ]; then
     validate_env_file
@@ -1127,6 +1764,8 @@ install_shelter() {
     ok ".env created atomically with mode 0600"
   fi
   check_socket
+  control_plane_image=$(env_value CONTROL_PLANE_IMAGE)
+  [ -n "$control_plane_image" ] || control_plane_image=shelter/control-plane:local
 
   if ! run_step "Validating the Compose configuration" docker compose config --quiet; then
     die "fix the Compose error above and rerun ./install.sh"
@@ -1141,9 +1780,24 @@ install_shelter() {
     note "Skipped by --no-pull"
   fi
 
+  if [ "$fresh_install" -eq 0 ]; then
+    heading "Retaining the current control plane"
+    if capture_control_plane_state && retain_previous_control_plane_image; then
+      prior_control_plane_found=1
+      ok "Previous image retained as ${previous_image_tag}"
+    else
+      note "No complete prior API/worker generation was found; a ready data volume will require one before replacement"
+    fi
+  fi
+
   if ! run_step "Building the Shelter control plane" build_control_plane; then
     die "the control-plane image could not be built"
   fi
+  new_image_id=$(inspect_built_control_plane_image 2>/dev/null || true)
+  new_revision=$(current_source_revision)
+  case "$new_image_id" in sha256:*) ;;
+    *) die "the built control-plane image identity could not be verified" ;;
+  esac
 
   heading "Inspecting persistent data"
   if ! data_state=$(inspect_data_state); then
@@ -1174,17 +1828,37 @@ install_shelter() {
   fi
 
   if [ "$data_state" = ready ]; then
-    if ! capture_control_plane_state; then
-      die "the current API and worker state could not be inspected safely"
+    if [ "$prior_control_plane_found" -eq 0 ]; then
+      if ! capture_control_plane_state || ! retain_previous_control_plane_image; then
+        die "the prior API and worker image could not be retained safely; the database was not changed"
+      fi
+      prior_control_plane_found=1
     fi
     control_plane_stopped=1
     if ! run_step "Pausing the control plane for a safe update" stop_control_plane; then
       die "the API and worker could not be paused cleanly; the installer will restore their previous running state"
     fi
-    if ! run_step "Creating the pre-update database snapshot" backup_database; then
+    if ! run_step "Invalidating the superseded rollback bundle" invalidate_rollback_bundle; then
+      die "the previous rollback metadata could not be invalidated before replacing its snapshot"
+    fi
+    if ! run_step "Creating the pre-update database snapshot" backup_database "$ROLLBACK_HELPER_IMAGE"; then
       die "the database snapshot failed; the previous API and worker will be restarted"
     fi
-    note "Rollback snapshot: ${data_volume}:/data/shelter-before-update.sqlite"
+    rollback_fail_closed=1
+    heading "Preparing safe rollback metadata"
+    if ! rollback_bundle_state=$(prepare_rollback_bundle); then
+      die "the rollback snapshot or metadata could not be validated; API and worker remain stopped"
+    fi
+    case "$rollback_bundle_state" in
+      ready)
+        ok "Rollback bundle is ready (${new_revision} → prior validated revision)"
+        ;;
+      incomplete)
+        warn "Rollback metadata and the prior image were retained, but the prior Compose baseline is unavailable. Any post-migration failure will leave API and worker stopped."
+        ;;
+      *) die "the rollback bundle returned an unexpected state" ;;
+    esac
+    note "Snapshot: ${data_volume}:/data/shelter-before-update.sqlite"
   fi
 
   if [ "$bootstrap_needed" -eq 1 ]; then
@@ -1213,7 +1887,12 @@ install_shelter() {
   if ! run_step "Starting and verifying Shelter" start_and_verify_stack; then
     die "Shelter did not become fully ready; inspect: docker compose ps && docker compose logs --tail=200 api worker traefik"
   fi
+  rollback_fail_closed=0
   control_plane_stopped=0
+
+  if ! run_step "Recording the control-plane baseline" record_current_baseline; then
+    warn "Shelter is healthy, but the next update will not have a complete automatic rollback baseline until this step succeeds."
+  fi
 
   cloudflared_id=$(docker compose ps -q cloudflared 2>/dev/null || true)
   if [ -n "$cloudflared_id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$cloudflared_id" 2>/dev/null || true)" = true ]; then
@@ -1241,12 +1920,13 @@ install_shelter() {
   printf '  Sign in, open Settings, and connect Cloudflare.\n'
   printf '\nUseful commands:\n'
   printf '  ./install.sh doctor\n'
+  printf '  ./install.sh rollback  # only when doctor reports a ready bundle\n'
   printf '  docker compose ps\n'
   printf '  docker compose logs --tail=200 api worker traefik cloudflared\n\n'
 }
 
-if [ "$mode" = doctor ]; then
-  doctor
-else
-  install_shelter
-fi
+case "$mode" in
+  doctor) doctor ;;
+  rollback) rollback_shelter ;;
+  *) install_shelter ;;
+esac

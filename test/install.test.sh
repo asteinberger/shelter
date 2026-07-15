@@ -64,6 +64,17 @@ assert_command_order() {
   done
 }
 
+assert_command_substring_order() {
+  local previous=0
+  local command line
+  for command in "$@"; do
+    line=$(grep -nF -- "$command" "$MOCK_DOCKER_LOG" | head -n 1 | cut -d: -f1)
+    [ -n "$line" ] || fail_test "Docker command containing this text was not called: ${command}"
+    [ "$line" -gt "$previous" ] || fail_test "Docker command order is wrong at text: ${command}"
+    previous=$line
+  done
+}
+
 file_mode() {
   local mode
   mode=$(stat -c '%a' "$1" 2>/dev/null || true)
@@ -106,6 +117,10 @@ case "$*" in
     cat >/dev/null
     printf 'correct horse battery staple'
     ;;
+  dgst\ -sha256\ *)
+    digest=$(shasum -a 256 "$3" | awk '{ print $1 }')
+    printf 'SHA2-256(%s)= %s\n' "$3" "$digest"
+    ;;
   *)
     printf 'unexpected openssl invocation: %s\n' "$*" >&2
     exit 97
@@ -137,6 +152,10 @@ next_counter() {
   printf '%s\n' "$counter"
 }
 
+old_image_id="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+new_image_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+rollback_tag="shelter/control-plane:rollback-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
 if [ "$#" -eq 6 ] && [ "$1" = compose ] && [ "$2" = up ] && [ "$3" = -d ] && [ "$4" = --force-recreate ] && [ "$5" = --no-deps ] && [ "$6" = api ]; then
   snapshot_number=$(next_counter "$MOCK_STATE_DIR/api-up-count")
   if [ -f "$MOCK_SANDBOX/.env" ]; then
@@ -157,11 +176,17 @@ case "$command_line" in
   'volume inspect '* )
     [ "${MOCK_VOLUME_EXISTS:-0}" -eq 1 ]
     ;;
-  'compose config --quiet'|'compose pull traefik cloudflared'|'compose build --pull api worker'|'compose build api worker'|'compose up -d'|'compose stop -t 60 worker api'|'compose start api worker')
+  'compose config --quiet'|'compose pull traefik cloudflared'|'compose build --pull api worker'|'compose build api worker'|'compose up -d'|'compose stop -t 60 worker api'|'compose stop -t 30 worker api'|'compose start api worker')
     ;;
   'compose start api'|'compose start worker')
     ;;
   'compose up -d --force-recreate --no-deps api')
+    ;;
+  'compose ps -a -q api')
+    [ "${MOCK_CONTROL_PLANE_EXISTS:-1}" -eq 1 ] && printf 'api-id\n'
+    ;;
+  'compose ps -a -q worker')
+    [ "${MOCK_CONTROL_PLANE_EXISTS:-1}" -eq 1 ] && printf 'worker-id\n'
     ;;
   'compose ps -q api')
     printf 'api-id\n'
@@ -183,6 +208,27 @@ case "$command_line" in
   'compose ps')
     printf 'NAME STATUS\napi-id running\n'
     ;;
+  'image inspect --format {{.Id}} shelter/control-plane:local')
+    printf '%s\n' "$new_image_id"
+    ;;
+  image\ inspect\ --format\ \{\{.Id\}\}\ shelter/control-plane:rollback-*)
+    if [ "${MOCK_ROLLBACK_IMAGE_MATCH:-1}" -eq 1 ]; then
+      printf '%s\n' "$old_image_id"
+    else
+      printf '%s\n' "$new_image_id"
+    fi
+    ;;
+  'image inspect shelter/control-plane:rollback')
+    [ "${MOCK_ROLLBACK_AVAILABLE:-0}" -eq 1 ]
+    ;;
+  tag\ *)
+    ;;
+  inspect*'{{.Image}} api-id')
+    printf '%s\n' "$old_image_id"
+    ;;
+  inspect*'{{.Image}} worker-id')
+    printf '%s\n' "$old_image_id"
+    ;;
   inspect*'{{.State.Running}} api-id')
     printf 'true\n'
     ;;
@@ -203,9 +249,62 @@ case "$command_line" in
     ;;
   run\ --rm*)
     case "$command_line" in
+      *'-e SHELTER_ROLLBACK_ACTION=prepare '*)
+        printf '%s\n' "${MOCK_ROLLBACK_PREPARE_STATE:-incomplete}"
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=record-baseline '*)
+        printf 'recorded\n'
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=invalidate '*)
+        printf 'invalidated\n'
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=validate '*)
+        [ "${MOCK_ROLLBACK_VALIDATE_FAIL:-0}" -eq 0 ] || exit 43
+        if [ "${MOCK_ROLLBACK_MALFORMED_METADATA:-0}" -eq 1 ]; then
+          printf 'BROKEN_METADATA=yes\n'
+          exit 0
+        fi
+        compose_sha=$(shasum -a 256 "$MOCK_SANDBOX/compose.yaml" | awk '{ print $1 }')
+        printf 'PREVIOUS_REVISION=git:1111111111111111111111111111111111111111\n'
+        printf 'NEW_REVISION=git:2222222222222222222222222222222222222222\n'
+        printf 'PREVIOUS_IMAGE_ID=%s\n' "$old_image_id"
+        printf 'PREVIOUS_IMAGE_TAG=%s\n' "$rollback_tag"
+        printf 'PREVIOUS_IMAGE_REFERENCE=shelter/control-plane:local\n'
+        printf 'NEW_IMAGE_ID=%s\n' "$new_image_id"
+        printf 'SNAPSHOT_SCHEMA=7\n'
+        printf 'COMPOSE_SHA256=%s\n' "$compose_sha"
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=extract-compose '*)
+        cat "$MOCK_SANDBOX/compose.yaml"
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=restore '*)
+        printf 'restored\n'
+        ;;
+      *'-e SHELTER_ROLLBACK_ACTION=promote '*)
+        printf 'applied\n'
+        ;;
       *:/data:ro*) printf '%s\n' "${MOCK_DATA_STATE:-ready}" ;;
       *) : ;;
     esac
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ config\ --quiet)
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ up\ -d\ --no-build\ --force-recreate\ --no-deps\ api)
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ up\ -d\ --no-build\ --force-recreate\ --no-deps\ worker)
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ up\ -d\ --no-build\ traefik)
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ ps\ -q\ api)
+    printf 'api-id\n'
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ ps\ -q\ worker)
+    printf 'worker-id\n'
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ ps\ -q\ traefik)
+    printf 'traefik-id\n'
+    ;;
+  compose\ --env-file\ .env\ -f\ *\ stop\ -t\ 30\ worker\ api)
     ;;
   *)
     printf 'unexpected docker invocation: %s\n' "$command_line" >&2
@@ -238,6 +337,8 @@ setup_sandbox() {
   export MOCK_VOLUME_EXISTS=0 MOCK_DATA_STATE=ready MOCK_API_HEALTH=healthy
   export MOCK_TRAEFIK_HEALTH=healthy MOCK_WORKER_ONLINE=1 MOCK_CLOUDFLARED_RUNNING=0
   export MOCK_CLOUDFLARED_STATE=true MOCK_DOCKER_FAIL_CONTAINS=
+  export MOCK_CONTROL_PLANE_EXISTS=1 MOCK_ROLLBACK_AVAILABLE=0 MOCK_ROLLBACK_IMAGE_MATCH=1
+  export MOCK_ROLLBACK_VALIDATE_FAIL=0 MOCK_ROLLBACK_MALFORMED_METADATA=0 MOCK_ROLLBACK_PREPARE_STATE=incomplete
   RUN_CWD=$CALLER_DIR
 }
 
@@ -538,7 +639,7 @@ test_failed_update_snapshot_restores_running_services() {
   before_checksum=$(cksum "$SANDBOX/.env")
   MOCK_VOLUME_EXISTS=1
   MOCK_DATA_STATE=ready
-  MOCK_DOCKER_FAIL_CONTAINS='shelter-before-update.sqlite'
+  MOCK_DOCKER_FAIL_CONTAINS='const target = "/data/shelter-before-update.sqlite"'
   export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_DOCKER_FAIL_CONTAINS
 
   run_installer '' --non-interactive --no-pull
@@ -582,6 +683,158 @@ test_deploy_lock_requires_matching_handoff_token() {
   assert_contains "$SANDBOX/.shelter-install.lock/owner" "$deploy_token"
 }
 
+test_update_records_ready_rollback_bundle() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_DATA_STATE=ready
+  MOCK_ROLLBACK_PREPARE_STATE=ready
+  export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_ROLLBACK_PREPARE_STATE
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" 'Previous image retained as shelter/control-plane:rollback-'
+  assert_contains "$INSTALL_OUTPUT" 'Rollback bundle is ready'
+  assert_contains "$INSTALL_OUTPUT" 'Recording the control-plane baseline'
+  assert_command_substring_order \
+    'tag sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc shelter/control-plane:rollback-' \
+    'compose build api worker' \
+    'compose stop -t 60 worker api' \
+    'SHELTER_ROLLBACK_ACTION=prepare' \
+    'compose up -d --force-recreate --no-deps api'
+}
+
+test_doctor_reports_rollback_readiness_without_mutation() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  export MOCK_VOLUME_EXISTS
+
+  run_installer '' doctor
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" 'Rollback incomplete'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop'
+  assert_not_matches "$MOCK_DOCKER_LOG" '^tag '
+
+  : > "$MOCK_DOCKER_LOG"
+  MOCK_ROLLBACK_AVAILABLE=1
+  export MOCK_ROLLBACK_AVAILABLE
+  run_installer '' doctor
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" 'Rollback ready:'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop'
+  assert_not_matches "$MOCK_DOCKER_LOG" '^tag '
+}
+
+test_rollback_restores_snapshot_and_prior_revision() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_ROLLBACK_AVAILABLE=1
+  export MOCK_VOLUME_EXISTS MOCK_ROLLBACK_AVAILABLE
+
+  run_installer '' rollback --non-interactive
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" 'Rollback completed safely.'
+  assert_contains "$INSTALL_OUTPUT" 'git:1111111111111111111111111111111111111111'
+  assert_contains "$INSTALL_OUTPUT" 'shelter-before-rollback.sqlite'
+  assert_command_substring_order \
+    'SHELTER_ROLLBACK_ACTION=validate' \
+    'SHELTER_ROLLBACK_ACTION=extract-compose' \
+    'compose stop -t 60 worker api' \
+    'tag shelter/control-plane:rollback-' \
+    'SHELTER_ROLLBACK_ACTION=restore' \
+    'up -d --no-build --force-recreate --no-deps api' \
+    'up -d --no-build --force-recreate --no-deps worker' \
+    'SHELTER_ROLLBACK_ACTION=promote'
+  assert_file_absent "$SANDBOX/.shelter-install.lock"
+  assert_file_absent "$SANDBOX/.shelter-install.log"
+  [ -z "$(find "$SANDBOX" -maxdepth 1 -name '.rollback-compose.*' -print -quit)" ] || fail_test 'temporary rollback Compose file was retained'
+}
+
+test_invalid_rollback_artifacts_never_stop_writers() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_ROLLBACK_AVAILABLE=1
+  MOCK_ROLLBACK_MALFORMED_METADATA=1
+  export MOCK_VOLUME_EXISTS MOCK_ROLLBACK_AVAILABLE MOCK_ROLLBACK_MALFORMED_METADATA
+
+  run_installer '' rollback --non-interactive
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'rollback is incomplete or invalid; no writer was stopped'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+
+  : > "$MOCK_DOCKER_LOG"
+  MOCK_ROLLBACK_MALFORMED_METADATA=0
+  MOCK_ROLLBACK_VALIDATE_FAIL=1
+  export MOCK_ROLLBACK_MALFORMED_METADATA MOCK_ROLLBACK_VALIDATE_FAIL
+  run_installer '' rollback --non-interactive
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'rollback is incomplete or invalid; no writer was stopped'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+
+  : > "$MOCK_DOCKER_LOG"
+  MOCK_ROLLBACK_VALIDATE_FAIL=0
+  MOCK_ROLLBACK_IMAGE_MATCH=0
+  export MOCK_ROLLBACK_VALIDATE_FAIL MOCK_ROLLBACK_IMAGE_MATCH
+  run_installer '' rollback --non-interactive
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'rollback is incomplete or invalid; no writer was stopped'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+}
+
+test_rollback_restore_failure_leaves_writers_stopped() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_ROLLBACK_AVAILABLE=1
+  MOCK_DOCKER_FAIL_CONTAINS='-e SHELTER_ROLLBACK_ACTION=restore '
+  export MOCK_VOLUME_EXISTS MOCK_ROLLBACK_AVAILABLE MOCK_DOCKER_FAIL_CONTAINS
+
+  run_installer '' rollback --non-interactive
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'atomic database restore failed'
+  assert_contains "$INSTALL_OUTPUT" 'API and worker are being left stopped'
+  assert_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_contains "$MOCK_DOCKER_LOG" 'compose stop -t 30 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'up -d --no-build --force-recreate --no-deps api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=promote'
+}
+
+test_update_metadata_failure_leaves_writers_stopped() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_DATA_STATE=ready
+  MOCK_DOCKER_FAIL_CONTAINS='-e SHELTER_ROLLBACK_ACTION=prepare '
+  export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_DOCKER_FAIL_CONTAINS
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'rollback snapshot or metadata could not be validated'
+  assert_contains "$INSTALL_OUTPUT" 'API and worker are being left stopped'
+  assert_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=invalidate'
+  assert_contains "$MOCK_DOCKER_LOG" 'shelter-before-update.sqlite'
+  assert_contains "$MOCK_DOCKER_LOG" 'compose stop -t 30 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose up -d --force-recreate --no-deps api'
+}
+
+test_rollback_health_failure_leaves_restored_database_closed() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_ROLLBACK_AVAILABLE=1
+  MOCK_API_HEALTH=starting
+  export MOCK_VOLUME_EXISTS MOCK_ROLLBACK_AVAILABLE MOCK_API_HEALTH
+
+  run_installer '' rollback --non-interactive
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'prior API, worker, or Traefik did not become healthy'
+  assert_contains "$INSTALL_OUTPUT" 'API and worker are being left stopped'
+  assert_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=restore'
+  assert_contains "$MOCK_DOCKER_LOG" 'compose stop -t 30 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=promote'
+}
+
 run_test() {
   local name=$1
   local function_name=$2
@@ -618,6 +871,13 @@ run_test 'image-pull failure leaves resumable non-secret state' test_stage_failu
 run_test 'failed update snapshot restores prior running services' test_failed_update_snapshot_restores_running_services
 run_test 'an active installer lock prevents concurrent mutation' test_active_install_lock_is_respected
 run_test 'deploy lock requires an explicit matching handoff token' test_deploy_lock_requires_matching_handoff_token
+run_test 'updates retain an image and record a ready rollback bundle' test_update_records_ready_rollback_bundle
+run_test 'doctor reports rollback readiness without mutating state' test_doctor_reports_rollback_readiness_without_mutation
+run_test 'rollback restores the validated snapshot and prior revision' test_rollback_restores_snapshot_and_prior_revision
+run_test 'invalid metadata, snapshots, or images never stop writers' test_invalid_rollback_artifacts_never_stop_writers
+run_test 'restore failure leaves API and worker stopped' test_rollback_restore_failure_leaves_writers_stopped
+run_test 'update rollback-metadata failure remains fail-closed' test_update_metadata_failure_leaves_writers_stopped
+run_test 'rollback health failure remains fail-closed' test_rollback_health_failure_leaves_restored_database_closed
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

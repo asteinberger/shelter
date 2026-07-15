@@ -11,7 +11,7 @@ x-metrics-environment: &metrics-environment
   METRICS_RETENTION_HOURS: ${METRICS_RETENTION_HOURS:-48}
 
 x-control-plane: &control-plane
-  image: shelter/control-plane:local
+  image: ${CONTROL_PLANE_IMAGE:-shelter/control-plane:local}
   build:
     context: .
     dockerfile: Dockerfile
@@ -78,6 +78,14 @@ services:
       BUILD_TIMEOUT_MINUTES: ${BUILD_TIMEOUT_MINUTES:-30}
       GIT_TIMEOUT_MINUTES: ${GIT_TIMEOUT_MINUTES:-10}
       BUILD_CACHE_MAX_GB: ${BUILD_CACHE_MAX_GB:-8}
+      BUILD_MEMORY: ${BUILD_MEMORY:-2g}
+      BUILD_MEMORY_SWAP: ${BUILD_MEMORY_SWAP:-2g}
+      BUILD_CPUS: ${BUILD_CPUS:-1.0}
+      BUILD_PIDS_LIMIT: ${BUILD_PIDS_LIMIT:-1024}
+      BUILD_MAX_PARALLELISM: ${BUILD_MAX_PARALLELISM:-2}
+      BUILD_MIN_FREE_GB: ${BUILD_MIN_FREE_GB:-5}
+      CONTROL_PLANE_IMAGE: ${CONTROL_PLANE_IMAGE:-shelter/control-plane:local}
+      CHROMIUM_PATH: /usr/bin/chromium-browser
       DOCKER_HOST: unix:///var/run/docker.sock
       DOCKER_CONFIG: /tmp/.docker
       HOME: /tmp
@@ -88,15 +96,20 @@ services:
     networks:
       control:
         ipv4_address: ${WORKER_CONTROL_IP:-10.253.253.5}
-      runtime: {}
     depends_on:
       api:
         condition: service_healthy
 
   traefik:
     image: traefik:v3.7.1
+    container_name: shelter-traefik
+    labels:
+      shelter.control-plane: traefik
     command:
-      - --entrypoints.web.address=:80
+      # Listen only on the control-plane interface. Traefik may be attached to
+      # project networks for outbound proxying, but applications must never be
+      # able to call the panel router directly and bypass Cloudflare Access.
+      - --entrypoints.web.address=${TRAEFIK_CONTROL_IP:-10.253.253.3}:80
       - --entrypoints.web.forwardedHeaders.trustedIPs=${CLOUDFLARED_CONTROL_IP:-10.253.253.4}/32
       - --providers.file.directory=/routing
       - --providers.file.watch=true

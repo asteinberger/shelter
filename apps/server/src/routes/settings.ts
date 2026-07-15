@@ -33,10 +33,15 @@ const CloudflareHostnameCheckSchema = z.object({
   zoneId: CloudflareZoneIdSchema.optional()
 }).strict();
 
+const CloudflareAccessConfirmationSchema = z.object({
+  panelDomain: z.string().trim().min(1).max(253)
+}).strict();
+
 export function registerSettingsRoutes(app: FastifyInstance, cloudflare: CloudflareService): void {
-  app.get("/api/settings/cloudflare", { preHandler: requireSessionAuth }, async (request) => ({
-    cloudflare: cloudflare.state(request.auth?.user.id)
-  }));
+  app.get("/api/settings/cloudflare", { preHandler: requireSessionAuth }, async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    return { cloudflare: cloudflare.state(request.auth?.user.id) };
+  });
 
   app.put<{ Body: unknown }>("/api/settings/cloudflare", { preHandler: requireSessionMutationAuth }, async (request) => {
     const input = CloudflareSetupSchema.parse(request.body);
@@ -49,6 +54,23 @@ export function registerSettingsRoutes(app: FastifyInstance, cloudflare: Cloudfl
   });
 
   app.post("/api/settings/cloudflare/test", { preHandler: requireSessionMutationAuth }, async () => cloudflare.test());
+
+  app.post<{ Body: unknown }>("/api/settings/cloudflare/access-protection/confirmation", {
+    preHandler: requireSessionMutationAuth,
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const input = CloudflareAccessConfirmationSchema.parse(request.body);
+    reply.header("cache-control", "no-store");
+    return { accessProtection: cloudflare.confirmAccessProtection(input.panelDomain, request.auth!.user.id) };
+  });
+
+  app.delete("/api/settings/cloudflare/access-protection/confirmation", {
+    preHandler: requireSessionMutationAuth,
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } }
+  }, async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    return { accessProtection: cloudflare.revokeAccessProtection() };
+  });
 
   app.get<{ Querystring: unknown }>("/api/settings/cloudflare/zones", {
     preHandler: requireScopedAuth("domains:write"),
