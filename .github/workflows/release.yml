@@ -1547,8 +1547,15 @@ jobs:
             if ! gh "${create_arguments[@]}"; then
               echo "Draft creation returned an error; checking whether GitHub committed the exact owned draft."
             fi
-            releases="$(matching_releases)"
-            release_count="$(jq -r 'length' <<< "$releases")"
+            # GitHub may return the newly-created draft before it appears in
+            # the repository release listing. Wait briefly for that listing to
+            # converge, while preserving the exact-one check below.
+            for attempt in 1 2 3 4 5 6; do
+              releases="$(matching_releases)"
+              release_count="$(jq -r 'length' <<< "$releases")"
+              [[ "$release_count" != "0" ]] && break
+              [[ "$attempt" -eq 6 ]] || sleep 2
+            done
           fi
 
           if [[ "$release_count" != "1" ]]; then
