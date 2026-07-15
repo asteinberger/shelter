@@ -10,11 +10,13 @@
     <a href="https://shelter.host">Website</a>
     · <a href="#quick-start">Quick start</a>
     · <a href="docs/API.md">API & CLI</a>
+    · <a href="docs/RELEASES.md">Releases</a>
     · <a href="#architecture">Architecture</a>
     · <a href="CONTRIBUTING.md">Contributing</a>
     · <a href="SECURITY.md">Security</a>
   </p>
   <p>
+    <a href="https://github.com/asteinberger/shelter/actions/workflows/ci.yml?query=branch%3Adev"><img alt="CI" src="https://github.com/asteinberger/shelter/actions/workflows/ci.yml/badge.svg?branch=dev" /></a>
     <img alt="Status: MVP" src="https://img.shields.io/badge/status-MVP-f59e0b" />
     <img alt="Node.js 24+" src="https://img.shields.io/badge/Node.js-24%2B-3c873a?logo=nodedotjs&logoColor=white" />
     <img alt="Docker Compose v2" src="https://img.shields.io/badge/Docker_Compose-v2-2496ed?logo=docker&logoColor=white" />
@@ -51,6 +53,7 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 - **Instant context:** successful website deployments receive an automatic screenshot preview in the project overview.
 - **Operator-ready:** dashboard, live deployment logs, rollbacks, project deletion, encrypted variables, and resource limits.
 - **Automation-ready:** scoped, expiring personal access tokens, a documented HTTP API, OpenAPI, and an installable `shelter` CLI.
+- **Verifiable releases:** immutable GitHub Releases, digest-pinned multi-platform images, signed provenance, downloadable SBOMs, and a fail-closed release installer.
 - **Multilingual panel:** English and German with browser detection and a persistent language preference.
 
 ## Quick start
@@ -74,6 +77,11 @@ ssh -N -L 7080:127.0.0.1:7080 USER@YOUR-VPS
 ```
 
 Open `http://127.0.0.1:7080`, sign in, and then [connect Cloudflare](#connect-cloudflare) to publish the panel and projects. A Cloudflare account and active zone are needed for publishing, not for the local installation.
+
+The commands above deliberately build a reviewed checkout locally. Production
+operators should prefer a [verified release bundle](docs/RELEASES.md), which
+installs the signed control-plane image by digest without rebuilding it on the
+VPS.
 
 ## API and CLI
 
@@ -136,7 +144,8 @@ The worker samples host capacity and managed-container aggregates every 15 secon
 
 ## Installation
 
-Run the installer from a trusted Shelter checkout on the VPS:
+Run the installer from a trusted Shelter checkout on the VPS for a local source
+build:
 
 ```sh
 ./install.sh
@@ -153,6 +162,11 @@ For a fresh installation it:
 7. verifies the API, worker, and Traefik. Cloudflare may remain `not configured yet` until the next setup step.
 
 The panel stays bound to `127.0.0.1`; the installer does not open a public host port. Run `./install.sh --help` for the complete command reference.
+
+For production, follow the [release guide](docs/RELEASES.md) instead. The
+release helper cryptographically verifies the immutable GitHub Release and its
+downloaded asset before reading the archive, then installs the exact OCI digest
+recorded in the checked bundle.
 
 ### Check the server with `doctor`
 
@@ -475,7 +489,28 @@ Redeploy every project on a new VPS so application images and stable containers 
 
 ## Update
 
-Fetch the desired Shelter revision, then let the installer handle the control-plane update:
+For production, download the desired immutable release into a new directory and
+run its release installer:
+
+```sh
+./ops/download-release.sh \
+  --repo asteinberger/shelter \
+  --tag v0.2.0 \
+  --destination ../shelter-v0.2.0
+cd ../shelter-v0.2.0
+./ops/install-release-bundle.sh \
+  --installation /opt/shelter \
+  -- --non-interactive
+/opt/shelter/install.sh doctor
+```
+
+The release path verifies GitHub's signed release and asset attestations,
+bundle checksums, and the OCI digest. It does not rebuild the control plane on
+the VPS. See [Shelter releases](docs/RELEASES.md) for prerequisites and
+independent verification commands.
+
+For an intentionally reviewed source build, fetch the desired revision and let
+the normal installer build it locally:
 
 ```sh
 ./install.sh doctor
@@ -483,6 +518,11 @@ git pull --ff-only
 ./install.sh
 ./install.sh doctor
 ```
+
+If this installation currently follows a verified release, the source
+installer fails closed instead of overwriting its digest-derived image tag.
+Set `CONTROL_PLANE_IMAGE=shelter/control-plane:local` in `.env` only when you
+deliberately want to leave the verified release channel.
 
 An existing `.env` is validated and reused; the administrator, `APP_SECRET`, projects, and named volumes remain unchanged. Before building over the configured mutable control-plane tag, the installer retains the running API/worker image under a content-derived rollback tag and verifies its image ID. Before the new revision can write to SQLite, it then pauses API and worker, creates and `quick_check`s `shelter-before-update.sqlite`, and atomically records restricted rollback metadata in the configured data volume. The metadata binds the previous and new revision/image IDs, SQLite schema, snapshot, and saved prior Compose file. Project containers, Traefik, and the tunnel remain running during that pause.
 
@@ -495,7 +535,7 @@ An existing `.env` is validated and reused; the administrator, `APP_SECRET`, pro
 
 Rollback validates every artifact before stopping a writer, validates them again after API and worker are stopped, saves the current database as `shelter-before-rollback.sqlite`, restores the pre-update snapshot through an atomic rename, selects the retained prior image, and requires the prior API, worker, and Traefik to become healthy. Any uncertainty after writers are stopped leaves both writers stopped. Never start an older binary manually against a database that may have been migrated by a newer revision.
 
-The first update performed after introducing this mechanism can report **rollback incomplete**: older installations have no trustworthy saved Compose baseline, and the current source checkout may already contain the new Compose file. The installer still retains the old image and validated snapshot, but deliberately refuses to claim that combination is automatically restorable. A successful run records the current baseline in the data volume, so the following update can become rollback-ready. This limitation remains while the Compose file uses a mutable local image reference and the image has no immutable release/revision label; adopting immutable release image references would remove that bootstrap gap.
+The first update performed after introducing this mechanism can report **rollback incomplete**: older installations have no trustworthy saved Compose baseline, and the current source checkout may already contain the new Compose file. The installer still retains the old image and validated snapshot, but deliberately refuses to claim that combination is automatically restorable. A successful run records the current baseline in the data volume, so the following update can become rollback-ready. Verified releases use digest-specific image references for every new generation; local source builds retain the mutable development-image path.
 
 The rollback snapshot is replaced by the next update and covers only SQLite and the control plane. It is not a substitute for the complete backup above. Do not delete the content-derived `shelter/control-plane:rollback-*` image needed by a bundle that `doctor` reports as ready.
 
@@ -629,7 +669,7 @@ npm run dev
 npm run check
 ```
 
-`npm run check` runs strict type checking, all server and web tests, and both production builds. The standalone CLI has its own `npm run check` workflow. Local automated tests use temporary data and do not modify real Cloudflare, GitHub, or Docker resources.
+`npm run check` runs strict type checking, installer and release-bundle tests, all server and web tests, and both production builds. Pull requests also validate Compose and the production container image; CodeQL, Dependency Review, and Dependabot cover code and dependency changes. The standalone CLI has its own `npm run check` workflow. Local automated tests use temporary data and do not modify real Cloudflare, GitHub, or Docker resources.
 
 A real end-to-end smoke test requires a disposable VPS, an active Cloudflare zone and free test hostnames, a private Cloudflare OAuth client or scoped API token, a test repository or ZIP, and explicit permission to modify those resources.
 

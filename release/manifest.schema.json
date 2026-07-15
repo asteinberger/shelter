@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shelter GitHub release asset manifest",
+  "description": "Machine-readable metadata for a Shelter container release and its GitHub Release assets. The installer archive additionally carries its canonical POSIX release.manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "version",
+    "generatedAt",
+    "release",
+    "source",
+    "image",
+    "attestations",
+    "artifacts",
+    "checksums"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "url"],
+      "properties": {
+        "tag": {
+          "type": "string",
+          "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "format": "uri"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "digest", "reference", "tags", "platforms"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[a-z0-9._-]+/[a-z0-9._/-]+$"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "reference": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[a-z0-9._-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
+        },
+        "tags": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ghcr\\.io/[a-z0-9._-]+/[a-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+          }
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/platform"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "architecture": {
+                      "const": "amd64"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/platform"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "architecture": {
+                      "const": "arm64"
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "attestations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provenance", "sbom"],
+      "properties": {
+        "provenance": {
+          "$ref": "#/$defs/provenanceAttestation"
+        },
+        "sbom": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sbomAttestation"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "platform": {
+                      "const": "linux/amd64"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sbomAttestation"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "platform": {
+                      "const": "linux/arm64"
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "mediaType", "checksum"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "mediaType": {
+            "type": "string",
+            "minLength": 1
+          },
+          "checksum": {
+            "$ref": "#/$defs/checksum"
+          }
+        }
+      }
+    },
+    "checksums": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "file"],
+      "properties": {
+        "algorithm": {
+          "const": "sha256"
+        },
+        "file": {
+          "const": "SHA256SUMS"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": {
+          "const": "sha256"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "architecture", "digest"],
+      "properties": {
+        "os": {
+          "const": "linux"
+        },
+        "architecture": {
+          "enum": ["amd64", "arm64"]
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256Digest"
+        }
+      }
+    },
+    "provenanceAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["githubUrl", "registry", "bundle"],
+      "properties": {
+        "githubUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "registry": {
+          "const": true
+        },
+        "bundle": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "sbomAttestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "githubUrl", "registry", "bundle"],
+      "properties": {
+        "platform": {
+          "enum": ["linux/amd64", "linux/arm64"]
+        },
+        "githubUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "registry": {
+          "const": true
+        },
+        "bundle": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

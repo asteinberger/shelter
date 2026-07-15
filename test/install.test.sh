@@ -7,6 +7,9 @@ INSTALL_SHELL=${SHELTER_INSTALL_TEST_SHELL:-$(command -v dash || command -v sh)}
 TEST_PASSWORD='correct horse battery staple'
 TEST_PASSWORD_B64='Y29ycmVjdCBob3JzZSBiYXR0ZXJ5IHN0YXBsZQ=='
 TEST_APP_SECRET='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+TEST_RELEASE_IMAGE='shelter/control-plane:release-2222222222222222222222222222222222222222222222222222222222222222'
+TEST_RELEASE_IMAGE_ID='sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+TEST_RELEASE_REVISION='release:1.2.3-1111111111111111111111111111111111111111'
 
 passed=0
 failed=0
@@ -75,6 +78,20 @@ assert_command_substring_order() {
   done
 }
 
+assert_all_compose_commands_bound() {
+  local physical_sandbox expected_prefix
+  physical_sandbox=$(CDPATH= cd -P "$SANDBOX" >/dev/null 2>&1 && pwd)
+  expected_prefix="compose --env-file ${physical_sandbox}/.env -f ${physical_sandbox}/compose.yaml "
+  awk -v prefix="$expected_prefix" '
+    $0 == "compose version" { next }
+    /^compose / {
+      seen += 1
+      if (index($0, prefix) != 1) exit 1
+    }
+    END { if (seen == 0) exit 1 }
+  ' "$MOCK_DOCKER_LOG" || fail_test 'a verified-release Docker Compose command was not bound to the authenticated compose.yaml and .env'
+}
+
 file_mode() {
   local mode
   mode=$(stat -c '%a' "$1" 2>/dev/null || true)
@@ -132,13 +149,28 @@ EOF
 #!/bin/sh
 set -u
 
-command_line=$*
-printf '%s\n' "$command_line" >> "$MOCK_DOCKER_LOG"
+raw_command_line=$*
+command_line=$raw_command_line
+printf '%s\n' "$raw_command_line" >> "$MOCK_DOCKER_LOG"
 
 if [ -n "${MOCK_DOCKER_FAIL_CONTAINS:-}" ]; then
-  case "$command_line" in
+  case "$raw_command_line" in
     *"$MOCK_DOCKER_FAIL_CONTAINS"*) exit 42 ;;
   esac
+fi
+
+physical_sandbox=$(CDPATH= cd -P "$MOCK_SANDBOX" >/dev/null 2>&1 && pwd)
+if [ "${1:-}" = compose ] && [ "${2:-}" = --env-file ] &&
+   [ "${3:-}" = "$physical_sandbox/.env" ] && [ "${4:-}" = -f ] &&
+   [ "${5:-}" = "$physical_sandbox/compose.yaml" ]; then
+  [ "$#" -ge 6 ] || exit 96
+  [ "${COMPOSE_FILE:-}" = "$physical_sandbox/compose.yaml" ] || exit 96
+  [ "${COMPOSE_PATH_SEPARATOR:-}" = : ] || exit 96
+  shift 5
+  command_line="compose $*"
+elif [ "${MOCK_REQUIRE_RELEASE_COMPOSE_BINDING:-0}" -eq 1 ] &&
+     [ "${1:-}" = compose ] && [ "$raw_command_line" != 'compose version' ]; then
+  exit 96
 fi
 
 next_counter() {
@@ -156,8 +188,9 @@ old_image_id="sha256:ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 new_image_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 rollback_tag="shelter/control-plane:rollback-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
-if [ "$#" -eq 6 ] && [ "$1" = compose ] && [ "$2" = up ] && [ "$3" = -d ] && [ "$4" = --force-recreate ] && [ "$5" = --no-deps ] && [ "$6" = api ]; then
+if [ "$command_line" = 'compose up -d --force-recreate --no-deps api' ]; then
   snapshot_number=$(next_counter "$MOCK_STATE_DIR/api-up-count")
+  : > "$MOCK_STATE_DIR/api-recreated"
   if [ -f "$MOCK_SANDBOX/.env" ]; then
     cp "$MOCK_SANDBOX/.env" "$MOCK_SNAPSHOT_DIR/api-${snapshot_number}.env"
   fi
@@ -211,6 +244,9 @@ case "$command_line" in
   'image inspect --format {{.Id}} shelter/control-plane:local')
     printf '%s\n' "$new_image_id"
     ;;
+  image\ inspect\ --format\ \{\{.Id\}\}\ shelter/control-plane:release-*)
+    printf '%s\n' "$new_image_id"
+    ;;
   image\ inspect\ --format\ \{\{.Id\}\}\ shelter/control-plane:rollback-*)
     if [ "${MOCK_ROLLBACK_IMAGE_MATCH:-1}" -eq 1 ]; then
       printf '%s\n' "$old_image_id"
@@ -224,10 +260,18 @@ case "$command_line" in
   tag\ *)
     ;;
   inspect*'{{.Image}} api-id')
-    printf '%s\n' "$old_image_id"
+    if [ -f "$MOCK_STATE_DIR/api-recreated" ]; then
+      printf '%s\n' "$new_image_id"
+    else
+      printf '%s\n' "$old_image_id"
+    fi
     ;;
   inspect*'{{.Image}} worker-id')
-    printf '%s\n' "$old_image_id"
+    if [ -f "$MOCK_STATE_DIR/api-recreated" ] && [ "${MOCK_RUNTIME_IMAGE_MISMATCH:-0}" -eq 0 ]; then
+      printf '%s\n' "$new_image_id"
+    else
+      printf '%s\n' "$old_image_id"
+    fi
     ;;
   inspect*'{{.State.Running}} api-id')
     printf 'true\n'
@@ -338,6 +382,7 @@ setup_sandbox() {
   export MOCK_TRAEFIK_HEALTH=healthy MOCK_WORKER_ONLINE=1 MOCK_CLOUDFLARED_RUNNING=0
   export MOCK_CLOUDFLARED_STATE=true MOCK_DOCKER_FAIL_CONTAINS=
   export MOCK_CONTROL_PLANE_EXISTS=1 MOCK_ROLLBACK_AVAILABLE=0 MOCK_ROLLBACK_IMAGE_MATCH=1
+  export MOCK_REQUIRE_RELEASE_COMPOSE_BINDING=0 MOCK_RUNTIME_IMAGE_MISMATCH=0
   export MOCK_ROLLBACK_VALIDATE_FAIL=0 MOCK_ROLLBACK_MALFORMED_METADATA=0 MOCK_ROLLBACK_PREPARE_STATE=incomplete
   RUN_CWD=$CALLER_DIR
 }
@@ -703,6 +748,163 @@ test_update_records_ready_rollback_bundle() {
     'compose up -d --force-recreate --no-deps api'
 }
 
+test_verified_release_image_skips_local_build() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_DATA_STATE=ready
+  MOCK_BUILDX_VERSION_FAIL=1
+  export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_BUILDX_VERSION_FAIL
+  export SHELTER_INSTALL_PRELOADED_IMAGE=$TEST_RELEASE_IMAGE
+  export SHELTER_INSTALL_PRELOADED_IMAGE_ID=$TEST_RELEASE_IMAGE_ID
+  export SHELTER_INSTALL_RELEASE_REVISION=$TEST_RELEASE_REVISION
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" 'Docker Buildx is not required for a verified release image'
+  assert_contains "$INSTALL_OUTPUT" "Using ${TEST_RELEASE_IMAGE} without a local build"
+  assert_contains "$SANDBOX/.env" "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}"
+  assert_contains "$MOCK_DOCKER_LOG" "image inspect --format {{.Id}} ${TEST_RELEASE_IMAGE}"
+  assert_contains "$MOCK_DOCKER_LOG" 'PREVIOUS_IMAGE_REFERENCE=shelter/control-plane:local'
+  assert_contains "$MOCK_DOCKER_LOG" "NEW_REVISION=${TEST_RELEASE_REVISION}"
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose build'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'buildx version'
+}
+
+test_verified_release_fresh_install_creates_env_after_preflight() {
+  MOCK_REQUIRE_RELEASE_COMPOSE_BINDING=1
+  export MOCK_REQUIRE_RELEASE_COMPOSE_BINDING
+  export SHELTER_INSTALL_PRELOADED_IMAGE=$TEST_RELEASE_IMAGE
+  export SHELTER_INSTALL_PRELOADED_IMAGE_ID=$TEST_RELEASE_IMAGE_ID
+  export SHELTER_INSTALL_RELEASE_REVISION=$TEST_RELEASE_REVISION
+
+  run_installer "${TEST_PASSWORD}"$'\n' \
+    --non-interactive --email admin@example.com --password-stdin --no-pull
+  assert_status 0
+  assert_contains "$INSTALL_OUTPUT" '.env created atomically with mode 0600'
+  assert_contains "$SANDBOX/.env" "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}"
+  assert_all_compose_commands_bound
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose build'
+}
+
+test_verified_release_ignores_compose_file_overrides() {
+  write_valid_env 7080
+  printf '%s\n' \
+    "COMPOSE_FILE=${SANDBOX}/untrusted-from-env.yaml" \
+    'COMPOSE_PATH_SEPARATOR=;' >> "$SANDBOX/.env"
+  printf '%s\n' 'services: {}' > "$SANDBOX/compose.override.yaml"
+  printf '%s\n' 'services: {}' > "$SANDBOX/untrusted-from-env.yaml"
+  printf '%s\n' 'services: {}' > "$SANDBOX/untrusted-inherited.yaml"
+  MOCK_VOLUME_EXISTS=1
+  MOCK_DATA_STATE=ready
+  MOCK_REQUIRE_RELEASE_COMPOSE_BINDING=1
+  COMPOSE_FILE="${SANDBOX}/untrusted-inherited.yaml;${SANDBOX}/compose.override.yaml"
+  COMPOSE_PATH_SEPARATOR=';'
+  export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_REQUIRE_RELEASE_COMPOSE_BINDING
+  export COMPOSE_FILE COMPOSE_PATH_SEPARATOR
+  export SHELTER_INSTALL_PRELOADED_IMAGE=$TEST_RELEASE_IMAGE
+  export SHELTER_INSTALL_PRELOADED_IMAGE_ID=$TEST_RELEASE_IMAGE_ID
+  export SHELTER_INSTALL_RELEASE_REVISION=$TEST_RELEASE_REVISION
+
+  run_installer '' --non-interactive --no-pull
+  unset COMPOSE_FILE COMPOSE_PATH_SEPARATOR
+  assert_status 0
+  assert_all_compose_commands_bound
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose.override.yaml'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'untrusted-from-env.yaml'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'untrusted-inherited.yaml'
+  assert_contains "$SANDBOX/.env" "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}"
+}
+
+test_verified_release_runtime_image_mismatch_stops_writers() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  MOCK_DATA_STATE=ready
+  MOCK_REQUIRE_RELEASE_COMPOSE_BINDING=1
+  MOCK_RUNTIME_IMAGE_MISMATCH=1
+  export MOCK_VOLUME_EXISTS MOCK_DATA_STATE MOCK_REQUIRE_RELEASE_COMPOSE_BINDING MOCK_RUNTIME_IMAGE_MISMATCH
+  export SHELTER_INSTALL_PRELOADED_IMAGE=$TEST_RELEASE_IMAGE
+  export SHELTER_INSTALL_PRELOADED_IMAGE_ID=$TEST_RELEASE_IMAGE_ID
+  export SHELTER_INSTALL_RELEASE_REVISION=$TEST_RELEASE_REVISION
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'running API or worker image identity did not match the authenticated image'
+  assert_contains "$INSTALL_OUTPUT" 'API and worker are being left stopped'
+  assert_not_contains "$SANDBOX/.env" 'CONTROL_PLANE_IMAGE='
+  assert_contains "$MOCK_DOCKER_LOG" 'inspect --format {{.Image}} api-id'
+  assert_contains "$MOCK_DOCKER_LOG" 'inspect --format {{.Image}} worker-id'
+  assert_all_compose_commands_bound
+  physical_sandbox=$(CDPATH= cd -P "$SANDBOX" >/dev/null 2>&1 && pwd)
+  assert_contains "$MOCK_DOCKER_LOG" "compose --env-file ${physical_sandbox}/.env -f ${physical_sandbox}/compose.yaml stop -t 30 worker api"
+}
+
+test_release_doctor_uses_authenticated_compose_plan() {
+  write_valid_env 7080
+  printf '%s\n' \
+    "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}" \
+    "COMPOSE_FILE=${SANDBOX}/untrusted-from-env.yaml" \
+    'COMPOSE_PATH_SEPARATOR=;' >> "$SANDBOX/.env"
+  printf '%s\n' 'services: {}' > "$SANDBOX/compose.override.yaml"
+  printf '%s\n' 'services: {}' > "$SANDBOX/untrusted-from-env.yaml"
+  MOCK_REQUIRE_RELEASE_COMPOSE_BINDING=1
+  export MOCK_REQUIRE_RELEASE_COMPOSE_BINDING
+
+  run_installer '' doctor
+  assert_status 0
+  assert_all_compose_commands_bound
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose.override.yaml'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'untrusted-from-env.yaml'
+}
+
+test_verified_release_identity_mismatch_is_non_mutating() {
+  write_valid_env 7080
+  MOCK_VOLUME_EXISTS=1
+  export MOCK_VOLUME_EXISTS
+  export SHELTER_INSTALL_PRELOADED_IMAGE=$TEST_RELEASE_IMAGE
+  export SHELTER_INSTALL_PRELOADED_IMAGE_ID=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  export SHELTER_INSTALL_RELEASE_REVISION=$TEST_RELEASE_REVISION
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'preloaded release image no longer matches its verified identity'
+  assert_not_contains "$SANDBOX/.env" 'CONTROL_PLANE_IMAGE='
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose build'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=prepare'
+}
+
+test_source_installer_never_overwrites_release_tag() {
+  write_valid_env 7080
+  printf '%s\n' "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}" >> "$SANDBOX/.env"
+  MOCK_VOLUME_EXISTS=1
+  export MOCK_VOLUME_EXISTS
+
+  run_installer '' --non-interactive --no-pull
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'tracks a verified release image'
+  assert_contains "$SANDBOX/.env" "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}"
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose build'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose stop -t 60 worker api'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'SHELTER_ROLLBACK_ACTION=prepare'
+}
+
+test_interrupted_release_sync_blocks_operations() {
+  write_valid_env 7080
+  printf '%s\n' 'interrupted' > "$SANDBOX/.shelter-release-sync-incomplete"
+
+  run_installer '' doctor
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'authenticated release payload synchronization was interrupted'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose config --quiet'
+
+  : > "$MOCK_DOCKER_LOG"
+  run_installer '' --non-interactive --no-pull
+  assert_status 1
+  assert_contains "$INSTALL_OUTPUT" 'authenticated release payload synchronization was interrupted'
+  assert_not_contains "$MOCK_DOCKER_LOG" 'compose build'
+  assert_file_absent "$SANDBOX/.shelter-install.lock"
+}
+
 test_doctor_reports_rollback_readiness_without_mutation() {
   write_valid_env 7080
   MOCK_VOLUME_EXISTS=1
@@ -728,6 +930,7 @@ test_doctor_reports_rollback_readiness_without_mutation() {
 
 test_rollback_restores_snapshot_and_prior_revision() {
   write_valid_env 7080
+  printf '%s\n' "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}" >> "$SANDBOX/.env"
   MOCK_VOLUME_EXISTS=1
   MOCK_ROLLBACK_AVAILABLE=1
   export MOCK_VOLUME_EXISTS MOCK_ROLLBACK_AVAILABLE
@@ -737,10 +940,14 @@ test_rollback_restores_snapshot_and_prior_revision() {
   assert_contains "$INSTALL_OUTPUT" 'Rollback completed safely.'
   assert_contains "$INSTALL_OUTPUT" 'git:1111111111111111111111111111111111111111'
   assert_contains "$INSTALL_OUTPUT" 'shelter-before-rollback.sqlite'
+  assert_contains "$SANDBOX/.env" 'CONTROL_PLANE_IMAGE=shelter/control-plane:local'
+  assert_not_contains "$SANDBOX/.env" "CONTROL_PLANE_IMAGE=${TEST_RELEASE_IMAGE}"
+  physical_sandbox=$(CDPATH= cd -P "$SANDBOX" >/dev/null 2>&1 && pwd)
+  assert_contains "$MOCK_DOCKER_LOG" "compose --env-file ${physical_sandbox}/.env -f ${physical_sandbox}/compose.yaml stop -t 60 worker api"
   assert_command_substring_order \
     'SHELTER_ROLLBACK_ACTION=validate' \
     'SHELTER_ROLLBACK_ACTION=extract-compose' \
-    'compose stop -t 60 worker api' \
+    'stop -t 60 worker api' \
     'tag shelter/control-plane:rollback-' \
     'SHELTER_ROLLBACK_ACTION=restore' \
     'up -d --no-build --force-recreate --no-deps api' \
@@ -872,6 +1079,14 @@ run_test 'failed update snapshot restores prior running services' test_failed_up
 run_test 'an active installer lock prevents concurrent mutation' test_active_install_lock_is_respected
 run_test 'deploy lock requires an explicit matching handoff token' test_deploy_lock_requires_matching_handoff_token
 run_test 'updates retain an image and record a ready rollback bundle' test_update_records_ready_rollback_bundle
+run_test 'verified release image skips Buildx and local image builds' test_verified_release_image_skips_local_build
+run_test 'fresh verified release creates env after preflight' test_verified_release_fresh_install_creates_env_after_preflight
+run_test 'verified releases ignore Compose file-selection overrides' test_verified_release_ignores_compose_file_overrides
+run_test 'release runtime image mismatch stops both writers' test_verified_release_runtime_image_mismatch_stops_writers
+run_test 'release doctor uses the authenticated Compose plan' test_release_doctor_uses_authenticated_compose_plan
+run_test 'release image identity mismatch fails before mutation' test_verified_release_identity_mismatch_is_non_mutating
+run_test 'source installs never overwrite digest-derived release tags' test_source_installer_never_overwrites_release_tag
+run_test 'interrupted release synchronization blocks operations' test_interrupted_release_sync_blocks_operations
 run_test 'doctor reports rollback readiness without mutating state' test_doctor_reports_rollback_readiness_without_mutation
 run_test 'rollback restores the validated snapshot and prior revision' test_rollback_restores_snapshot_and_prior_revision
 run_test 'invalid metadata, snapshots, or images never stop writers' test_invalid_rollback_artifacts_never_stop_writers
