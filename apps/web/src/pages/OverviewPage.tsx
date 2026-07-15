@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Rocket,
   Server,
+  ShieldCheck,
   TriangleAlert,
   Upload,
 } from 'lucide-react';
@@ -42,6 +43,7 @@ import { deploymentSourceLabel } from '../utils/deployment';
 import { isFileStorageProject } from '../utils/project-runtime';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/i18n';
+import { ProductionSafetyAlert } from '../components/ProductionSafetyAlert';
 
 function MetricCard({
   icon: Icon,
@@ -215,6 +217,7 @@ export function OverviewPage() {
     ?? projects.filter((project) => project.status === 'failed' || project.status === 'deletion_failed').length;
   const workerOnline = data?.system?.workerOnline;
   const tunnelConfigured = Boolean(data?.system?.tunnelConfigured || data?.cloudflare?.configured || data?.cloudflare?.connected);
+  const accessProtection = data?.system?.accessProtection;
   const systemReady = workerOnline !== false && tunnelConfigured;
 
   if (overview.isLoading && !data) return <DashboardSkeleton />;
@@ -279,6 +282,8 @@ export function OverviewPage() {
           </div>
         </Alert>
       )}
+
+      <ProductionSafetyAlert accessProtection={accessProtection} />
 
       {attention && (
         <Alert variant={attention.destructive ? 'destructive' : 'default'} className="items-start p-4">
@@ -365,6 +370,29 @@ export function OverviewPage() {
                 <span className="flex shrink-0 items-center gap-2 text-xs font-medium">
                   <span className={cn('size-1.5 rounded-full', tunnelConfigured ? 'bg-success' : 'bg-warning')} aria-hidden="true" />
                   {tunnelConfigured ? t('Configured', 'Eingerichtet') : t('Pending', 'Offen')}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-3 border-b px-4 py-5">
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/30 text-muted-foreground"><ShieldCheck className="size-4" aria-hidden="true" /></span>
+                <div className="min-w-0 flex-1">
+                  <strong className="block text-sm font-medium">Cloudflare Access</strong>
+                  <span className="block text-xs text-muted-foreground">{t('Manual security posture for the panel', 'Manueller Sicherheitsstatus des Panels')}</span>
+                </div>
+                <span className="flex shrink-0 items-center gap-2 text-xs font-medium">
+                  <span className={cn(
+                    'size-1.5 rounded-full',
+                    accessProtection?.status === 'confirmed_by_admin'
+                      ? 'bg-success'
+                      : accessProtection?.status === 'action_required'
+                        ? 'bg-destructive'
+                        : 'bg-muted-foreground/50',
+                  )} aria-hidden="true" />
+                  {accessProtection?.status === 'confirmed_by_admin'
+                    ? t('Confirmed', 'Bestätigt')
+                    : accessProtection?.status === 'action_required'
+                      ? t('Action required', 'Handlung nötig')
+                      : t('Not applicable', 'Nicht anwendbar')}
                 </span>
               </div>
 

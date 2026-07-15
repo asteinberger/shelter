@@ -21,7 +21,7 @@ import {
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
-import { api } from '../api/client';
+import { ApiError, api } from '../api/client';
 import { Button, ErrorState, Field, SelectField, Skeleton, StatusBadge } from '../components/ui';
 import { SettingsHeader, type SettingsSection } from '../components/settings/SettingsHeader';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
@@ -41,8 +41,10 @@ import {
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { NavigationGuard } from '../components/NavigationGuard';
+import { CloudflareAccessProtectionCard } from '../components/CloudflareAccessProtectionCard';
 import { trustedGitHubAppUrl, trustedGitHubManifestRegistrationUrl } from '../utils/github';
 import { currentLocale, localize, useI18n } from '@/i18n';
+import type { CloudflareSettings } from '../types';
 
 interface FormState {
   accountId: string;
@@ -201,6 +203,18 @@ function InlineNotice({
 export function SettingsPage({ section }: { section: SettingsSection }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
+  const accessProtectionErrorMessage = (error: unknown) => {
+    const code = error instanceof ApiError && error.details && typeof error.details === 'object'
+      ? (error.details as { code?: unknown }).code
+      : undefined;
+    if (code === 'PANEL_DOMAIN_CHANGED') {
+      return t('The panel hostname changed. Review the current hostname before confirming it.', 'Der Panel-Hostname wurde geändert. Prüfe den aktuellen Hostnamen, bevor du ihn bestätigst.');
+    }
+    if (code === 'PANEL_DOMAIN_REQUIRED') {
+      return t('Set up a panel hostname before confirming Cloudflare Access.', 'Richte einen Panel-Hostnamen ein, bevor du Cloudflare Access bestätigst.');
+    }
+    return t('Shelter could not update the administrator confirmation. Refresh the settings and try again.', 'Shelter konnte die Administrator-Bestätigung nicht aktualisieren. Lade die Einstellungen neu und versuche es erneut.');
+  };
   const passwordInvalidationSummary = (result: { invalidatedSessions: number; invalidatedApiTokens: number }) => {
     const sessions = result.invalidatedSessions === 1
       ? t('One other session was signed out.', 'Eine andere Sitzung wurde abgemeldet.')
@@ -276,10 +290,10 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     if (callbackStatus === 'connected') {
       setConnectionNotice({
         tone: 'success',
-        title: t('Cloudflare access confirmed', 'Cloudflare-Zugriff bestätigt'),
+        title: t('Cloudflare authorization confirmed', 'Cloudflare-Autorisierung bestätigt'),
         message: t('Sign-in succeeded. Finish setting up the tunnel now.', 'Die Anmeldung war erfolgreich. Schließe jetzt die Tunnel-Einrichtung ab.'),
       });
-      toast.success(t('Cloudflare access confirmed', 'Cloudflare-Zugriff bestätigt'), {
+      toast.success(t('Cloudflare authorization confirmed', 'Cloudflare-Autorisierung bestätigt'), {
         description: t('Sign-in succeeded. Finish setting up the tunnel now.', 'Die Anmeldung war erfolgreich. Schließe jetzt die Tunnel-Einrichtung ab.'),
         id: 'cloudflare-callback',
       });
@@ -428,9 +442,47 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
       id: 'cloudflare-test',
     }),
   });
+  const confirmAccessProtection = useMutation({
+    mutationFn: () => api.confirmCloudflareAccessProtection(settings.data?.accessProtection?.panelDomain ?? ''),
+    onMutate: () => toast.loading(t('Saving administrator confirmation …', 'Administrator-Bestätigung wird gespeichert …'), { id: 'cloudflare-access-confirm' }),
+    onSuccess: (accessProtection) => {
+      queryClient.setQueryData<CloudflareSettings>(['cloudflare-settings'], (current) => (
+        current ? { ...current, accessProtection } : current
+      ));
+      void queryClient.invalidateQueries({ queryKey: ['cloudflare-settings'] });
+      void queryClient.invalidateQueries({ queryKey: ['overview'] });
+      toast.success(t('Administrator confirmation saved', 'Administrator-Bestätigung gespeichert'), {
+        description: t('It is tied to this exact panel hostname.', 'Sie ist an diesen exakten Panel-Hostnamen gebunden.'),
+        id: 'cloudflare-access-confirm',
+      });
+    },
+    onError: (error) => toast.error(t('Confirmation could not be saved', 'Bestätigung konnte nicht gespeichert werden'), {
+      description: accessProtectionErrorMessage(error),
+      id: 'cloudflare-access-confirm',
+    }),
+  });
+  const revokeAccessProtection = useMutation({
+    mutationFn: api.revokeCloudflareAccessProtection,
+    onMutate: () => toast.loading(t('Revoking administrator confirmation …', 'Administrator-Bestätigung wird widerrufen …'), { id: 'cloudflare-access-revoke' }),
+    onSuccess: (accessProtection) => {
+      queryClient.setQueryData<CloudflareSettings>(['cloudflare-settings'], (current) => (
+        current ? { ...current, accessProtection } : current
+      ));
+      void queryClient.invalidateQueries({ queryKey: ['cloudflare-settings'] });
+      void queryClient.invalidateQueries({ queryKey: ['overview'] });
+      toast.success(t('Administrator confirmation revoked', 'Administrator-Bestätigung widerrufen'), {
+        description: t('Shelter now marks the panel as production-unsafe.', 'Shelter markiert das Panel jetzt als produktionsunsicher.'),
+        id: 'cloudflare-access-revoke',
+      });
+    },
+    onError: (error) => toast.error(t('Confirmation could not be revoked', 'Bestätigung konnte nicht widerrufen werden'), {
+      description: accessProtectionErrorMessage(error),
+      id: 'cloudflare-access-revoke',
+    }),
+  });
   const disconnect = useMutation({
     mutationFn: api.disconnectCloudflare,
-    onMutate: () => toast.loading(t('Removing Cloudflare access …', 'Cloudflare-Zugriff wird entfernt …'), { id: 'cloudflare-disconnect' }),
+    onMutate: () => toast.loading(t('Removing Cloudflare authorization …', 'Cloudflare-Autorisierung wird entfernt …'), { id: 'cloudflare-disconnect' }),
     onSuccess: (cloudflare) => {
       const onlyAccount = cloudflare.accounts.length === 1 ? cloudflare.accounts[0] : undefined;
       setForm({
@@ -479,6 +531,8 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
   const cloudflareBusy = save.isPending
     || startOAuth.isPending
     || test.isPending
+    || confirmAccessProtection.isPending
+    || revokeAccessProtection.isPending
     || disconnect.isPending;
 
   function submitOAuthSetup(event: FormEvent) {
@@ -548,6 +602,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
   const configured = Boolean(settings.data?.configured);
   const authorized = Boolean(settings.data?.authorized);
   const oauthPending = Boolean(settings.data?.oauthPending);
+  const panelAccessProtection = settings.data?.accessProtection;
   const cloudflareErrors = {
     accountId: accountIdError(form.accountId),
     tunnelName: tunnelNameError(form.tunnelName),
@@ -1226,6 +1281,30 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
             </Card>
           )}
 
+          {panelAccessProtection?.panelDomain && (
+            <CloudflareAccessProtectionCard
+              accessProtection={panelAccessProtection}
+              accountId={settings.data?.accountId}
+              pending={confirmAccessProtection.isPending || revokeAccessProtection.isPending}
+              error={confirmAccessProtection.error || revokeAccessProtection.error
+                ? accessProtectionErrorMessage(confirmAccessProtection.error ?? revokeAccessProtection.error)
+                : null}
+              success={confirmAccessProtection.isSuccess
+                ? 'confirmed'
+                : revokeAccessProtection.isSuccess
+                  ? 'revoked'
+                  : null}
+              onConfirm={() => {
+                revokeAccessProtection.reset();
+                confirmAccessProtection.mutate();
+              }}
+              onRevoke={() => {
+                confirmAccessProtection.reset();
+                revokeAccessProtection.mutate();
+              }}
+            />
+          )}
+
           {(!configured || settings.data?.authMethod === 'api_token') && (
             <Card className="gap-0 py-0">
               <Accordion type="single" collapsible>
@@ -1305,6 +1384,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
               ['1.', t('Sign in with Cloudflare', 'Bei Cloudflare anmelden'), t('You confirm access directly on Cloudflare.', 'Du bestätigst den Zugriff direkt auf der Cloudflare-Seite.')],
               ['2.', t('Choose account and hostname', 'Account und Hostname wählen'), t('Shelter lists available accounts and configures routing.', 'Shelter zeigt verfügbare Accounts an und richtet das Routing ein.')],
               ['3.', t('Use the tunnel', 'Tunnel verwenden'), t('The panel and projects remain reachable without a public VPS port.', 'Panel und Projekte bleiben ohne öffentlich offenen VPS-Port erreichbar.')],
+              ['4.', t('Protect the panel with Access', 'Panel mit Access schützen'), t('Add a Self-hosted Access application for the panel hostname and confirm the checklist in Shelter.', 'Lege eine Self-hosted-Access-Anwendung für den Panel-Hostnamen an und bestätige anschließend die Checkliste in Shelter.')],
             ].map(([number, title, description]) => (
               <li key={number} className="grid grid-cols-[1.25rem_minmax(0,1fr)] gap-2 text-sm">
                 <span className="text-muted-foreground" aria-hidden="true">{number}</span>
@@ -1344,7 +1424,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
         <section aria-labelledby="cloudflare-danger-title" className="max-w-4xl">
           <Card className="border-destructive/20">
             <CardHeader>
-              <CardTitle id="cloudflare-danger-title" className="text-base">{t('Remove Cloudflare access', 'Cloudflare-Zugriff entfernen')}</CardTitle>
+              <CardTitle id="cloudflare-danger-title" className="text-base">{t('Remove Cloudflare authorization', 'Cloudflare-Autorisierung entfernen')}</CardTitle>
               <CardDescription>
                 {t('Removes credentials from Shelter. Existing tunnels and connectors continue to run in Cloudflare until you delete them there.', 'Entfernt die Zugangsdaten aus Shelter. Bestehende Tunnel und Connectoren laufen bei Cloudflare weiter, bis du sie dort löschst.')}
               </CardDescription>
@@ -1359,7 +1439,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                 <AlertDialog>
                   <AlertDialogTrigger asChild>
                     <Button type="button" variant="danger" loading={disconnect.isPending} disabled={cloudflareBusy} className="w-full sm:w-auto">
-                      {!disconnect.isPending && <Unplug aria-hidden="true" />} {disconnect.isPending ? t('Disconnecting …', 'Verbindung wird getrennt …') : t('Remove Cloudflare access', 'Cloudflare-Zugriff entfernen')}
+                      {!disconnect.isPending && <Unplug aria-hidden="true" />} {disconnect.isPending ? t('Disconnecting …', 'Verbindung wird getrennt …') : t('Remove Cloudflare authorization', 'Cloudflare-Autorisierung entfernen')}
                     </Button>
                   </AlertDialogTrigger>
                   <AlertDialogContent>
@@ -1367,7 +1447,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                       <AlertDialogMedia className="bg-destructive/10 text-destructive">
                         <Unplug aria-hidden="true" />
                       </AlertDialogMedia>
-                      <AlertDialogTitle>{t('Remove Cloudflare access from Shelter?', 'Cloudflare-Zugriff aus Shelter entfernen?')}</AlertDialogTitle>
+                      <AlertDialogTitle>{t('Remove Cloudflare authorization from Shelter?', 'Cloudflare-Autorisierung aus Shelter entfernen?')}</AlertDialogTitle>
                       <AlertDialogDescription>
                         {t('Existing tunnels and cloudflared connectors continue to run in Cloudflare until you delete them there.', 'Bestehende Tunnel und cloudflared-Connectoren laufen bei Cloudflare weiter, bis du sie dort löschst.')}
                       </AlertDialogDescription>
@@ -1381,7 +1461,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                           if (!cloudflareBusy) disconnect.mutate();
                         }}
                       >
-                        {t('Remove access', 'Zugriff entfernen')}
+                        {t('Remove authorization', 'Autorisierung entfernen')}
                       </AlertDialogAction>
                     </AlertDialogFooter>
                   </AlertDialogContent>

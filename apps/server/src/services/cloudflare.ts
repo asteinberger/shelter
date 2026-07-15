@@ -9,6 +9,12 @@ import {
   CloudflareOAuthService,
   type CloudflareOAuthAccount
 } from "./cloudflare-oauth.js";
+import {
+  cloudflareAccessProtection,
+  revokeCloudflareAccessConfirmation,
+  storeCloudflareAccessConfirmation,
+  type CloudflareAccessProtectionState
+} from "./cloudflare-access.js";
 import { panelHostnames, storePanelDomainTransition } from "./panel-domains.js";
 import { reconcileRouting } from "./routing.js";
 
@@ -124,6 +130,7 @@ export interface CloudflareState {
   accounts: CloudflareOAuthAccount[];
   oauthExpiresAt: string | null;
   reconnectRequired: boolean;
+  accessProtection: CloudflareAccessProtectionState;
 }
 
 export interface CloudflareZoneSummary {
@@ -225,8 +232,28 @@ export class CloudflareService {
       oauthPending: Boolean(pending),
       accounts: pending?.accounts ?? oauthConnection?.accounts ?? [],
       oauthExpiresAt: oauthConnection?.expiresAt ?? null,
-      reconnectRequired: disabled ? false : this.oauth.reconnectRequired()
+      reconnectRequired: disabled ? false : this.oauth.reconnectRequired(),
+      accessProtection: cloudflareAccessProtection(this.database)
     };
+  }
+
+  confirmAccessProtection(panelDomainInput: string, userId: string): CloudflareAccessProtectionState {
+    const panelDomain = this.database.getSetting("cloudflare.panel_domain");
+    if (!panelDomain) {
+      throw badRequest("Bitte zuerst eine Panel-Domain einrichten", "PANEL_DOMAIN_REQUIRED");
+    }
+    const expectedPanelDomain = normalizeHostname(panelDomainInput);
+    if (expectedPanelDomain !== normalizeHostname(panelDomain)) {
+      throw conflict(
+        "Die Panel-Domain wurde geändert. Bitte den aktuellen Hostnamen erneut prüfen.",
+        "PANEL_DOMAIN_CHANGED"
+      );
+    }
+    return storeCloudflareAccessConfirmation(this.database, expectedPanelDomain, userId);
+  }
+
+  revokeAccessProtection(): CloudflareAccessProtectionState {
+    return revokeCloudflareAccessConfirmation(this.database);
   }
 
   private async credentials(override?: { accountId?: string; apiToken?: string }): Promise<{

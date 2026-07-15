@@ -1,6 +1,7 @@
 import type {
   ApiTokenSummary,
   CloudflareInput,
+  CloudflareAccessProtection,
   CloudflareOAuthStartResult,
   CloudflareSettings,
   CloudflareTestResult,
@@ -517,6 +518,22 @@ export const api = {
 
   testCloudflare() {
     return request<CloudflareTestResult>('/api/settings/cloudflare/test', { method: 'POST' });
+  },
+
+  async confirmCloudflareAccessProtection(panelDomain: string) {
+    const payload = await request<{ accessProtection: CloudflareAccessProtection }>(
+      '/api/settings/cloudflare/access-protection/confirmation',
+      { method: 'POST', body: JSON.stringify({ panelDomain }) },
+    );
+    return payload.accessProtection;
+  },
+
+  async revokeCloudflareAccessProtection() {
+    const payload = await request<{ accessProtection: CloudflareAccessProtection }>(
+      '/api/settings/cloudflare/access-protection/confirmation',
+      { method: 'DELETE' },
+    );
+    return payload.accessProtection;
   },
 
   async github() {

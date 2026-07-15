@@ -5,7 +5,8 @@ import {
   deploymentContainerNames,
   isDockerDnsLabel,
   isManagedVersionedRuntimeName,
-  legacyDeploymentContainerName
+  legacyDeploymentContainerName,
+  managedProjectIdForContainer
 } from "../src/services/runtime-identity.js";
 
 describe("versioned runtime container identity", () => {
@@ -41,5 +42,28 @@ describe("versioned runtime container identity", () => {
     expect(isDockerDnsLabel(current)).toBe(true);
     expect(isDockerDnsLabel(candidate)).toBe(true);
     expect(deploymentContainerNames(slug, deploymentId, legacy)).toEqual([legacy, current]);
+  });
+
+  it("treats current Shelter ownership as authoritative over inherited legacy labels", () => {
+    expect(managedProjectIdForContainer({
+      "shelter.managed": "true",
+      "shelter.project": "prj_current",
+      "portsmith.managed": "false",
+      "portsmith.project": ""
+    }, "/shelter-run-current", "shelter/current:dep")).toBe("prj_current");
+    expect(managedProjectIdForContainer({
+      "shelter.managed": "true",
+      "shelter.project": "prj_rollback"
+    }, "/shelter-run-rollback", "portsmith/legacy:ready")).toBe("prj_rollback");
+    expect(managedProjectIdForContainer({
+      "shelter.managed": "true",
+      "shelter.project": "prj_victim",
+      "portsmith.managed": "true",
+      "portsmith.project": "prj_legacy"
+    }, "/portsmith-app-legacy", "portsmith/legacy:latest")).toBe("prj_legacy");
+    expect(managedProjectIdForContainer({
+      "shelter.managed": "true",
+      "shelter.project": "prj_current"
+    }, "/unknown-runtime", "unknown/current:dep")).toBeNull();
   });
 });

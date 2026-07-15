@@ -11,5 +11,6 @@ apps/server/data/
 traefik/dynamic.yml
 coverage/
 *.log
+.shelter-install.lock/
 .DS_Store
 *.tsbuildinfo

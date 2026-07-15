@@ -14,6 +14,52 @@ import type { DeploymentRow, ProjectRow } from "../src/types/models.js";
 
 const temporaryDirectories: string[] = [];
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const isolatedTarget = {
+  networkName: "shelter-prj-0123456789abcdefabcd",
+  helperImage: "shelter/control-plane:local"
+};
+
+function optionValue(args: string[], option: string): string {
+  const index = args.indexOf(option);
+  return index === -1 ? "" : (args[index + 1] ?? "");
+}
+
+function helperLabels(args: string[]): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== "--label") continue;
+    const label = args[index + 1] ?? "";
+    const separator = label.indexOf("=");
+    if (separator > 0) labels[label.slice(0, separator)] = label.slice(separator + 1);
+  }
+  return labels;
+}
+
+function previewCommand(runExitCode = 0) {
+  let helperName = "";
+  let labels: Record<string, string> = {};
+  return vi.fn(async (_binary: string, args: string[]) => {
+    if (args[0] === "run") {
+      helperName = optionValue(args, "--name");
+      labels = helperLabels(args);
+      return { stdout: "", stderr: "", exitCode: runExitCode };
+    }
+    if (args[0] === "cp" && args[2]) {
+      await fs.promises.writeFile(args[2], PNG);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (args[0] === "inspect") {
+      expect(args.at(-1)).toBe(helperName);
+      return {
+        stdout: JSON.stringify({ id: "a".repeat(64), labels }),
+        stderr: "",
+        exitCode: 0
+      };
+    }
+    if (args[0] === "rm") return { stdout: "", stderr: "", exitCode: 0 };
+    throw new Error(`Unexpected Docker command: ${args.join(" ")}`);
+  });
+}
 
 function temporaryConfig() {
   const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "shelter-preview-"));
@@ -90,29 +136,22 @@ afterEach(() => {
 describe("project previews", () => {
   it("captures HTML with Chromium and exposes only the active deployment", async () => {
     const config = temporaryConfig();
-    const command = vi.fn(async (_binary: string, args: string[]) => {
-      const screenshot = args.find((argument) => argument.startsWith("--screenshot="))?.slice("--screenshot=".length);
-      if (!screenshot) throw new Error("screenshot path missing");
-      await fs.promises.writeFile(screenshot, PNG);
-      return { stdout: "", stderr: "", exitCode: 0 };
-    });
+    const command = previewCommand();
 
     const metadata = await captureProjectPreview(config, {
       projectId: "prj_preview",
       deploymentId: "dep_one",
-      url: "http://shelter-app-preview:3000/"
+      url: "http://shelter-app-preview:3000/",
+      ...isolatedTarget
     }, {
-      fetch: vi.fn(async () => new Response("<!doctype html><title>Preview</title>", {
-        headers: { "content-type": "text/html; charset=utf-8" }
-      })),
       command
     });
 
     expect(metadata.status).toBe("ready");
-    expect(command).toHaveBeenCalledWith("/fake/chromium", expect.arrayContaining([
-      "--headless",
-      "--window-size=1440,900",
-      "http://shelter-app-preview:3000/"
+    expect(command).toHaveBeenCalledWith("docker", expect.arrayContaining([
+      "run",
+      "--network", isolatedTarget.networkName,
+      isolatedTarget.helperImage
     ]), expect.objectContaining({ timeoutMs: 30_000 }));
     expect(fs.readFileSync(projectPreviewImagePath(config, "prj_preview"))).toEqual(PNG);
     expect(projectPreviewState(config, "prj_preview", "dep_one")).toMatchObject({
@@ -128,19 +167,17 @@ describe("project previews", () => {
 
   it("marks API responses as unavailable without launching Chromium", async () => {
     const config = temporaryConfig();
-    const command = vi.fn();
+    const command = previewCommand(40);
     const metadata = await captureProjectPreview(config, {
       projectId: "prj_api",
       deploymentId: "dep_api",
-      url: "http://shelter-app-api:3000/health"
+      url: "http://shelter-app-api:3000/health",
+      ...isolatedTarget
     }, {
-      fetch: vi.fn(async () => new Response('{"ok":true}', {
-        headers: { "content-type": "application/json" }
-      })),
       command
     });
 
-    expect(command).not.toHaveBeenCalled();
+    expect(command.mock.calls.some(([, args]) => args[0] === "cp")).toBe(false);
     expect(metadata).toMatchObject({ status: "unavailable", reason: "not_html" });
     expect(projectPreviewState(config, "prj_api", "dep_api")).toMatchObject({
       status: "unavailable",
@@ -159,15 +196,10 @@ describe("project previews", () => {
     await captureProjectPreview(config, {
       projectId: row.id,
       deploymentId: active.id,
-      url: "http://shelter-app-preview:3000/"
+      url: "http://shelter-app-preview:3000/",
+      ...isolatedTarget
     }, {
-      fetch: async () => new Response("<html></html>", { headers: { "content-type": "text/html" } }),
-      command: async (_binary, args) => {
-        const screenshot = args.find((argument) => argument.startsWith("--screenshot="))?.slice("--screenshot=".length);
-        if (!screenshot) throw new Error("screenshot path missing");
-        await fs.promises.writeFile(screenshot, PNG);
-        return { stdout: "", stderr: "", exitCode: 0 };
-      }
+      command: previewCommand()
     });
     const app = await createApp(config, database);
 
@@ -198,4 +230,3 @@ describe("project previews", () => {
     await app.close();
   });
 });
-

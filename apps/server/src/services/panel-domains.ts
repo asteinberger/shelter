@@ -1,4 +1,5 @@
 import type { Database } from "../lib/database.js";
+import { invalidateCloudflareAccessConfirmationForHostname } from "./cloudflare-access.js";
 
 const PANEL_ALIASES_SETTING = "cloudflare.panel_domain_aliases";
 
@@ -63,6 +64,7 @@ export function storePanelDomainTransition(
   recordId: string
 ): void {
   const current = database.getSetting("cloudflare.panel_domain")?.toLowerCase();
+  invalidateCloudflareAccessConfirmationForHostname(database, hostname);
   const aliases = panelDomainAliases(database).filter((alias) => alias.hostname !== hostname);
   if (current && current !== hostname) {
     aliases.push({

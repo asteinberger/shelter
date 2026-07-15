@@ -2,14 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "../config.js";
-import type { CommandOptions, CommandResult } from "../lib/command.js";
-import { runCommand } from "../lib/command.js";
 import { resolveWithin } from "../lib/security.js";
 import type { PublicProjectPreview } from "../types/models.js";
+import {
+  captureProjectContainerPreview,
+  type ProjectRuntimeHelperCommandRunner
+} from "./project-runtime-helper.js";
 
-const PREVIEW_WIDTH = 1440;
-const PREVIEW_HEIGHT = 900;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+export const MAX_PROJECT_PREVIEW_BYTES = 10 * 1024 * 1024;
 
 type PreviewConfig = Pick<AppConfig, "DATA_DIR" | "CHROMIUM_PATH">;
 
@@ -21,15 +22,8 @@ export interface ProjectPreviewMetadata {
   capturedAt: string;
 }
 
-export type ProjectPreviewCommandRunner = (
-  command: string,
-  args: string[],
-  options?: CommandOptions
-) => Promise<CommandResult>;
-
 interface CaptureDependencies {
-  fetch?: typeof fetch;
-  command?: ProjectPreviewCommandRunner;
+  command?: ProjectRuntimeHelperCommandRunner;
 }
 
 function assertManagedId(id: string, kind: string): void {
@@ -93,7 +87,7 @@ export function projectPreviewState(
   }
   try {
     const stat = fs.statSync(projectPreviewImagePath(config, projectId));
-    if (!stat.isFile() || stat.size < PNG_SIGNATURE.length) {
+    if (!stat.isFile() || stat.size < PNG_SIGNATURE.length || stat.size > MAX_PROJECT_PREVIEW_BYTES) {
       return { status: "pending", deploymentId: activeDeploymentId };
     }
   } catch {
@@ -139,7 +133,13 @@ async function markUnavailable(
 
 export async function captureProjectPreview(
   config: PreviewConfig,
-  input: { projectId: string; deploymentId: string; url: string },
+  input: {
+    projectId: string;
+    deploymentId: string;
+    url: string;
+    networkName: string;
+    helperImage: string;
+  },
   dependencies: CaptureDependencies = {}
 ): Promise<ProjectPreviewMetadata> {
   assertManagedId(input.projectId, "Projekt");
@@ -148,56 +148,41 @@ export async function captureProjectPreview(
   if (target.protocol !== "http:" || !target.hostname || target.username || target.password) {
     throw new Error("Projektvorschauen dürfen nur interne HTTP-Ziele ohne Zugangsdaten verwenden");
   }
-
-  const fetchPage = dependencies.fetch ?? fetch;
-  const command = dependencies.command ?? runCommand;
-  try {
-    const response = await fetchPage(target, {
-      headers: { accept: "text/html,application/xhtml+xml" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(5_000)
-    });
-    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    await response.body?.cancel();
-    if (!response.ok || !contentType.includes("text/html")) {
-      return markUnavailable(config, input.projectId, input.deploymentId, "not_html");
-    }
-  } catch {
-    return markUnavailable(config, input.projectId, input.deploymentId, "capture_failed");
-  }
-
   const directory = previewDirectory(config);
   await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
   const token = randomUUID();
   const temporaryImage = resolveWithin(directory, `.${input.projectId}.${token}.png`);
-  const userDataDirectory = resolveWithin("/tmp", `shelter-preview-${token}`);
   try {
-    await command(config.CHROMIUM_PATH, [
-      "--headless",
-      "--no-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      "--hide-scrollbars",
-      "--mute-audio",
-      "--disable-extensions",
-      "--disable-background-networking",
-      `--user-data-dir=${userDataDirectory}`,
-      `--window-size=${PREVIEW_WIDTH},${PREVIEW_HEIGHT}`,
-      "--force-device-scale-factor=1",
-      "--virtual-time-budget=4000",
-      `--screenshot=${temporaryImage}`,
-      target.toString()
-    ], {
-      timeoutMs: 30_000,
-      env: { ...process.env, HOME: "/tmp" }
-    });
+    const capture = await captureProjectContainerPreview({
+      projectId: input.projectId,
+      deploymentId: input.deploymentId,
+      networkName: input.networkName,
+      targetContainer: target.hostname,
+      port: target.port ? Number.parseInt(target.port, 10) : 80,
+      path: `${target.pathname}${target.search}`,
+      helperImage: input.helperImage,
+      outputPath: temporaryImage,
+      chromiumPath: config.CHROMIUM_PATH
+    }, dependencies.command);
+    if (capture === "not_html") {
+      return markUnavailable(config, input.projectId, input.deploymentId, "not_html");
+    }
+    if (capture !== "ready") {
+      return markUnavailable(config, input.projectId, input.deploymentId, "capture_failed");
+    }
 
+    const stat = await fs.promises.stat(temporaryImage);
+    if (!stat.isFile() || stat.size > MAX_PROJECT_PREVIEW_BYTES) {
+      throw new Error("Preview-Helper hat keine zulässige Datei erzeugt");
+    }
+    // The helper already verifies size and signature before returning. Repeat
+    // the small signature check across the Docker copy boundary before publish.
     const file = await fs.promises.open(temporaryImage, "r");
     try {
       const signature = Buffer.alloc(PNG_SIGNATURE.length);
       const { bytesRead } = await file.read(signature, 0, signature.length, 0);
       if (bytesRead !== PNG_SIGNATURE.length || !signature.equals(PNG_SIGNATURE)) {
-        throw new Error("Chromium hat keine gültige PNG-Vorschau erzeugt");
+        throw new Error("Preview-Helper hat keine gültige PNG-Vorschau erzeugt");
       }
     } finally {
       await file.close();
@@ -216,7 +201,6 @@ export async function captureProjectPreview(
     return markUnavailable(config, input.projectId, input.deploymentId, "capture_failed");
   } finally {
     await fs.promises.rm(temporaryImage, { force: true });
-    await fs.promises.rm(userDataDirectory, { recursive: true, force: true });
   }
 }
 

@@ -9,10 +9,13 @@ import { resolveWithin } from "../lib/security.js";
 import type { DeploymentRow, ProjectRow } from "../types/models.js";
 import type { CloudflareService } from "./cloudflare.js";
 import { removeProjectPreview } from "./project-preview.js";
+import { removeProjectNetwork } from "./project-network.js";
 import { reconcileRouting } from "./routing.js";
 import {
   deploymentContainerNames,
+  isManagedImage,
   isManagedVersionedRuntimeName,
+  managedProjectIdForContainer,
   MANAGED_LABEL_NAMESPACES
 } from "./runtime-identity.js";
 
@@ -125,6 +128,7 @@ export class ProjectDeletionWorker {
     await this.removeProjectImages(deployments);
     await this.removeWorkspaces(deployments);
     await removeProjectPreview(this.config, projectId);
+    await removeProjectNetwork(projectId, this.command);
 
     // The project is excluded from listProjects while a deletion row exists.
     // Reconcile once more before the project row and its metadata are removed.
@@ -139,7 +143,7 @@ export class ProjectDeletionWorker {
   }
 
   private async removeProjectContainers(project: ProjectRow, deployments: DeploymentRow[]): Promise<void> {
-    const containerIds = new Set<string>();
+    const containerCandidates = new Set<string>();
     const runtimeNames = new Set<string>();
     for (const namespace of MANAGED_LABEL_NAMESPACES) {
       const result = await this.command("docker", [
@@ -147,7 +151,13 @@ export class ProjectDeletionWorker {
         "--filter", `label=${namespace}.managed=true`,
         "--filter", `label=${namespace}.project=${project.id}`
       ]);
-      for (const id of parseDockerIds(result.stdout, "Container")) containerIds.add(id);
+      for (const id of parseDockerIds(result.stdout, "Container")) containerCandidates.add(id);
+    }
+    const containerIds = new Set<string>();
+    for (const id of containerCandidates) {
+      const identity = await this.inspectContainerIdentity(id);
+      if (managedProjectIdForContainer(identity.labels, identity.name, identity.image) !== project.id) continue;
+      containerIds.add(id);
     }
     for (const deployment of deployments) {
       if (!deployment.runtime_container) continue;
@@ -156,12 +166,12 @@ export class ProjectDeletionWorker {
       }
     }
     for (const id of containerIds) {
-      await this.command("docker", ["rm", "-f", id]);
+      await this.command("docker", ["rm", "-f", "-v", id]);
     }
     // A labelled lookup normally removed these already. The persisted name is
     // a recovery fallback for a Docker daemon whose label index is incomplete.
     for (const name of runtimeNames) {
-      await this.command("docker", ["rm", "-f", name], { allowFailure: true });
+      await this.command("docker", ["rm", "-f", "-v", name], { allowFailure: true });
     }
   }
 
@@ -169,16 +179,53 @@ export class ProjectDeletionWorker {
     const imageIds = new Set<string>();
     for (const deployment of deployments) {
       assertManagedId(deployment.id, "Deployment");
-      for (const namespace of MANAGED_LABEL_NAMESPACES) {
-        const result = await this.command("docker", [
-          "image", "ls", "-q",
-          "--filter", `label=${namespace}.managed=true`,
-          "--filter", `label=${namespace}.deployment=${deployment.id}`
-        ]);
-        for (const id of parseDockerIds(result.stdout, "Image")) imageIds.add(id);
+      if (!deployment.image_tag || !isManagedImage(deployment.image_tag)) continue;
+      const result = await this.command("docker", [
+        "image", "inspect", "--format", "{{.Id}}", deployment.image_tag
+      ], { allowFailure: true });
+      if (result.exitCode !== 0) {
+        const detail = `${result.stderr}\n${result.stdout}`.trim();
+        if (/\bno such image\b/i.test(detail)) continue;
+        throw new Error(
+          `Image ${deployment.image_tag} konnte vor dem Löschen nicht verifiziert werden: ${detail || `Exit ${result.exitCode}`}`
+        );
       }
+      for (const id of parseDockerIds(result.stdout, "Image")) imageIds.add(id);
     }
     for (const id of imageIds) await this.command("docker", ["image", "rm", id]);
+  }
+
+  private async inspectContainerIdentity(id: string): Promise<{
+    name: string;
+    image: string;
+    labels: Record<string, unknown>;
+  }> {
+    const result = await this.command("docker", [
+      "inspect", "--type", "container", "--format",
+      '{"name":{{json .Name}},"image":{{json .Config.Image}},"labels":{{json .Config.Labels}}}', id
+    ], { allowFailure: true });
+    if (result.exitCode !== 0) {
+      throw new Error(`Container ${id} konnte vor dem Löschen nicht verifiziert werden: ${result.stderr || `Exit ${result.exitCode}`}`);
+    }
+    try {
+      const parsed: unknown = JSON.parse(result.stdout);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid identity");
+      const identity = parsed as Record<string, unknown>;
+      if (
+        typeof identity.name !== "string"
+        || typeof identity.image !== "string"
+        || !identity.labels
+        || typeof identity.labels !== "object"
+        || Array.isArray(identity.labels)
+      ) throw new Error("incomplete identity");
+      return {
+        name: identity.name,
+        image: identity.image,
+        labels: identity.labels as Record<string, unknown>
+      };
+    } catch {
+      throw new Error(`Container ${id} hat eine ungültige Docker-Identität`);
+    }
   }
 
   private async removeWorkspaces(deployments: DeploymentRow[]): Promise<void> {

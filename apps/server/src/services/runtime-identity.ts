@@ -9,6 +9,38 @@ const VERSIONED_RUNTIME_PREFIX = `${DOCKER_NAMESPACE}-run-`;
 export const MANAGED_LABEL_NAMESPACES = [DOCKER_NAMESPACE, LEGACY_DOCKER_NAMESPACE] as const;
 export const COMPOSE_PROJECT_NAMES = [DOCKER_NAMESPACE, LEGACY_DOCKER_NAMESPACE] as const;
 
+type DockerLabels = Record<string, unknown>;
+
+function projectLabelForNamespace(labels: DockerLabels, namespace: string): string | null {
+  if (labels[`${namespace}.managed`] !== "true") return null;
+  const projectId = labels[`${namespace}.project`];
+  if (typeof projectId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(projectId)) {
+    throw new Error(`${namespace}-project-Label ist nicht sicher verwaltet`);
+  }
+  return projectId;
+}
+
+/**
+ * Dockerfile labels are untrusted. Container names and image tags are selected
+ * by the Shelter/Portsmith worker, so they decide which label namespace is
+ * authoritative while migrating an older installation.
+ */
+export function managedProjectIdForContainer(
+  labels: DockerLabels,
+  containerName: string,
+  image: string
+): string | null {
+  const name = containerName.replace(/^\//, "");
+  if (!isManagedImage(image)) return null;
+  if (name.startsWith(`${DOCKER_NAMESPACE}-`)) {
+    return projectLabelForNamespace(labels, DOCKER_NAMESPACE);
+  }
+  if (name.startsWith(`${LEGACY_DOCKER_NAMESPACE}-`)) {
+    return projectLabelForNamespace(labels, LEGACY_DOCKER_NAMESPACE);
+  }
+  return null;
+}
+
 export function imageTag(projectSlug: string, deploymentId: string): string {
   return `${DOCKER_NAMESPACE}/${projectSlug}:${deploymentId.replace(/^dep_/, "").slice(0, 16)}`;
 }

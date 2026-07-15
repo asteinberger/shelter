@@ -11,7 +11,7 @@ import type { DeploymentRow, ProjectRow } from "../types/models.js";
 import { requireScopedAuth, requireScopedMutation, requireSessionMutationAuth } from "../services/auth.js";
 import type { CloudflareService } from "../services/cloudflare.js";
 import { ProjectDeletionService } from "../services/project-deletion.js";
-import { projectPreviewImagePath, projectPreviewState } from "../services/project-preview.js";
+import { MAX_PROJECT_PREVIEW_BYTES, projectPreviewImagePath, projectPreviewState } from "../services/project-preview.js";
 import { panelHostnames } from "../services/panel-domains.js";
 import { reconcileRouting } from "../services/routing.js";
 import type { UploadService } from "../services/uploads.js";
@@ -347,7 +347,9 @@ export function registerProjectRoutes(
   database.recoverPendingDomains();
   const projectDeletion = new ProjectDeletionService(config, database, cloudflare);
 
-  app.get("/api/overview", { preHandler: requireScopedAuth("projects:read") }, async () => {
+  app.get("/api/overview", { preHandler: requireScopedAuth("projects:read") }, async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    const cloudflareState = cloudflare.state();
     const projects = database.listProjects();
     const deletions = new Map(projects.map((project) => [project.id, database.getProjectDeletion(project.id)]));
     const deployments = projects.flatMap((project) => database.listDeployments(project.id, 10));
@@ -382,7 +384,11 @@ export function registerProjectRoutes(
           ...presentDeployment(deployment),
           projectName: projects.find((project) => project.id === deployment.project_id)?.name ?? "Unbekanntes Projekt"
         })),
-      system: { workerOnline, tunnelConfigured: cloudflare.state().configured }
+      system: {
+        workerOnline,
+        tunnelConfigured: cloudflareState.configured,
+        accessProtection: cloudflareState.accessProtection
+      }
     };
   });
 
@@ -442,7 +448,7 @@ export function registerProjectRoutes(
     const imagePath = projectPreviewImagePath(config, project.id);
     try {
       const stat = await fs.promises.stat(imagePath);
-      if (!stat.isFile()) throw new Error("not a file");
+      if (!stat.isFile() || stat.size > MAX_PROJECT_PREVIEW_BYTES) throw new Error("not a bounded preview file");
       reply.type("image/png");
       reply.header("cache-control", "private, max-age=300");
       reply.header("last-modified", stat.mtime.toUTCString());
