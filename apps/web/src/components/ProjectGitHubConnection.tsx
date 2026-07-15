@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { AlertTriangle, ArrowRight, ExternalLink, Github, Save, Unplug } from 'lucide-react';
+import { AlertTriangle, ArrowRight, ExternalLink, Save, Unplug } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -30,6 +30,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
 import { useI18n } from '@/i18n';
+import { GitHubIcon } from './GitHubIcon';
 
 function repositoryKey(repository: Pick<GitHubRepository, 'installationId' | 'id'>) {
   return `${repository.installationId}:${repository.id}`;
@@ -226,7 +227,7 @@ export function ProjectGitHubConnection({
     <Card aria-labelledby="project-github-title">
       <CardHeader className="gap-4 border-b sm:grid-cols-[1fr_auto]">
         <div>
-          <CardTitle id="project-github-title" className="flex items-center gap-2"><Github className="size-5" aria-hidden="true" /> GitHub auto-deploy</CardTitle>
+          <CardTitle id="project-github-title" className="flex items-center gap-2"><GitHubIcon className="size-5" aria-hidden="true" /> GitHub auto-deploy</CardTitle>
           <CardDescription className="mt-1">{t('Repository access, watched branch, and automatic deployments.', 'Repository-Zugriff, beobachteter Branch und automatische Deployments.')}</CardDescription>
         </div>
         <StatusBadge status={connection ? project.githubConnectionError ? 'error' : 'connected' : 'offline'} />
@@ -244,7 +245,7 @@ export function ProjectGitHubConnection({
           <p className="text-sm text-muted-foreground" role="status">{t('Loading GitHub connection …', 'GitHub-Verbindung wird geladen …')}</p>
         ) : githubSettings.isError || !githubSettings.data?.connected ? (
           <Alert variant={githubSettings.isError ? 'destructive' : 'default'}>
-            <Github aria-hidden="true" />
+            <GitHubIcon aria-hidden="true" />
             <AlertTitle>{githubSettings.isError ? t('GitHub is unavailable', 'GitHub ist nicht erreichbar') : t('GitHub App not connected', 'GitHub App nicht verbunden')}</AlertTitle>
             <AlertDescription className="grid gap-3">
               <p>{githubSettings.isError
@@ -257,7 +258,7 @@ export function ProjectGitHubConnection({
           <>
             {connection ? (
               <div className="flex min-w-0 items-center gap-3 rounded-lg border bg-muted/20 p-4">
-                <span className="grid size-9 shrink-0 place-items-center rounded-md border bg-background"><Github className="size-4" aria-hidden="true" /></span>
+                <span className="grid size-9 shrink-0 place-items-center rounded-md border bg-background"><GitHubIcon className="size-4" aria-hidden="true" /></span>
                 <div className="min-w-0 flex-1">
                   {repositoryUrl ? (
                     <a href={repositoryUrl} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-center gap-1.5 text-sm font-medium hover:underline hover:underline-offset-4">
@@ -276,7 +277,7 @@ export function ProjectGitHubConnection({
               <div className="grid gap-4 sm:grid-cols-2">
                 {(repositories.data?.length ?? 0) === 0 && (
                   <Alert className="sm:col-span-2">
-                    <Github aria-hidden="true" />
+                    <GitHubIcon aria-hidden="true" />
                     <AlertTitle>{t('No repositories shared', 'Keine Repositories freigegeben')}</AlertTitle>
                     <AlertDescription className="grid gap-3">
                       <p>{t('Add this repository to the existing GitHub installation.', 'Erweitere die bestehende GitHub-Installation um dieses Repository.')}</p>
