@@ -48,8 +48,8 @@ Docker builds of deployed projects safe for hostile tenants; see
    ```sh
    git switch main
    git pull --ff-only
-   git tag -a v0.2.0 -m "Shelter v0.2.0"
-   git push origin v0.2.0
+   git tag -a v0.2.1 -m "Shelter v0.2.1"
+   git push origin v0.2.1
    ```
 
 Release tags are deliberately one-way: the repository ruleset permits creation
@@ -79,21 +79,21 @@ Run the helper from a trusted Shelter checkout:
 gh auth login
 ./ops/download-release.sh \
   --repo asteinberger/shelter \
-  --tag v0.2.0 \
-  --destination ../shelter-v0.2.0
+  --tag v0.2.1 \
+  --destination ../shelter-v0.2.1
 ```
 
 Inspect the immutable plan without contacting Docker or changing the current
 installation:
 
 ```sh
-../shelter-v0.2.0/ops/install-release-bundle.sh --dry-run
+../shelter-v0.2.1/ops/install-release-bundle.sh --dry-run
 ```
 
 For a new interactive installation:
 
 ```sh
-cd ../shelter-v0.2.0
+cd ../shelter-v0.2.1
 ./ops/install-release-bundle.sh
 ```
 
@@ -134,8 +134,8 @@ a fail-closed marker; rerun the same release command before using `install`,
 The release and any downloaded asset can be verified again with GitHub CLI:
 
 ```sh
-gh release verify v0.2.0 --repo asteinberger/shelter
-gh release verify-asset v0.2.0 shelter-v0.2.0.tar.gz \
+gh release verify v0.2.1 --repo asteinberger/shelter
+gh release verify-asset v0.2.1 shelter-v0.2.1.tar.gz \
   --repo asteinberger/shelter
 ```
 
@@ -147,7 +147,7 @@ gh attestation verify \
   oci://ghcr.io/asteinberger/shelter@sha256:RELEASE_DIGEST \
   --repo asteinberger/shelter \
   --signer-workflow asteinberger/shelter/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.2.0 \
+  --source-ref refs/tags/v0.2.1 \
   --bundle-from-oci
 ```
 

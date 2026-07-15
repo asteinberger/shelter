@@ -454,9 +454,27 @@ jobs:
             jq -e '.spdxVersion == "SPDX-2.3" and (.SPDXID | type == "string")' "$sbom" >/dev/null
           done
 
+      # actions/attest currently resolves registry credentials exclusively from
+      # $HOME/.docker/config.json, while this job deliberately isolates Docker
+      # in DOCKER_CONFIG. Give the three attestation steps a dedicated HOME so
+      # the runner's real home directory remains untouched.
+      - name: Stage GHCR credentials for attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_config="${DOCKER_CONFIG}/config.json"
+          target_directory="${RUNNER_TEMP}/shelter-attest-home/.docker"
+          test -s "$source_config"
+          jq -e '.auths | has("ghcr.io") or has("https://ghcr.io")' "$source_config" >/dev/null
+          install -d -m 0700 "$target_directory"
+          install -m 0600 "$source_config" "${target_directory}/config.json"
+
       - name: Attest image provenance
         id: provenance
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        env:
+          HOME: ${{ runner.temp }}/shelter-attest-home
         with:
           subject-name: ${{ steps.metadata.outputs.image_name }}
           subject-digest: ${{ steps.image.outputs.digest }}
@@ -467,6 +485,8 @@ jobs:
       - name: Attest linux/amd64 SBOM
         id: sbom_attestation_amd64
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        env:
+          HOME: ${{ runner.temp }}/shelter-attest-home
         with:
           subject-name: ${{ steps.metadata.outputs.image_name }}
           subject-digest: ${{ steps.image.outputs.amd64_digest }}
@@ -478,6 +498,8 @@ jobs:
       - name: Attest linux/arm64 SBOM
         id: sbom_attestation_arm64
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        env:
+          HOME: ${{ runner.temp }}/shelter-attest-home
         with:
           subject-name: ${{ steps.metadata.outputs.image_name }}
           subject-digest: ${{ steps.image.outputs.arm64_digest }}
@@ -485,6 +507,14 @@ jobs:
           sbom-path: ${{ steps.assets.outputs.directory }}/shelter-${{ steps.metadata.outputs.version }}-linux-arm64.spdx.json
           push-to-registry: true
           create-storage-record: false
+
+      - name: Remove staged attestation credentials
+        if: always()
+        shell: bash
+        run: |
+          credential_home="${RUNNER_TEMP}/shelter-attest-home"
+          rm -f "${credential_home}/.docker/config.json"
+          rmdir "${credential_home}/.docker" "$credential_home" 2>/dev/null || true
 
       - name: Verify signed image attestations
         shell: bash
