@@ -195,13 +195,16 @@ Clients should use the machine-readable `code`, apply bounded retries only to tr
 
 ## Shelter CLI
 
-The CLI wraps these API workflows and is included in this repository as `@shelter/cli`:
+The standalone [Shelter CLI](https://github.com/asteinberger/shelter-cli) wraps these API workflows:
 
 ```sh
-npm run build --workspace @shelter/cli
-npm install --global ./apps/cli
+git clone https://github.com/asteinberger/shelter-cli.git
+cd shelter-cli
+npm ci
+npm run build
+npm install --global .
 shelter login --server https://panel.example.com
 shelter projects
 ```
 
-See the [CLI reference](../apps/cli/README.md) for all commands, JSON output, CI environment variables, and credential-storage details.
+See the [CLI repository](https://github.com/asteinberger/shelter-cli) for all commands, JSON output, CI environment variables, and credential-storage details.

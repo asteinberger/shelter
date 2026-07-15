@@ -80,16 +80,19 @@ Open `http://127.0.0.1:7080`. Connect Cloudflare from Settings before publishing
 
 ## API and CLI
 
-Create a scoped token under **Settings → API & CLI**, then connect the bundled command-line client without placing the secret in shell history:
+Create a scoped token under **Settings → API & CLI**, then install the standalone [Shelter CLI](https://github.com/asteinberger/shelter-cli) without placing the secret in shell history:
 
 ```sh
-npm run build --workspace @shelter/cli
-npm install --global ./apps/cli
+git clone https://github.com/asteinberger/shelter-cli.git
+cd shelter-cli
+npm ci
+npm run build
+npm install --global .
 shelter login --server https://panel.example.com
 shelter projects
 ```
 
-Each installation publishes its OpenAPI document at `/api/openapi.json`. See the [API guide](docs/API.md) and [CLI reference](apps/cli/README.md) for authentication, scopes, commands, uploads, JSON output, and CI usage.
+Each installation publishes its OpenAPI document at `/api/openapi.json`. See the [API guide](docs/API.md) and [CLI repository](https://github.com/asteinberger/shelter-cli) for authentication, scopes, commands, uploads, JSON output, and CI usage.
 
 ## Architecture
 
@@ -513,7 +516,7 @@ npm run dev
 npm run check
 ```
 
-`npm run check` runs strict type checking, all server, web, and CLI tests, and all three production builds. Local automated tests use temporary data and do not modify real Cloudflare, GitHub, or Docker resources.
+`npm run check` runs strict type checking, all server and web tests, and both production builds. The standalone CLI has its own `npm run check` workflow. Local automated tests use temporary data and do not modify real Cloudflare, GitHub, or Docker resources.
 
 A real end-to-end smoke test requires a disposable VPS, an active Cloudflare zone and free test hostnames, a private Cloudflare OAuth client or scoped API token, a test repository or ZIP, and explicit permission to modify those resources.
 

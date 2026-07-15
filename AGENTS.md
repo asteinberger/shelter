@@ -12,7 +12,6 @@ Shelter is a self-hosted deployment control plane for a single VPS. Changes shou
 | --- | --- |
 | `apps/web` | React/Vite panel with a shadcn-oriented UI and light and dark themes |
 | `apps/server` | Fastify API, SQLite, Cloudflare/GitHub integration, and deployment worker |
-| `apps/cli` | Dependency-free Node.js command-line client for the Shelter API |
 | `apps/server/test` | Server, integration, and regression tests |
 | `docs/API.md` | Public API authentication, workflows, and CLI entry point |
 | `compose.yaml`, `Dockerfile`, `install.sh` | VPS installation and runtime |
@@ -70,7 +69,6 @@ For a focused run:
 ```sh
 npm run test -w @shelter/server -- <test-file>
 npm run test -w @shelter/web -- <test-file>
-npm run test -w @shelter/cli -- <test-file>
 ```
 
 ## Operational and deployment changes
