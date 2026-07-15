@@ -9,7 +9,6 @@ import {
   Cloud,
   Copy,
   ExternalLink,
-  Github,
   GitPullRequest,
   KeyRound,
   LockKeyhole,
@@ -41,6 +40,7 @@ import {
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { NavigationGuard } from '../components/NavigationGuard';
+import { GitHubIcon } from '../components/GitHubIcon';
 import { CloudflareAccessProtectionCard } from '../components/CloudflareAccessProtectionCard';
 import { trustedGitHubAppUrl, trustedGitHubManifestRegistrationUrl } from '../utils/github';
 import { currentLocale, localize, useI18n } from '@/i18n';
@@ -741,7 +741,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                         loading={registerGitHub.isPending}
                         className="w-full sm:w-auto"
                       >
-                        {!registerGitHub.isPending && <Github aria-hidden="true" />}
+                        {!registerGitHub.isPending && <GitHubIcon aria-hidden="true" />}
                         {registerGitHub.isPending ? t('Opening GitHub …', 'GitHub wird geöffnet …') : t('Register GitHub App', 'GitHub App registrieren')}
                         {!registerGitHub.isPending && <ArrowRight aria-hidden="true" />}
                       </Button>
@@ -768,7 +768,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                   <CardHeader className="gap-4 border-b sm:grid-cols-[1fr_auto]">
                     <div className="min-w-0">
                       <CardTitle id="github-app-title" className="flex items-center gap-2 text-lg">
-                        <Github className="size-5" aria-hidden="true" />
+                        <GitHubIcon className="size-5" aria-hidden="true" />
                         <span className="truncate">{github.appName ?? 'Shelter GitHub App'}</span>
                       </CardTitle>
                       <CardDescription className="mt-1">{t('Dedicated GitHub App for this Shelter server', 'Eigene GitHub App für diesen Shelter-Server')}</CardDescription>
@@ -824,7 +824,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                           const accountType = rawAccountType === 'Organization' ? t('Organization', 'Organisation') : rawAccountType === 'User' ? t('Personal account', 'Persönlicher Account') : rawAccountType;
                           return (
                             <li key={String(installation.id)} className="flex min-w-0 items-center gap-3 px-3 py-3.5">
-                              <span className="grid size-9 shrink-0 place-items-center rounded-md border bg-muted/30"><Github className="size-4" aria-hidden="true" /></span>
+                              <span className="grid size-9 shrink-0 place-items-center rounded-md border bg-muted/30"><GitHubIcon className="size-4" aria-hidden="true" /></span>
                               <div className="min-w-0 flex-1">
                                 <strong className="block truncate text-sm font-medium">{login}</strong>
                                 <span className="mt-0.5 block truncate text-xs text-muted-foreground">
@@ -839,7 +839,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                     ) : (
                       <div className="grid min-h-40 place-items-center rounded-lg border border-dashed bg-muted/15 p-6 text-center">
                         <div>
-                          <Github className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
+                          <GitHubIcon className="mx-auto size-6 text-muted-foreground" aria-hidden="true" />
                           <strong className="mt-3 block text-sm">{t('No installation yet', 'Noch keine Installation')}</strong>
                           <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('Install the app in your account or an organization.', 'Installiere die App in deinem Account oder einer Organisation.')}</p>
                           {githubInstallUrl && <Button asChild size="sm" className="mt-4"><a href={githubInstallUrl}>{t('Install now', 'Jetzt installieren')} <ArrowRight /></a></Button>}

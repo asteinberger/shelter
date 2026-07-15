@@ -7,7 +7,6 @@ import {
   FileArchive,
   Files,
   FolderOpen,
-  Github,
   LoaderCircle,
   GitBranch,
   PackageOpen,
@@ -22,6 +21,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { api } from '../api/client';
 import { NavigationGuard } from '../components/NavigationGuard';
+import { GitHubIcon } from '../components/GitHubIcon';
 import { ProjectAnalysisCard, type ProjectAnalysisStatus } from '../components/ProjectAnalysisCard';
 import { StaticBasePathControl } from '../components/StaticBasePathControl';
 import { Button, Field, PageIntro, SelectField } from '../components/ui';
@@ -968,7 +968,7 @@ export function NewProjectPage() {
                       }}
                       disabled={createProject.isPending}
                     >
-                      <Github aria-hidden="true" /> GitHub
+                      <GitHubIcon aria-hidden="true" /> GitHub
                     </Button>
                     <Button
                       type="button"
@@ -992,7 +992,7 @@ export function NewProjectPage() {
                       </div>
                     ) : githubSettings.isError || !githubSettings.data?.connected ? (
                       <Alert variant={githubSettings.isError ? 'destructive' : 'default'}>
-                        <Github aria-hidden="true" />
+                        <GitHubIcon aria-hidden="true" />
                         <AlertTitle>{githubSettings.isError ? t('GitHub is currently unavailable', 'GitHub ist gerade nicht erreichbar') : t('Connect GitHub first', 'GitHub zuerst verbinden')}</AlertTitle>
                         <AlertDescription className="grid gap-3">
                           <p>{githubSettings.isError
@@ -1022,7 +1022,7 @@ export function NewProjectPage() {
                       <div className="overflow-hidden rounded-xl border bg-card text-card-foreground">
                         <div className="flex items-center justify-between gap-3 border-b px-4 py-4 sm:px-5">
                           <div className="flex min-w-0 items-center gap-3">
-                            <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/30"><Github className="size-4" aria-hidden="true" /></span>
+                            <span className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/30"><GitHubIcon className="size-4" aria-hidden="true" /></span>
                             <div className="min-w-0">
                               <strong className="block text-sm font-medium">{t('Select repository', 'Repository auswählen')}</strong>
                               <span className="mt-0.5 block text-xs text-muted-foreground">{t('{count} available', '{count} verfügbar', { count: githubRepositories.data?.length ?? 0 })}</span>
@@ -1033,7 +1033,7 @@ export function NewProjectPage() {
                         <div className="grid gap-5 p-4 sm:p-5">
                           {(githubRepositories.data?.length ?? 0) === 0 && (
                             <Alert>
-                              <Github aria-hidden="true" />
+                              <GitHubIcon aria-hidden="true" />
                               <AlertTitle>{t('No repositories shared', 'Keine Repositories freigegeben')}</AlertTitle>
                               <AlertDescription className="grid gap-3">
                                 <p>{t('Open the GitHub installation and grant Shelter access to at least one repository.', 'Öffne die GitHub-Installation und gib mindestens ein Repository für Shelter frei.')}</p>
@@ -1136,7 +1136,7 @@ export function NewProjectPage() {
 
                           {selectedRepository && (
                             <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                              <Github className="size-3.5 shrink-0" aria-hidden="true" />
+                              <GitHubIcon className="size-3.5 shrink-0" aria-hidden="true" />
                               <span className="truncate">{selectedRepository.fullName}</span>
                               {selectedRepository.private && <Badge variant="secondary" className="shrink-0">{t('Private', 'Privat')}</Badge>}
                             </div>
