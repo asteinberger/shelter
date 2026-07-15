@@ -80,6 +80,16 @@ Shelter does not protect against:
 - Traefik uses the file provider and has no Docker socket.
 - `cloudflared` creates an outbound public connection; Traefik and applications publish no host ports.
 
+### Installer and update path
+
+- `install.sh` operates from the checked-out Shelter directory and changes Docker state with the operator's privileges. Run it only from a revision you have verified; access to the Docker daemon is root-equivalent.
+- The installer validates Linux, Docker daemon access, Compose v2, Buildx, required host tools, capacity, `.env`, and Compose configuration before replacing the control plane, and reports a missing or non-standard Docker socket. `./install.sh doctor` performs the same host and configuration checks without starting, stopping, or rebuilding containers.
+- One owner-token operation lock serializes manual installs, remote source synchronization, and deploy-triggered installs. New `.env` files and bootstrap-value changes use a restricted temporary file followed by an atomic rename, and `.env` is kept at mode `0600`. Symlinked, structurally invalid, duplicate-key, or placeholder-secret configurations are rejected.
+- Initial passwords are accepted only from an interactive terminal or standard input. The installer has no password command-line option or password environment variable. Non-interactive automation should redirect a protected, single-line secret file to `--password-stdin` and remove that file after secure handoff.
+- The installer fails closed when the default data volume exists without its matching `.env`, or when a configured data volume is unexpectedly empty. `--bootstrap-empty-volume` is an explicit recovery override for a volume that the operator has independently verified is intentionally empty; it is not a way to bypass suspected data loss.
+- Before updating a ready database, the installer briefly pauses API and worker, builds a temporary SQLite snapshot, runs `quick_check`, flushes it, and atomically renames it to `shelter-before-update.sqlite` inside the data volume. This single snapshot is replaced by the next update and covers only SQLite; it is not a complete backup or an automatic rollback mechanism.
+- Compact interactive installer output is backed by `.shelter-install.log` after a failed run. Non-interactive and verbose output is streamed instead. The file has restrictive permissions and is removed after success, but its Docker output and host details must still be treated as operationally sensitive and redacted before sharing.
+
 ### Authentication and requests
 
 - Passwords are hashed with scrypt and a random salt.
@@ -150,7 +160,7 @@ Prefer an SSH key or short-lived agent key to a stored root password. With the p
 
 ### `.env` and `APP_SECRET`
 
-The installer creates `.env` with mode `0600`. During first boot it briefly contains the bootstrap administrator password as a Base64 transport value (`ADMIN_PASSWORD_B64`, explicitly not encryption). After creating the user, the installer removes the value atomically and recreates the API without it. `APP_SECRET` remains. OAuth setups also keep client ID, client secret, redirect URI, scopes, and possibly a proxy URL with credentials; fallback setups may include the Cloudflare API token. Only the API loads the OAuth client secret and optional proxy configuration. The worker does not inherit `.env` and receives neither through its explicit allowlist. GitHub App credentials are encrypted in SQLite instead of `.env`.
+The installer creates `.env` atomically with mode `0600`. During first boot it briefly contains the bootstrap administrator password as a Base64 transport value (`ADMIN_PASSWORD_B64`, explicitly not encryption). After creating the user, the installer removes the value atomically and recreates the API without it. If bootstrap fails before that point, the value may remain so the same installation can resume; keep `.env` protected and rerun the installer instead of copying, printing, or manually editing the bootstrap fields. `APP_SECRET` remains. OAuth setups also keep client ID, client secret, redirect URI, scopes, and possibly a proxy URL with credentials; fallback setups may include the Cloudflare API token. Only the API loads the OAuth client secret and optional proxy configuration. The worker does not inherit `.env` and receives neither through its explicit allowlist. GitHub App credentials are encrypted in SQLite instead of `.env`.
 
 A credentialed proxy is part of the secret and trust boundary. With an `http://` proxy URL, proxy authentication is not TLS-protected before reaching the proxy; use it only for a local or otherwise isolated trusted proxy. Remote credentialed proxies require HTTPS.
 
@@ -190,12 +200,14 @@ A complete backup of `.env`, `shelter-data`, `shelter-routing`, and `shelter-tun
 
 - Use a dedicated Ubuntu 24.04 or 26.04 LTS VPS and Docker daemon for Shelter. Builder-cache cleanup is daemon-wide.
 - Install host, kernel, Docker Engine, and Compose security updates promptly.
+- Verify the Shelter revision before running the installer, run `./install.sh doctor` before and after an update, and retain the previous commit identifier until the new control plane is healthy.
+- Do not use `--no-pull` for routine updates. It deliberately reuses local runtime and base images and can therefore miss upstream security fixes.
 - Use SSH keys only and disable root login and password authentication where possible.
 - Allow inbound SSH only. Shelter does not require public ports 80, 443, or 7080.
 - Allow outbound TCP and UDP 7844 for `cloudflared`, plus required HTTPS, DNS, Git, registry, and package destinations.
 - Restrict Docker access to the smallest possible operator group; membership in `docker` is root-equivalent.
 - Prefer a private self-managed Cloudflare OAuth client with Account Read, Cloudflare Tunnel Write, Zone Read, and DNS Write. Restrict the API-token fallback to the same account and required zones.
-- Register a stable HTTPS callback URL. Use a loopback URL only briefly for bootstrap over a controlled SSH tunnel, then update the client and `.env` together.
+- Register a stable HTTPS callback URL. Use an HTTP loopback callback only briefly through a controlled SSH forward, never over an exposed network, then update the Cloudflare client and `.env` together to the exact final HTTPS callback.
 - Manually configure Cloudflare Access with a restrictive identity or device policy for the panel domain.
 - Deploy trusted sources only and review pull requests and dependency changes before building.
 - Use minimal custom Dockerfiles for complex applications and remove unnecessary packages.

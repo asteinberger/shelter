@@ -55,28 +55,25 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 
 ## Quick start
 
-### Requirements
-
 - Ubuntu Server 24.04 or 26.04 LTS
 - Docker Engine with Buildx and Docker Compose v2
 - `openssl`
-- a Cloudflare account with at least one active zone
 - recommended: 2 vCPU, 4 GB RAM, and 40 GB SSD
 
 ```sh
-git clone https://github.com/YOUR-ACCOUNT/shelter.git
+git clone https://github.com/asteinberger/shelter.git
 cd shelter
-chmod +x install.sh
+./install.sh doctor
 ./install.sh
 ```
 
-The installer creates local runtime configuration, securely asks for the initial administrator email and password, builds the stack, and waits for a healthy API. For the first sign-in, open an SSH tunnel:
+The installer checks the VPS, asks for the initial administrator and local panel port, builds Shelter, and verifies the complete control plane. From your computer, open the SSH tunnel printed at the end:
 
 ```sh
 ssh -N -L 7080:127.0.0.1:7080 USER@YOUR-VPS
 ```
 
-Open `http://127.0.0.1:7080`. Connect Cloudflare from Settings before publishing the panel or projects.
+Open `http://127.0.0.1:7080`, sign in, and then [connect Cloudflare](#connect-cloudflare) to publish the panel and projects. A Cloudflare account and active zone are needed for publishing, not for the local installation.
 
 ## API and CLI
 
@@ -133,29 +130,78 @@ The worker samples host capacity and managed-container aggregates every 15 secon
 
 ## Installation
 
-Run from the Shelter directory on the VPS:
+Run the installer from a trusted Shelter checkout on the VPS:
 
 ```sh
-chmod +x install.sh
 ./install.sh
 ```
 
-The installer:
+For a fresh installation it:
 
-1. checks Docker, Docker Compose v2, and OpenSSL,
-2. creates `.env`, the administrator identity, and a random `APP_SECRET`,
-3. pulls Traefik and `cloudflared` and builds API and worker images,
-4. asks for an initial password of at least 16 characters,
-5. waits for a healthy API, removes the bootstrap password atomically, recreates the API without it, and starts the complete stack.
+1. checks Linux, Docker, Compose v2, Buildx, required host tools, architecture, and available disk space,
+2. asks for the administrator email, loopback panel port, and a confirmed password of at least 16 characters,
+3. shows the installation plan before changing the system,
+4. creates `.env` atomically with mode `0600` and a random `APP_SECRET`,
+5. pulls the pinned runtime images, builds the control plane, and inspects persistent data before bootstrap,
+6. creates the administrator with a one-time bootstrap credential, removes that value atomically, and restarts the API without it,
+7. verifies the API, worker, and Traefik. Cloudflare may remain `not configured yet` until the next setup step.
 
-An existing `.env` is reused. The file is always restricted to mode `0600`, and an interrupted installation can be safely run again.
+The panel stays bound to `127.0.0.1`; the installer does not open a public host port. Run `./install.sh --help` for the complete command reference.
+
+### Check the server with `doctor`
+
+Run the doctor before installing, after an update, or when the panel is unavailable:
 
 ```sh
-docker compose ps
-curl --fail http://127.0.0.1:7080/api/healthz
+./install.sh doctor
 ```
 
-The health response also reports whether the deployment worker is online.
+It checks the host prerequisites and Docker daemon. When `.env` exists, it also validates required values and Compose configuration, reports Docker-socket and service state, and makes no configuration or container changes.
+
+Use plain output in logs or terminals without color:
+
+```sh
+NO_COLOR=1 ./install.sh doctor
+```
+
+### Non-interactive installation
+
+Provisioning systems can supply all fresh-install values explicitly. The password must be a single line of at least 16 characters from a protected file or secret-manager pipe:
+
+```sh
+./install.sh --non-interactive \
+  --email admin@example.com \
+  --panel-port 7080 \
+  --password-stdin \
+  < /run/secrets/shelter-admin-password
+```
+
+`--non-interactive` never prompts and implies `--yes`. Shelter intentionally has no password argument or password environment variable; do not place the password in shell history. Restrict the input file to the operator and delete it after moving the credential into a password manager.
+
+For an existing healthy installation, a non-interactive repair or rebuild needs no identity arguments:
+
+```sh
+./install.sh --non-interactive
+```
+
+If a previous bootstrap is still pending and no bootstrap password remains in `.env`, add `--password-stdin` again. Existing administrator email and panel-port values cannot be changed through installer flags; use the panel for the account and edit the supported `.env` setting deliberately for the port.
+
+### Useful installer options
+
+| Option | Purpose |
+| --- | --- |
+| `doctor` | Run host, configuration, and service checks without rebuilding |
+| `--email EMAIL` | Set the administrator email on a fresh installation |
+| `--panel-port PORT` | Set the loopback panel port on a fresh installation |
+| `--password-stdin` | Read the one-time administrator password from standard input |
+| `--non-interactive` | Disable every prompt and imply `--yes` |
+| `--yes` | Accept the displayed installation plan |
+| `--verbose` | Stream full Docker output instead of compact progress |
+| `--no-color` | Disable ANSI colors; `NO_COLOR` is also supported |
+| `--no-pull` | Reuse known local images; intended for controlled offline recovery only |
+| `--bootstrap-empty-volume` | Bootstrap an intentionally empty configured data volume |
+
+The last option is deliberately explicit. Never use it merely to bypass a missing-data warning; first confirm that the configured volume is supposed to be empty.
 
 ### First sign-in over SSH
 
@@ -163,11 +209,11 @@ The health response also reports whether the deployment worker is online.
 ssh -N -L 7080:127.0.0.1:7080 USER@YOUR-VPS
 ```
 
-Then open `http://127.0.0.1:7080`. If local port 7080 is occupied, use `-L 7081:127.0.0.1:7080` and open port 7081 instead.
+Then open `http://127.0.0.1:7080`. If local port 7080 is occupied, use `-L 7081:127.0.0.1:7080` and open `http://127.0.0.1:7081`. With a custom `PANEL_PORT`, use that value on the right-hand side; the installer prints the exact command.
 
 ## Connect Cloudflare
 
-Shelter supports Cloudflare self-managed OAuth using the Authorization Code flow, refresh tokens, PKCE `S256`, and confidential-client token exchange with `client_secret_basic`. The browser never receives the client secret or access and refresh tokens.
+Cloudflare is the next step after the local panel is healthy; it is not required to finish `./install.sh`. Shelter supports Cloudflare self-managed OAuth using the Authorization Code flow, refresh tokens, PKCE `S256`, and confidential-client token exchange with `client_secret_basic`. The browser never receives the client secret or access and refresh tokens.
 
 ### Create one private OAuth client
 
@@ -177,7 +223,13 @@ Create a private self-managed OAuth client for this Shelter installation in Clou
 - **Grant types:** `authorization_code` and `refresh_token`
 - **Token authentication method:** `client_secret_basic`
 
-Register the exact, stable callback URL, including scheme, host, port, and path, with no trailing slash:
+For the first connection over the SSH tunnel, register the exact browser URL, including scheme, local forwarding port, and path, with no trailing slash:
+
+```text
+http://127.0.0.1:7080/api/settings/cloudflare/oauth/callback
+```
+
+If the left-hand side of the SSH forward uses port 7081, the callback must use 7081 as well. If the final panel hostname is already reachable through a prepared tunnel, use its stable HTTPS callback directly:
 
 ```text
 https://panel.example.com/api/settings/cloudflare/oauth/callback
@@ -188,7 +240,7 @@ Add the credentials to `.env`:
 ```dotenv
 CLOUDFLARE_OAUTH_CLIENT_ID=...
 CLOUDFLARE_OAUTH_CLIENT_SECRET=...
-CLOUDFLARE_OAUTH_REDIRECT_URI=https://panel.example.com/api/settings/cloudflare/oauth/callback
+CLOUDFLARE_OAUTH_REDIRECT_URI=http://127.0.0.1:7080/api/settings/cloudflare/oauth/callback
 CLOUDFLARE_OAUTH_SCOPES=account-settings.read zone.read dns.write argotunnel.write
 ```
 
@@ -207,14 +259,14 @@ docker compose up -d --force-recreate api
 
 ### Finish setup in Shelter
 
-1. Open Shelter from the registered callback origin and sign in.
+1. Keep the SSH tunnel open and sign in from the exact origin registered above.
 2. Go to **Settings → Cloudflare Tunnel** and choose **Connect Cloudflare**.
-3. Review and approve the requested permissions.
-4. Select the intended account if Cloudflare returns more than one.
-5. Enter a dedicated tunnel name such as `shelter-vps` and an unused panel domain such as `panel.example.com`.
-6. Save and run the connection test.
-
-For temporary bootstrap, a loopback callback such as `http://127.0.0.1:7081/api/settings/cloudflare/oauth/callback` may be used with an active SSH forward. Move both Cloudflare and `.env` to a stable HTTPS callback afterward.
+3. Review the requested permissions and select the intended account if Cloudflare returns more than one.
+4. Enter a dedicated tunnel name such as `shelter-vps` and an unused panel hostname such as `panel.example.com`.
+5. Save, run the connection test, and open the new HTTPS panel URL.
+6. Replace the loopback callback in both the Cloudflare OAuth client and `.env` with `https://panel.example.com/api/settings/cloudflare/oauth/callback`.
+7. Recreate the API with `docker compose up -d --force-recreate api`, sign in at the final HTTPS origin, and test **Connect Cloudflare** once more.
+8. Put a restrictive Cloudflare Access policy in front of the panel before treating it as production-ready.
 
 Shelter creates a dedicated remotely managed tunnel with a catch-all origin of `http://traefik:80` and a proxied CNAME to `<tunnel-id>.cfargotunnel.com`. It refuses to take over an unrelated tunnel with the same name or overwrite a conflicting DNS record.
 
@@ -409,22 +461,29 @@ Redeploy every project on a new VPS so application images and stable containers 
 
 ## Update
 
-Create a backup first:
+Fetch the desired Shelter revision, then let the installer handle the control-plane update:
+
+```sh
+./install.sh doctor
+git pull --ff-only
+./install.sh
+./install.sh doctor
+```
+
+An existing `.env` is validated and reused; the administrator, `APP_SECRET`, projects, and named volumes remain unchanged. Before replacing a ready control plane, the installer briefly pauses API and worker and writes a validated `shelter-before-update.sqlite` snapshot through an atomic rename inside the configured data volume. Project containers, Traefik, and the tunnel remain running during that pause. The snapshot is replaced by the next update and is not a substitute for the complete backup above.
+
+For unattended updates:
 
 ```sh
 git pull --ff-only
-docker compose pull traefik cloudflared
-docker compose build --pull api worker
-docker compose up -d
-docker compose ps
-curl --fail http://127.0.0.1:7080/api/healthz
+./install.sh --non-interactive
 ```
 
-`./install.sh` may also be run again and reuses the existing `.env`. The MVP has no automatic control-plane rollback, so record the previous release or commit and keep its backup.
+The installer updates the checked-out revision; it never runs `git pull` itself. Record the previous commit before updating. Use `--no-pull` only when the necessary pinned images already exist locally, because it also skips refreshing base images during the control-plane build.
 
 ### Portsmith migration
 
-The first Shelter deployment detects an existing Portsmith installation, preserves its runtime `.env`, explicitly reuses its three Docker volumes, creates a consistent SQLite backup, and starts the control plane under the Compose project name `shelter`. Keep the existing `APP_SECRET` unchanged.
+The first Shelter deployment detects an existing Portsmith installation, preserves its runtime `.env`, explicitly reuses its volumes and runtime network, and pauses the legacy API and worker while the installer snapshots and migrates SQLite. The retired control-plane containers are removed only after Shelter is healthy. Keep the existing `APP_SECRET` unchanged.
 
 Legacy internal resource names such as `portsmith-data`, `portsmith-routing`, `portsmith-tunnel`, `portsmith-runtime`, and `portsmith-app-*` may remain until each resource is safely replaced. They are not a visible product name and must not be renamed blindly, because attaching a new empty volume can appear as complete data loss.
 
@@ -440,7 +499,7 @@ chmod 600 .env.server
 ./ops/deploy.sh
 ```
 
-The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, syncs with rsync, and starts Compose on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup.
+The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, serializes remote deploys, protects installer locks and in-repository backups from rsync deletion, and invokes the same `./install.sh --non-interactive` path on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup.
 
 ## Security
 
@@ -454,6 +513,33 @@ The helper refuses group- or world-readable configuration, verifies the SSH host
 The worker's Docker socket is effectively host-root access. API, Traefik, `cloudflared`, and project containers do not receive it. This reduces attack surface but does not create safe hostile multi-tenancy. Read [SECURITY.md](SECURITY.md) for the full threat model and secret handling rules.
 
 ## Troubleshooting
+
+### Installer stopped or failed
+
+The installer is designed to be rerun. It serializes concurrent runs, creates `.env` atomically, removes bootstrap values through an atomic rewrite, and keeps `.shelter-install.log` after a failed compact interactive run. Non-interactive and `--verbose` output is streamed directly. Start with:
+
+```sh
+./install.sh doctor
+tail -n 200 .shelter-install.log
+./install.sh --verbose
+```
+
+Also inspect the affected services:
+
+```sh
+docker compose ps
+docker compose logs --tail=200 api worker traefik cloudflared
+```
+
+- **Interrupted first bootstrap:** rerun `./install.sh`. When still required, the one-time Base64 transport value remains protected in `.env` until the API becomes healthy; the installer then removes it and restarts the API. Do not edit bootstrap markers by hand while recovering.
+- **`.env` is missing but `shelter-data` exists:** restore the matching `.env`. Never generate a new `APP_SECRET` for existing encrypted data.
+- **`.env` exists but its configured data volume is empty:** restore the expected volume. Use `--bootstrap-empty-volume` only after verifying that the empty volume is intentional; provide a new password through the prompt or `--password-stdin`.
+- **An update paused the control plane:** project containers can continue through Traefik. If needed while investigating, run `docker compose start api worker`; retain `shelter-before-update.sqlite` and the failed revision before attempting manual database recovery.
+- **A Portsmith migration failed after a Shelter API container was created:** the deploy helper deliberately leaves both generations of API and worker stopped. Rerun the Shelter installer to finish the forward migration, or restore the verified pre-update snapshot before starting legacy binaries. Never run both generations against the same volume.
+- **Image pull is temporarily unavailable:** retry normally first. `--no-pull` is only appropriate when every required runtime and base image is already present and trusted locally.
+- **A stale operation lock remains after a hard crash:** verify that no `install.sh` or `ops/deploy.sh` process is running. Remove only the `pid`, `owner`, and `kind` files that exist inside `.shelter-install.lock`, remove the empty directory, and retry.
+
+Treat `.shelter-install.log` as operationally sensitive and redact it before sharing. On success the installer removes it automatically.
 
 ### Overall status and logs
 

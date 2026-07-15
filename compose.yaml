@@ -27,8 +27,8 @@ x-control-plane: &control-plane
     RUNTIME_NETWORK: ${RUNTIME_NETWORK:-shelter-runtime}
     TRAEFIK_SERVICE_URL: http://traefik:80
     CHROMIUM_PATH: /usr/bin/chromium-browser
-    TRUSTED_PROXY_IP: ${TRAEFIK_CONTROL_IP:-10.253.253.3}
-    TRUSTED_CLOUDFLARED_IP: ${CLOUDFLARED_CONTROL_IP:-10.253.253.4}
+    TRUSTED_PROXY_IP: ${TRUSTED_PROXY_IP:-10.253.253.3}
+    TRUSTED_CLOUDFLARED_IP: ${TRUSTED_CLOUDFLARED_IP:-10.253.253.4}
   restart: unless-stopped
   read_only: true
   tmpfs:
@@ -113,6 +113,12 @@ services:
         ipv4_address: ${TRAEFIK_CONTROL_IP:-10.253.253.3}
       runtime: {}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m
