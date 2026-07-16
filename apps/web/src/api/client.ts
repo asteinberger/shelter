@@ -21,7 +21,11 @@ import type {
   HostnameAvailability,
   Overview,
   Project,
+  ProjectObservabilityRange,
+  ProjectObservabilityResponse,
   ProjectSourceAnalysis,
+  RuntimeLog,
+  RuntimeLogsResponse,
   ServerMetricsRange,
   ServerMetricsResponse,
   Session,
@@ -254,6 +258,18 @@ export const api = {
   async serverMetrics(range: ServerMetricsRange) {
     return unwrap(await request<ServerMetricsResponse | { data: ServerMetricsResponse }>(
       `/api/server/metrics?range=${encodeURIComponent(range)}`,
+    ));
+  },
+
+  async projectObservability(id: string, range: ProjectObservabilityRange) {
+    return unwrap(await request<ProjectObservabilityResponse | { data: ProjectObservabilityResponse }>(
+      `/api/projects/${encodeURIComponent(id)}/observability?range=${encodeURIComponent(range)}`,
+    ));
+  },
+
+  async runtimeLogs(id: string, after = 0, limit = 500) {
+    return unwrap(await request<RuntimeLogsResponse | { data: RuntimeLogsResponse }>(
+      `/api/projects/${encodeURIComponent(id)}/runtime-logs?after=${Math.max(0, Math.trunc(after))}&limit=${Math.max(1, Math.min(500, Math.trunc(limit)))}`,
     ));
   },
 
@@ -619,5 +635,41 @@ export function streamDeploymentLogs(
   source.addEventListener('log', handleLine as EventListener);
   source.addEventListener('complete', () => source.close());
   source.onerror = () => onError?.();
+  return () => source.close();
+}
+
+export function streamRuntimeLogs(
+  projectId: string,
+  handlers: {
+    onLog: (log: RuntimeLog) => void;
+    onDeployment?: (activeDeploymentId: string | null) => void;
+    onOpen?: () => void;
+    onError?: () => void;
+  },
+  after = 0,
+) {
+  const source = new EventSource(
+    `/api/projects/${encodeURIComponent(projectId)}/runtime-logs/stream?after=${Math.max(0, Math.trunc(after))}`,
+    { withCredentials: true },
+  );
+  source.addEventListener('log', ((event: MessageEvent<string>) => {
+    try {
+      const log = JSON.parse(event.data) as RuntimeLog;
+      if (typeof log.id === 'number' && typeof log.message === 'string') handlers.onLog(log);
+    } catch {
+      // The runtime-log protocol only accepts structured, bounded records.
+    }
+  }) as EventListener);
+  source.addEventListener('deployment', ((event: MessageEvent<string>) => {
+    try {
+      const payload = JSON.parse(event.data) as { activeDeploymentId?: string | null };
+      handlers.onDeployment?.(payload.activeDeploymentId ?? null);
+    } catch {
+      handlers.onDeployment?.(null);
+    }
+  }) as EventListener);
+  source.addEventListener('complete', () => source.close());
+  source.onopen = () => handlers.onOpen?.();
+  source.onerror = () => handlers.onError?.();
   return () => source.close();
 }

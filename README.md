@@ -51,7 +51,7 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 - **Safe activation:** a disposable, resource-bounded helper probes each candidate on its project-only network before Traefik receives the new route.
 - **Cloudflare integration:** OAuth, tunnels, zones, DNS, hostname availability, apex domains, and multiple project domains in one place.
 - **Instant context:** successful website deployments receive an automatic screenshot preview in the project overview.
-- **Operator-ready:** dashboard, live deployment logs, rollbacks, project deletion, encrypted variables, and resource limits.
+- **Operator-ready:** dashboard, deployment logs, rollbacks, project deletion, encrypted variables, resource limits, and per-project runtime observability.
 - **Automation-ready:** scoped, expiring personal access tokens, a documented HTTP API, OpenAPI, and an installable `shelter` CLI.
 - **Verifiable releases:** immutable GitHub Releases, digest-pinned multi-platform images, signed provenance, downloadable SBOMs, and a fail-closed release installer.
 - **Multilingual panel:** English and German with browser detection and a persistent language preference.
@@ -140,7 +140,9 @@ Only the worker mounts `/var/run/docker.sock`. The worker stays on the control n
 
 Candidate health probes and screenshot captures run in disposable containers on the matching project network. They have no Docker socket or host bind mount, use a read-only root filesystem, drop all capabilities, enforce memory/CPU/PID/time bounds, and are ownership-checked before removal. Builds use Shelter's dedicated Docker-container BuildKit builder with independently configured memory, swap, CPU, PID, and maximum-parallelism bounds plus a builder-cache GC target. A continuously sampled free-space guard cancels cancellable source/build work and refuses completion when the data filesystem falls below `BUILD_MIN_FREE_GB`.
 
-The worker samples host capacity and managed-container aggregates every 15 seconds. It stores at most the configured retention window in SQLite; Docker stats are limited to Shelter-labelled containers and refreshed no more than once per minute. The session-only metrics endpoint never receives the Docker socket.
+The worker samples host capacity, managed-container aggregates, and each active project's production runtime at the configured metrics interval (15 seconds by default). It stores at most the configured retention window in SQLite; Docker inspection is restricted to Shelter-owned containers whose project and active-deployment labels match database state. Host and project observability endpoints are administrator-session-only and never receive the Docker socket.
+
+Runtime output is collected by the worker on that same interval, separately from immutable build/deployment logs. Shelter keeps at most 5,000 runtime lines per project and serves at most 500 lines at a time for the active deployment. Exact configured environment-variable values are redacted before persistence, but applications can still emit derived, encoded, reformatted, or otherwise sensitive data. Treat runtime logs as sensitive administrator data and do not describe the interval-based view as instantaneous streaming.
 
 ## Installation
 
@@ -382,6 +384,7 @@ Each domain is routed through the same Cloudflare Tunnel to Traefik. A domain ne
 - **Replace source:** upload a new ZIP or folder for upload-backed projects.
 - **Redeploy:** fetch the latest configured Git branch or rebuild the current uploaded source.
 - **Rollback:** reactivate a previously successful deployment.
+- **Observe:** inspect active-container CPU and memory against project limits, network and block I/O, uptime, restarts, OOM and health state, bounded history, and near-live runtime output.
 - **Delete project:** remove routes, project containers and images, stored source, previews, deployments, and owned DNS associations after confirmation.
 
 Each deployment runs in a version-bound container on its project's own bridge network. The current runtime stays online while its candidate is built and probed by a disposable bounded helper on that same project network; the worker itself never joins the network. Shelter then changes the persisted active deployment and Traefik routing atomically, and removes the previous runtime only after the switch commits. Screenshot capture uses a separate bounded helper with the same isolation. A failed candidate or routing update keeps or restores the previous deployment. Deployment logs are streamed in the panel.
@@ -408,8 +411,8 @@ Start from `.env.example`. The most commonly changed settings are:
 | `BUILD_PIDS_LIMIT` | `1024` | Dedicated BuildKit builder PID limit |
 | `BUILD_MAX_PARALLELISM` | `2` | Maximum concurrent BuildKit solver work per builder |
 | `BUILD_MIN_FREE_GB` | `5` | Minimum free data-filesystem space required before a build |
-| `METRICS_INTERVAL_SECONDS` | `15` | Server-metrics sample interval |
-| `METRICS_RETENTION_HOURS` | `48` | Raw server-metrics retention window |
+| `METRICS_INTERVAL_SECONDS` | `15` | Host/project metrics and runtime-log collection interval |
+| `METRICS_RETENTION_HOURS` | `48` | Raw host/project metrics and runtime-log retention window |
 | `SESSION_TTL_HOURS` | `24` | Administrator session lifetime |
 | `LOG_LEVEL` | `info` | API and worker log level |
 | `CLOUDFLARE_ACCOUNT_ID` | empty | Optional API-token fallback account |
@@ -576,6 +579,7 @@ The helper refuses group- or world-readable configuration, verifies the SSH host
 - Allow inbound SSH only. Shelter needs no public ports 80, 443, or 7080.
 - Prefer SSH keys, restrict root login, and update the host, Docker Engine, and images regularly.
 - Never share `.env`, volume backups, Cloudflare credentials, or unredacted deployment logs.
+- Runtime logs are administrator-only and bounded, but they remain application-controlled output. Exact environment values are redacted; derived or reformatted secrets may remain and must not be shared without review.
 
 The worker's Docker socket is effectively host-root access. API, Traefik, `cloudflared`, and project containers do not receive it. This reduces attack surface but does not create safe hostile multi-tenancy. Read [SECURITY.md](SECURITY.md) for the full threat model and secret handling rules.
 

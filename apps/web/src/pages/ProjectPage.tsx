@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { motion } from 'motion/react';
 import {
   AlertTriangle,
+  Activity,
   ArrowLeft,
   Box,
   CheckCircle2,
@@ -29,6 +30,7 @@ import { api } from '../api/client';
 import { NavigationGuard } from '../components/NavigationGuard';
 import { ProjectGitHubConnection } from '../components/ProjectGitHubConnection';
 import { ProjectPreviewCard } from '../components/ProjectPreviewCard';
+import { ProjectObservabilityTab } from '../components/ProjectObservabilityTab';
 import { StaticBasePathControl } from '../components/StaticBasePathControl';
 import { Button, ErrorState, Field, PageIntro, SelectField, Skeleton, StatusBadge } from '../components/ui';
 import {
@@ -87,7 +89,7 @@ import {
 import { BRAND_NAME } from '../lib/brand';
 import { localize, useI18n } from '@/i18n';
 
-type ProjectTab = 'overview' | 'deployments' | 'domains' | 'environment' | 'settings';
+type ProjectTab = 'overview' | 'observability' | 'deployments' | 'domains' | 'environment' | 'settings';
 
 type ProjectBuildType = 'auto' | 'dockerfile' | 'node' | 'static';
 
@@ -105,7 +107,7 @@ interface ProjectSettingsDraft {
   cpuLimit: string;
 }
 
-const projectTabs: ProjectTab[] = ['overview', 'deployments', 'domains', 'environment', 'settings'];
+const projectTabs: ProjectTab[] = ['overview', 'observability', 'deployments', 'domains', 'environment', 'settings'];
 const reservedEnvironmentKeys = new Set(['PORT', 'HOSTNAME', 'NODE_ENV']);
 const MAX_ENVIRONMENT_VARIABLES = 200;
 const MAX_ENVIRONMENT_KEY_LENGTH = 100;
@@ -728,6 +730,7 @@ export function ProjectPage() {
 
   const tabs: Array<{ id: ProjectTab; label: string; count?: number }> = [
     { id: 'overview', label: t('Overview', 'Übersicht') },
+    { id: 'observability', label: 'Observability' },
     { id: 'deployments', label: fileStorage ? t('Versions', 'Versionen') : 'Deployments', count: deployments.length },
     { id: 'domains', label: 'Domains', count: project.domains?.length ?? 0 },
     { id: 'environment', label: t('Environment', 'Umgebung'), count: project.environmentKeys?.length ?? 0 },
@@ -990,6 +993,18 @@ export function ProjectPage() {
               )}
             </div>
           </motion.div>
+        </TabsContent>
+
+        <TabsContent value="observability" className="grid min-w-0 gap-5">
+          <motion.section initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className="grid min-w-0 gap-5">
+            <SectionHeading
+              eyebrow={t('Production runtime', 'Produktions-Laufzeit')}
+              title={t('Project observability', 'Projekt-Observability')}
+              description={t('Resource usage, container health, and near-live output for the active deployment.', 'Ressourcennutzung, Containerzustand und nahezu aktuelle Ausgabe des aktiven Deployments.')}
+              action={<Badge variant="outline" className="gap-2"><Activity className="size-3.5" /> {t('Worker-collected', 'Vom Worker erfasst')}</Badge>}
+            />
+            <ProjectObservabilityTab project={project} onOpenSettings={() => setActiveTab('settings')} />
+          </motion.section>
         </TabsContent>
 
         <TabsContent value="deployments" className="grid min-w-0 gap-5">
