@@ -1,6 +1,6 @@
 {
   "name": "shelter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "A small, self-hosted deployment control plane for a single VPS.",
   "license": "AGPL-3.0-only",
