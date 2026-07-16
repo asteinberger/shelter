@@ -315,6 +315,14 @@ Per project, choose whether push-to-deploy is enabled:
 
 **Deploy current source** always fetches the latest branch HEAD and creates a new deployment. Installation and webhook state are checked server-side. Private clones use short-lived, repository-scoped installation tokens.
 
+#### Pull-request preview deployments
+
+GitHub App projects can explicitly opt into pull-request previews and select one active project domain as their Cloudflare zone source. Shelter publishes a successful preview at a single-label zone hostname such as `pr-42--my-app-ab12cd34.example.com`, reports `shelter/preview` on the commit, and removes the bounded runtime, route, image, and exact owned DNS record when the pull request closes or its 1–168 hour TTL expires.
+
+Preview builds are deliberately fail-closed: the PR base branch must equal the project's configured branch, the head repository ID and full name must exactly equal the installed repository, and fork PRs are never built. A project can have at most three active previews. Synchronize events coalesce to the newest SHA and cooperatively cancel a running obsolete build. Preview variables live in a separate encrypted set and production variables are never inherited.
+
+Newly registered Shelter GitHub Apps request `Pull requests: Read-only` and subscribe to the `pull_request` event. Apps registered before this feature must be updated under **GitHub → Settings → Developer settings → GitHub Apps → Shelter → Permissions & events** and their installation must accept the changed permission. `/api/settings/github/preview-capability` and the GitHub settings response expose both checks; Shelter refuses opt-in until they are ready instead of silently assuming that events will arrive.
+
 ### HTTPS Git
 
 Provide a public HTTPS repository URL and branch. Embedded credentials, custom ports, URL queries and fragments, local paths, SSH URLs, and interactive Git authentication are rejected.
@@ -680,7 +688,7 @@ A real end-to-end smoke test requires a disposable VPS, an active Cloudflare zon
 - no hostile multi-tenancy or sandbox for untrusted Docker builds,
 - one dedicated local BuildKit builder and cache per Shelter installation,
 - GitHub App support for private repositories, but no other private Git providers, SSH keys, or deploy tokens,
-- no pull-request preview deployments or branch-per-environment model,
+- pull-request previews are GitHub-App only; there is no general branch-per-environment model,
 - no Shelter-managed persistent application volumes or database services,
 - HTTP applications only; no TCP or UDP proxying,
 - domains must be active zones in the connected Cloudflare account,

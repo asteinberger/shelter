@@ -189,8 +189,8 @@ describe("GitHub App manifest and API authentication", () => {
       redirect_url: "https://hosting.example.com/api/settings/github/manifest/callback",
       public: false,
       request_oauth_on_install: false,
-      default_permissions: { contents: "read", statuses: "write", metadata: "read" },
-      default_events: ["push"]
+      default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
+      default_events: ["push", "pull_request"]
     });
     const state = new URL(started.registrationUrl).searchParams.get("state")!;
     await github.completeManifest(state, started.browserNonce, "manifest-code");

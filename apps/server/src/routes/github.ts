@@ -49,14 +49,31 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
   app.get("/api/settings/github", { preHandler: requireSessionAuth }, async (_request, reply) => {
     reply.header("cache-control", "no-store");
     const state = github.state();
-    if (!state.configured) return { github: { ...state, installations: [], error: null } };
+    if (!state.configured) return {
+      github: {
+        ...state,
+        installations: [],
+        previewCapability: {
+          ready: false,
+          configured: false,
+          pullRequestsPermission: false,
+          pullRequestEvent: false,
+          remediation: "configure_app"
+        },
+        error: null
+      }
+    };
     try {
-      const installations = await github.installations();
+      const [installations, previewCapability] = await Promise.all([
+        github.installations(),
+        github.previewCapability()
+      ]);
       return {
         github: {
           ...state,
           connected: installations.some((installation) => !installation.suspendedAt),
           installations,
+          previewCapability,
           error: null
         }
       };
@@ -66,10 +83,19 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
           ...state,
           connected: false,
           installations: [],
+          previewCapability: null,
           error: "GitHub konnte gerade nicht erreicht werden. Die App-Verbindung bleibt gespeichert."
         }
       };
     }
+  });
+
+  app.get("/api/settings/github/preview-capability", {
+    preHandler: requireSessionAuth,
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } }
+  }, async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    return { previewCapability: await github.previewCapability() };
   });
 
   app.post("/api/settings/github/manifest/start", {
