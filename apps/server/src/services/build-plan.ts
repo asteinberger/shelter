@@ -338,7 +338,28 @@ function packageManager(directory: string, manifest: PackageManifest): PackageMa
   const bunLockfile = fs.existsSync(path.join(directory, "bun.lock"))
     ? "bun.lock"
     : fs.existsSync(path.join(directory, "bun.lockb")) ? "bun.lockb" : null;
-  if (declared === "bun" || bunLockfile) {
+  const hasPnpmLock = fs.existsSync(path.join(directory, "pnpm-lock.yaml"));
+  const hasYarnLock = fs.existsSync(path.join(directory, "yarn.lock"));
+  const hasNpmLock = fs.existsSync(path.join(directory, "package-lock.json"));
+  const selected = (
+    declared === "bun"
+    || declared === "pnpm"
+    || declared === "yarn"
+    || declared === "npm"
+  )
+    ? declared
+    : fs.existsSync(path.join(directory, "bun.lock"))
+      ? "bun"
+      : hasPnpmLock
+        ? "pnpm"
+        : hasYarnLock
+          ? "yarn"
+          : hasNpmLock
+            ? "npm"
+            : bunLockfile
+              ? "bun"
+              : "npm";
+  if (selected === "bun") {
     return {
       install: `npm install --global bun@1.2.20 && bun install${bunLockfile ? " --frozen-lockfile" : ""}`,
       build: "bun run build",
@@ -348,8 +369,7 @@ function packageManager(directory: string, manifest: PackageManifest): PackageMa
       configurationCopies: []
     };
   }
-  const hasPnpmLock = fs.existsSync(path.join(directory, "pnpm-lock.yaml"));
-  if (declared === "pnpm" || hasPnpmLock) {
+  if (selected === "pnpm") {
     return {
       install: `corepack enable && pnpm install${hasPnpmLock ? " --frozen-lockfile" : ""}`,
       build: "pnpm run build",
@@ -359,8 +379,7 @@ function packageManager(directory: string, manifest: PackageManifest): PackageMa
       configurationCopies: []
     };
   }
-  const hasYarnLock = fs.existsSync(path.join(directory, "yarn.lock"));
-  if (declared === "yarn" || hasYarnLock) {
+  if (selected === "yarn") {
     const hasBerryConfig = fs.existsSync(path.join(directory, ".yarnrc.yml"));
     const classicYarn = manifest.packageManager
       ? manifest.packageManager.startsWith("yarn@1.")
@@ -378,8 +397,7 @@ function packageManager(directory: string, manifest: PackageManifest): PackageMa
       configurationCopies
     };
   }
-  const hasNpmLock = fs.existsSync(path.join(directory, "package-lock.json"));
-  if (declared === "npm" || hasNpmLock) {
+  if (selected === "npm") {
     return {
       install: hasNpmLock ? "npm ci" : "npm install",
       build: "npm run build",
