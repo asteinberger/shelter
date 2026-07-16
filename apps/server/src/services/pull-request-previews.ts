@@ -10,7 +10,6 @@ function dnsSegment(value: string): string {
     .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
-
 /**
  * Preview hosts stay directly below the selected Cloudflare zone. This is
  * important because Universal SSL commonly covers `*.zone`, not nested names.
@@ -49,4 +48,3 @@ export function previewConfigurationReady(
     && Boolean(project.preview_domain_suffix)
     && domains.some((domain) => domain.id === project.preview_domain_id && domain.status === "active");
 }
-
