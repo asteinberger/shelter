@@ -242,6 +242,64 @@ export interface ServerMetricHistoryRow {
   application_network_transmit_bytes_per_second: number;
 }
 
+export type ProjectRuntimeStatus =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead"
+  | "missing"
+  | "unknown";
+
+export type ProjectRuntimeHealth = "healthy" | "unhealthy" | "starting" | "none" | "unknown";
+
+export interface ProjectMetricSampleRow {
+  project_id: string;
+  deployment_id: string;
+  sampled_at: number;
+  runtime_status: ProjectRuntimeStatus;
+  health_status: ProjectRuntimeHealth;
+  started_at: string | null;
+  uptime_seconds: number;
+  restart_count: number;
+  oom_killed: 0 | 1;
+  cpu_usage_percent: number;
+  cpu_limit_cores: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_usage_percent: number;
+  network_received_bytes: number;
+  network_transmitted_bytes: number;
+  network_receive_bytes_per_second: number;
+  network_transmit_bytes_per_second: number;
+  block_read_bytes: number;
+  block_write_bytes: number;
+}
+
+export interface ProjectMetricHistoryRow {
+  sampled_at: number;
+  cpu_usage_percent: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_usage_percent: number;
+  network_receive_bytes_per_second: number;
+  network_transmit_bytes_per_second: number;
+  block_read_bytes: number;
+  block_write_bytes: number;
+}
+
+export interface RuntimeLogRow {
+  id: number;
+  project_id: string;
+  deployment_id: string;
+  stream: "stdout" | "stderr";
+  message: string;
+  source_timestamp: string;
+  collected_at: string;
+}
+
 export interface ServerActivityCounts {
   projects: number;
   live_projects: number;

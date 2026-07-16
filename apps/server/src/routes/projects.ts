@@ -658,6 +658,15 @@ export function registerProjectRoutes(
       mutableProject(database, current.id);
       throw conflict("Projektstatus hat sich während der Änderung geändert", "PROJECT_MUTATION_CONFLICT");
     }
+    if (
+      input.repositoryBranch !== undefined
+      && input.repositoryBranch !== current.repository_branch
+    ) {
+      for (const preview of database.listPullRequestPreviews(project.id)) {
+        if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
+      }
+      reconcileRouting(config, database);
+    }
     return { project: presentApiProject(config, project, database.listDomains(current.id), database.listDeployments(current.id)) };
   });
 

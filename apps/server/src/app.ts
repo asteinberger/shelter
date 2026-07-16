@@ -14,6 +14,7 @@ import { registerApiTokenRoutes } from "./routes/api-tokens.js";
 import { registerOpenApiRoutes } from "./routes/openapi.js";
 import { registerGithubRoutes } from "./routes/github.js";
 import { registerProjectRoutes } from "./routes/projects.js";
+import { registerProjectObservabilityRoutes } from "./routes/project-observability.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerServerMetricsRoutes } from "./routes/server-metrics.js";
 import { registerPullRequestPreviewRoutes } from "./routes/pull-request-previews.js";
@@ -79,6 +80,7 @@ export async function createApp(config: AppConfig, database = new Database(confi
   registerUploadRoutes(app, uploads);
   registerProjectRoutes(app, config, database, uploads, cloudflare, github);
   registerPullRequestPreviewRoutes(app, config, database, cloudflare, github);
+  registerProjectObservabilityRoutes(app, config, database);
   registerDeploymentRoutes(app, database);
   registerSettingsRoutes(app, cloudflare);
   registerGithubRoutes(app, github);

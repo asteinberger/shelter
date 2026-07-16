@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import BetterSqlite3 from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { Database } from "../src/lib/database.js";
 import { GitHubService } from "../src/services/github.js";
@@ -16,7 +17,13 @@ const directories: string[] = [];
 function context() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "shelter-pr-preview-"));
   directories.push(directory);
-  const config = loadConfig({ NODE_ENV: "test", DATA_DIR: directory, APP_SECRET: "p".repeat(64) });
+  const config = loadConfig({
+    NODE_ENV: "test",
+    DATA_DIR: directory,
+    APP_SECRET: "p".repeat(64),
+    ADMIN_EMAIL: "admin@example.com",
+    ADMIN_PASSWORD: "correct horse battery staple"
+  });
   const database = new Database(config);
   const now = new Date().toISOString();
   const project: ProjectRow = {
@@ -515,6 +522,54 @@ describe("pull-request preview safety", () => {
     expect(disconnected.database.getPullRequestPreview(disconnectedPreviewId)?.status).toBe("closing");
     expect(fs.readFileSync(disconnected.config.traefikConfigPath, "utf8")).not.toContain("pr-18--");
     disconnected.database.close();
+  });
+
+  it("closes and unpublishes previews when the configured base branch changes", async () => {
+    const { config, database, project } = context();
+    database.updateProject(project.id, { github_installation_id: null });
+    const queued = database.queuePullRequestPreview({
+      projectId: project.id,
+      pullRequestNumber: 19,
+      headSha: "a".repeat(40),
+      headRef: "feature/preview",
+      baseRef: "main",
+      repositoryId: "99",
+      repositoryFullName: "example/app",
+      deliveryId: "branch-change",
+      hostname: "pr-19--preview-app.example.com",
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      commitMessage: "Branch change",
+      commitAuthor: "Ada",
+      commitUrl: null
+    });
+    activatePreview(database, project.id, 19);
+    reconcileRouting(config, database);
+    expect(fs.readFileSync(config.traefikConfigPath, "utf8")).toContain(queued.preview.hostname);
+
+    const app = await createApp(config, database);
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { email: "admin@example.com", password: "correct horse battery staple" }
+    });
+    const cookie = login.cookies.find((entry) => entry.name === "shelter_session")?.value ?? "";
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/projects/${project.id}`,
+      headers: {
+        cookie: `shelter_session=${cookie}`,
+        "x-csrf-token": login.json().csrfToken as string,
+        origin: "http://localhost:7080",
+        host: "localhost:7080"
+      },
+      payload: { repositoryBranch: "release" }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(database.getProject(project.id)?.repository_branch).toBe("release");
+    expect(database.getPullRequestPreview(queued.preview.id)?.status).toBe("closing");
+    expect(fs.readFileSync(config.traefikConfigPath, "utf8")).not.toContain(queued.preview.hostname);
+    await app.close();
   });
 
   it("caps active previews at three and closes DNS through the API reconciler", async () => {
