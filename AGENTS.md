@@ -86,6 +86,10 @@ npm run test -w @shelter/web -- <test-file>
 - Treat `install.sh`, `compose.yaml`, `Dockerfile`, `ops/`, and database migrations as high-risk surfaces.
 - Preserve a rollback path, back up persistent data, and document new variables in the example files.
 - A release is not ready until API health, worker status, login, at least one deployment, and routing have been verified at the appropriate level.
+- Deploy published production versions with `ops/deploy-release.sh`, not the
+  mutable source deployer. Preserve its local and remote verification order,
+  root-only incoming staging, atomic immutable release directory, and final
+  `doctor`; never weaken a dry run into an unverified plan.
 - Never claim a successful live test when only mocks or local tests ran. State the actual verification depth clearly.
 
 ## Promotion and release flow

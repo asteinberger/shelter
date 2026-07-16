@@ -106,13 +106,17 @@ jobs:
           set -euo pipefail
           dash -n install.sh \
             ops/create-release-manifest.sh \
+            ops/lib/deploy-release-remote.sh \
             ops/download-release.sh \
             ops/install-release-bundle.sh \
             ops/lib/release-bundle.sh \
             ops/verify-release-bundle.sh
           bash -n \
             ops/deploy.sh \
+            ops/deploy-release.sh \
+            ops/lib/server-connection.sh \
             test/development-workflow.test.sh \
+            test/deploy-release.test.sh \
             test/install.test.sh \
             test/release-bundle.test.sh
 
@@ -122,6 +126,7 @@ jobs:
           set -euo pipefail
           bash test/install.test.sh
           bash test/release-bundle.test.sh
+          bash test/deploy-release.test.sh
 
   compose:
     name: Compose configuration

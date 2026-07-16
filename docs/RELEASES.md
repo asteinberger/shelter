@@ -96,6 +96,54 @@ authenticity comes from the Sigstore-signed image provenance, SBOM and asset
 attestations plus GitHub Release immutability; it does not depend on a locally
 configured maintainer signing key.
 
+## Deploy a verified release to a VPS
+
+Run the production deployer from a trusted local checkout after the immutable
+GitHub Release workflow has completed:
+
+```sh
+cp .env.server.example .env.server
+chmod 600 .env.server
+# Configure root SSH access to /opt/shelter; prefer an identity file.
+./ops/deploy-release.sh --tag v0.3.0 --dry-run
+./ops/deploy-release.sh --tag v0.3.0
+```
+
+The workflow is fail closed and performs these steps in order:
+
+1. `ops/download-release.sh` verifies GitHub's immutable Release and downloaded
+   asset attestations, rejects unsafe archives, binds the bundle to the exact
+   repository/tag, and verifies every payload checksum locally.
+2. The operator connection requires `.env.server` mode `0600` or stricter,
+   verifies the SSH host key with `accept-new`, and keeps password fallback in a
+   temporary `SSH_ASKPASS` helper plus a protected ControlMaster socket. No
+   credential is put in argv or deployment logs.
+3. The root SSH account creates `/opt/shelter/releases/.incoming` as root-owned
+   mode `0700` and serializes release deployers with an ownership-token lock.
+   `rsync -rlpt` transfers no owner/group metadata and never transfers the
+   operator environment file.
+4. The VPS verifies the complete bundle and the exact locally authenticated
+   manifest again, then runs `install-release-bundle.sh --dry-run` before any
+   immutable release directory is published.
+5. A new bundle is renamed atomically to
+   `/opt/shelter/releases/vMAJOR.MINOR.PATCH`. An existing directory is reused
+   only if its verified manifest is identical. Different content under the same
+   tag is rejected.
+6. `install-release-bundle.sh --installation /opt/shelter -- --non-interactive`
+   installs the digest-pinned control plane while preserving `.env`, and
+   `/opt/shelter/install.sh doctor` must pass before the operator command reports
+   success.
+
+`--dry-run` performs the local download, temporary remote transport, repeated
+verification, and installer dry run, then removes its owned incoming stage. It
+does not publish a release directory, pull an image, or update the installation.
+Use `--server-env FILE` for a different protected target file and
+`--repo OWNER/REPOSITORY` only for an explicitly reviewed fork release.
+
+The lower-level `download-release.sh` and `install-release-bundle.sh` commands
+remain available for offline/manual operations. Do not replace this path with a
+source rsync when the intended production identity is an immutable release.
+
 ## Required repository rules
 
 Repository settings are part of the security boundary and cannot be enforced

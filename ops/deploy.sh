@@ -5,11 +5,11 @@ umask 077
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPOSITORY_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly SERVER_ENV_FILE="${SHELTER_SERVER_ENV_FILE:-${PORTSMITH_SERVER_ENV_FILE:-$REPOSITORY_DIR/.env.server}}"
+# shellcheck source=ops/lib/server-connection.sh
+source "$SCRIPT_DIR/lib/server-connection.sh"
 
 dry_run=0
 sync_only=0
-temporary_directory=
-control_path=
 ssh_target=
 remote_operation_lock_acquired=0
 remote_operation_lock_q=
@@ -36,36 +36,13 @@ cleanup() {
   if ((remote_operation_lock_acquired)) && [[ -n "$ssh_target" && -n "$remote_operation_lock_q" && -n "$remote_operation_lock_token" ]]; then
     "${ssh_args[@]}" "$ssh_target" "if [ -f $remote_operation_lock_q/owner ] && [ \"\$(cat $remote_operation_lock_q/owner)\" = '$remote_operation_lock_token' ]; then rm -f $remote_operation_lock_q/pid $remote_operation_lock_q/owner $remote_operation_lock_q/kind; rmdir $remote_operation_lock_q; fi" </dev/null >/dev/null 2>&1 || true
   fi
-  if [[ -n "$control_path" && -n "$ssh_target" && -S "$control_path" ]]; then
-    ssh -S "$control_path" -O exit "$ssh_target" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$temporary_directory" ]]; then
-    rm -rf -- "$temporary_directory"
-  fi
+  shelter_server_connection_cleanup
 }
 trap cleanup EXIT HUP INT TERM
 
 fail() {
   printf 'Error: %s\n' "$1" >&2
   exit 1
-}
-
-file_mode() {
-  local file=$1
-  if stat -f '%Lp' "$file" >/dev/null 2>&1; then
-    stat -f '%Lp' "$file"
-  else
-    stat -c '%a' "$file"
-  fi
-}
-
-shell_join() {
-  local item joined=
-  for item in "$@"; do
-    printf -v item '%q' "$item"
-    joined+="${joined:+ }$item"
-  done
-  printf '%s' "$joined"
 }
 
 while (($#)); do
@@ -78,96 +55,19 @@ while (($#)); do
   shift
 done
 
-[[ -f "$SERVER_ENV_FILE" ]] || fail "$SERVER_ENV_FILE is missing. Copy .env.server.example and configure the VPS."
+shelter_server_connection_init "$SERVER_ENV_FILE" shelter-deploy || exit 1
 
-mode="$(file_mode "$SERVER_ENV_FILE")"
-[[ "$mode" =~ ^[0-7]{3,4}$ ]] || fail "Could not verify the file mode of $SERVER_ENV_FILE."
-mode="${mode: -3}"
-(( (8#$mode & 077) == 0 )) || fail "$SERVER_ENV_FILE is readable by the group or other users. Run 'chmod 600 $SERVER_ENV_FILE'."
-
-# This is a trusted, local shell-format file. It is deliberately separate from
-# the application .env consumed by Docker Compose.
-# shellcheck disable=SC1090
-source "$SERVER_ENV_FILE"
-
-SHELTER_SERVER_HOST="${SHELTER_SERVER_HOST:-${PORTSMITH_SERVER_HOST:-}}"
-SHELTER_SERVER_USER="${SHELTER_SERVER_USER:-${PORTSMITH_SERVER_USER:-}}"
-SHELTER_SERVER_PATH="${SHELTER_SERVER_PATH:-${PORTSMITH_SERVER_PATH:-}}"
-SHELTER_SERVER_PORT="${SHELTER_SERVER_PORT:-${PORTSMITH_SERVER_PORT:-22}}"
-SHELTER_SERVER_IDENTITY_FILE="${SHELTER_SERVER_IDENTITY_FILE:-${PORTSMITH_SERVER_IDENTITY_FILE:-}}"
-SHELTER_SERVER_PASSWORD="${SHELTER_SERVER_PASSWORD:-${PORTSMITH_SERVER_PASSWORD:-}}"
 SHELTER_LEGACY_SERVER_PATH="${SHELTER_LEGACY_SERVER_PATH:-/opt/portsmith}"
-
-: "${SHELTER_SERVER_HOST:?SHELTER_SERVER_HOST is missing from $SERVER_ENV_FILE}"
-: "${SHELTER_SERVER_USER:?SHELTER_SERVER_USER is missing from $SERVER_ENV_FILE}"
-: "${SHELTER_SERVER_PATH:?SHELTER_SERVER_PATH is missing from $SERVER_ENV_FILE}"
-[[ "$SHELTER_SERVER_HOST" =~ ^[A-Za-z0-9:.%-]+$ ]] || fail "SHELTER_SERVER_HOST contains unsupported characters."
-[[ "$SHELTER_SERVER_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || fail "SHELTER_SERVER_USER is invalid."
-[[ "$SHELTER_SERVER_PORT" =~ ^[0-9]+$ ]] || fail "SHELTER_SERVER_PORT must be numeric."
-((SHELTER_SERVER_PORT >= 1 && SHELTER_SERVER_PORT <= 65535)) || fail "SHELTER_SERVER_PORT must be between 1 and 65535."
-[[ "$SHELTER_SERVER_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$SHELTER_SERVER_PATH" != "/" ]] || fail "SHELTER_SERVER_PATH must be a safe absolute path other than /."
 [[ "$SHELTER_LEGACY_SERVER_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$SHELTER_LEGACY_SERVER_PATH" != "/" ]] || fail "SHELTER_LEGACY_SERVER_PATH must be a safe absolute path other than /."
 
-ssh_args=(
-  ssh
-  -p "$SHELTER_SERVER_PORT"
-  -o ConnectTimeout=15
-  -o ServerAliveInterval=15
-  -o ServerAliveCountMax=3
-  -o StrictHostKeyChecking=accept-new
-)
-
-if [[ -n "$SHELTER_SERVER_IDENTITY_FILE" ]]; then
-  [[ -f "$SHELTER_SERVER_IDENTITY_FILE" ]] || fail "SSH key $SHELTER_SERVER_IDENTITY_FILE is missing."
-  ssh_args+=(
-    -i "$SHELTER_SERVER_IDENTITY_FILE"
-    -o IdentitiesOnly=yes
-    -o BatchMode=yes
-  )
-elif [[ -n "$SHELTER_SERVER_PASSWORD" ]]; then
-  temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/shelter-deploy.XXXXXX")"
-  chmod 700 "$temporary_directory"
-  askpass="$temporary_directory/askpass"
-  cat > "$askpass" <<'ASKPASS'
-#!/bin/sh
-set -eu
-# shellcheck disable=SC1090
-. "$SHELTER_SERVER_ENV_FILE"
-printf '%s\n' "${SHELTER_SERVER_PASSWORD:-${PORTSMITH_SERVER_PASSWORD:?}}"
-ASKPASS
-  chmod 700 "$askpass"
-  export SHELTER_SERVER_ENV_FILE="$SERVER_ENV_FILE"
-  export SSH_ASKPASS="$askpass"
-  export SSH_ASKPASS_REQUIRE=force
-  export DISPLAY="${DISPLAY:-shelter-askpass}"
-  control_path="$temporary_directory/ssh-control"
-  ssh_args+=(
-    -o BatchMode=no
-    -o NumberOfPasswordPrompts=1
-    -o PreferredAuthentications=password,keyboard-interactive
-    -o PubkeyAuthentication=no
-    -o ControlMaster=auto
-    -o ControlPersist=30
-    -o ControlPath="$control_path"
-  )
-  # The password remains only in the protected file and the current shell's
-  # memory; it is never placed in argv or exported to ssh/rsync.
-  unset SHELTER_SERVER_PASSWORD PORTSMITH_SERVER_PASSWORD
-else
-  ssh_args+=(-o BatchMode=yes)
-fi
-
-ssh_target="${SHELTER_SERVER_USER}@${SHELTER_SERVER_HOST}"
-if [[ "$SHELTER_SERVER_HOST" == *:* ]]; then
-  rsync_target="${SHELTER_SERVER_USER}@[${SHELTER_SERVER_HOST}]:${SHELTER_SERVER_PATH}/"
-else
-  rsync_target="${ssh_target}:${SHELTER_SERVER_PATH}/"
-fi
+ssh_args=("${SHELTER_SERVER_SSH_ARGS[@]}")
+ssh_target="$SHELTER_SERVER_SSH_TARGET"
+rsync_target="${SHELTER_SERVER_RSYNC_HOST}:${SHELTER_SERVER_PATH}/"
 
 remote_path_q="$(printf '%q' "$SHELTER_SERVER_PATH")"
 legacy_path_q="$(printf '%q' "$SHELTER_LEGACY_SERVER_PATH")"
 remote_operation_lock_q="$(printf '%q' "$SHELTER_SERVER_PATH/.shelter-install.lock")"
-rsync_rsh="$(shell_join "${ssh_args[@]}")"
+rsync_rsh="$SHELTER_SERVER_RSYNC_RSH"
 
 if ((dry_run)); then
   "${ssh_args[@]}" "$ssh_target" "test -d $remote_path_q && test ! -d $remote_operation_lock_q" </dev/null \
@@ -188,7 +88,9 @@ rsync_args=(
   --delete
   --human-readable
   --itemize-changes
-  --exclude=.git/
+  # Worktrees store .git as a file while ordinary clones use a directory.
+  # Exclude the path itself so neither representation reaches the VPS.
+  --exclude=.git
   --exclude=.github/
   --exclude=.env
   --exclude='.env.*'
@@ -197,6 +99,7 @@ rsync_args=(
   --exclude='*.log'
   --exclude=.shelter-install.lock/
   --exclude=backups/
+  --exclude=releases/
   --exclude=node_modules/
   --exclude=dist/
   --exclude=coverage/
