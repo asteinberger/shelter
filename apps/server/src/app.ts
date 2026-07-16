@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import cookie from "@fastify/cookie";
+import formbody from "@fastify/formbody";
 import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
@@ -25,6 +26,7 @@ import { panelHostnames } from "./services/panel-domains.js";
 import { reconcileRouting } from "./services/routing.js";
 import { registerUploadRoutes, UploadService } from "./services/uploads.js";
 import { PreviewDnsReconciler } from "./services/preview-dns-reconciler.js";
+import { registerSiteAccessRoutes } from "./services/site-access.js";
 
 export async function createApp(config: AppConfig, database = new Database(config)): Promise<FastifyInstance> {
   await bootstrapAdmin(config, database);
@@ -47,6 +49,7 @@ export async function createApp(config: AppConfig, database = new Database(confi
   });
 
   await app.register(cookie);
+  await app.register(formbody);
   await app.register(rateLimit, { global: false });
   await app.register(multipart, {
     limits: { fileSize: config.MAX_UPLOAD_MB * 1024 * 1024, files: 1, fields: 30 }
@@ -75,6 +78,7 @@ export async function createApp(config: AppConfig, database = new Database(confi
   const github = new GitHubService(config, database);
   const previewDns = new PreviewDnsReconciler(database, cloudflare);
   registerAuthRoutes(app, config, database);
+  registerSiteAccessRoutes(app, config, database);
   registerOpenApiRoutes(app);
   registerApiTokenRoutes(app, database);
   registerUploadRoutes(app, uploads);

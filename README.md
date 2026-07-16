@@ -396,6 +396,13 @@ Before creating a record, Shelter checks:
 
 Each domain is routed through the same Cloudflare Tunnel to Traefik. A domain needs an active deployment before it can serve an application.
 
+The **Access & visibility** section configures each hostname independently:
+
+- Optional site-password protection runs in Traefik before the application, so it works for static sites, Next.js, Astro, and custom containers without a redeploy.
+- Visitors receive a branded, mobile-friendly password page and a host-only access cookie. The shared site password is separate from the Shelter administrator account.
+- Changing the password, protection state, or session duration invalidates existing visitor access. The operator can also sign out all visitors explicitly.
+- Search indexing can be disabled for public sites. Shelter then adds a strict `X-Robots-Tag` response header. Password-protected domains are always `noindex`.
+
 ## Project lifecycle
 
 - **Edit settings:** source routing, build type, paths, port, health check, and auto-deploy.

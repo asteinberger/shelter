@@ -120,6 +120,12 @@ export interface DomainRow {
   dns_record_id: string | null;
   status: "pending" | "active" | "error";
   error: string | null;
+  /** Optional on input for backwards-compatible fixtures and additive migrations. */
+  password_protection_enabled?: 0 | 1;
+  password_hash?: string | null;
+  access_session_version?: number;
+  access_session_ttl_hours?: number;
+  seo_indexing?: 0 | 1;
   created_at: string;
 }
 
@@ -432,6 +438,10 @@ export interface PublicProject {
     hostname: string;
     status: DomainRow["status"];
     error: string | null;
+    passwordProtectionEnabled: boolean;
+    passwordConfigured: boolean;
+    accessSessionTtlHours: number;
+    seoIndexing: boolean;
   }>;
   deployments?: PublicDeployment[];
   currentDeployment?: PublicDeployment | null;

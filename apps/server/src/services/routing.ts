@@ -25,6 +25,7 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
     "http:",
     "  routers:"
   ];
+  let hasProtectedDomains = false;
 
   if (panelDomains.length > 0) {
     lines.push(
@@ -40,15 +41,34 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
     if (!project.active_deployment_id || !database.getDeployment(project.active_deployment_id)?.internal_port) continue;
     const domains = database.listDomains(project.id).filter((domain) => domain.status === "active");
     if (domains.length === 0) continue;
-    const name = routeName(project.id);
-    const hostRule = domains.map((domain) => `Host(\`${domain.hostname}\`)`).join(" || ");
-    lines.push(
-      `    ${name}:`,
-      `      rule: ${yamlString(hostRule)}`,
-      "      entryPoints: [web]",
-      `      service: ${name}`,
-      "      middlewares: [secure-headers, compress]"
-    );
+    const serviceName = routeName(project.id);
+    for (const domain of domains) {
+      const routerName = routeName(`${project.id}-${domain.id}`);
+      const middlewareNames = [
+        ...(domain.password_protection_enabled === 1 ? [`site-access-${routerName}`] : []),
+        ...((domain.password_protection_enabled === 1 || domain.seo_indexing === 0) ? [`noindex-${routerName}`] : []),
+        "secure-headers",
+        "compress"
+      ];
+      lines.push(
+        `    ${routerName}:`,
+        `      rule: ${yamlString(`Host(\`${domain.hostname}\`)`)}`,
+        "      entryPoints: [web]",
+        `      service: ${serviceName}`,
+        `      middlewares: [${middlewareNames.join(", ")}]`
+      );
+      if (domain.password_protection_enabled === 1) {
+        hasProtectedDomains = true;
+        lines.push(
+          `    ${routerName}-access:`,
+          `      rule: ${yamlString(`Host(\`${domain.hostname}\`) && PathPrefix(\`/_shelter/access\`)`)}`,
+          "      priority: 1000",
+          "      entryPoints: [web]",
+          "      service: shelter-access",
+          `      middlewares: [noindex-${routerName}, secure-headers, compress]`
+        );
+      }
+    }
   }
 
   for (const preview of previews) {
@@ -78,6 +98,15 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
     lines.push(
       "    panel:",
       "      loadBalancer:",
+      "        servers:",
+      "          - url: \"http://api:7080\""
+    );
+  }
+  if (hasProtectedDomains) {
+    lines.push(
+      "    shelter-access:",
+      "      loadBalancer:",
+      "        passHostHeader: true",
       "        servers:",
       "          - url: \"http://api:7080\""
     );
@@ -136,6 +165,27 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
     "        referrerPolicy: \"strict-origin-when-cross-origin\"",
     "        frameDeny: true"
   );
+
+  for (const project of projects) {
+    for (const domain of database.listDomains(project.id).filter((candidate) => candidate.status === "active")) {
+      const routerName = routeName(`${project.id}-${domain.id}`);
+      if (domain.password_protection_enabled === 1) {
+        lines.push(
+          `    site-access-${routerName}:`,
+          "      forwardAuth:",
+          `        address: ${yamlString(`http://api:7080/api/site-access/authorize?domainId=${encodeURIComponent(domain.id)}`)}`
+        );
+      }
+      if (domain.password_protection_enabled === 1 || domain.seo_indexing === 0) {
+        lines.push(
+          `    noindex-${routerName}:`,
+          "      headers:",
+          "        customResponseHeaders:",
+          "          X-Robots-Tag: \"noindex, nofollow, noarchive, nosnippet\""
+        );
+      }
+    }
+  }
 
   fs.mkdirSync(path.dirname(config.traefikConfigPath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${config.traefikConfigPath}.${process.pid}.${randomUUID()}.tmp`;
