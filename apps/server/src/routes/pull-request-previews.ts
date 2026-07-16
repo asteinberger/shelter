@@ -7,6 +7,7 @@ import { decryptString, encryptString, newId, validEnvironmentKey } from "../lib
 import { requireScopedAuth, requireScopedMutation } from "../services/auth.js";
 import type { CloudflareService } from "../services/cloudflare.js";
 import type { GitHubService } from "../services/github.js";
+import { reconcileRouting } from "../services/routing.js";
 import type { PullRequestPreviewRow } from "../types/models.js";
 
 const reservedEnvironmentKeys = new Set(["PORT", "HOSTNAME", "NODE_ENV"]);
@@ -22,8 +23,11 @@ function presentPreview(row: PullRequestPreviewRow) {
     baseRef: row.base_ref,
     generation: row.generation,
     deploymentId: row.deployment_id,
+    activeDeploymentId: row.active_deployment_id,
     hostname: row.hostname,
-    url: row.status === "ready" ? `https://${row.hostname}` : null,
+    url: row.active_deployment_id && !["closing", "closed", "blocked"].includes(row.status)
+      ? `https://${row.hostname}`
+      : null,
     status: row.status,
     error: row.error,
     expiresAt: row.expires_at,
@@ -84,20 +88,38 @@ export function registerPullRequestPreviewRoutes(
         preview_ttl_hours: input.ttlHours
       });
       if (!updated) throw conflict("Preview-Konfiguration konnte nicht gespeichert werden", "PROJECT_MUTATION_CONFLICT");
+      reconcileRouting(config, database);
       return { enabled: false, domainId: null, domainSuffix: null, ttlHours: input.ttlHours };
     }
 
     if (!project.github_installation_id || !project.github_repository_id || !project.github_repository_full_name) {
       throw badRequest("Preview-Deployments benötigen ein verbundenes GitHub-App-Repository", "GITHUB_PROJECT_REQUIRED");
     }
-    const capability = await github.previewCapability();
+    if (!input.domainId) throw badRequest("Bitte eine aktive Projekt-Domain auswählen", "PREVIEW_DOMAIN_REQUIRED");
+    const existingPreviews = database.listPullRequestPreviews(project.id);
+    if (existingPreviews.some((preview) => preview.status === "closing")) {
+      throw conflict(
+        "Eine Preview wird noch vollständig aus DNS und Runtime entfernt. Aktiviere Previews danach erneut.",
+        "PREVIEW_CLEANUP_PENDING"
+      );
+    }
+    if (
+      project.preview_domain_id
+      && project.preview_domain_id !== input.domainId
+      && existingPreviews.some((preview) => preview.status !== "closed")
+    ) {
+      throw conflict(
+        "Die Preview-Domain kann erst geändert werden, wenn alle bestehenden Previews geschlossen sind.",
+        "PREVIEW_DOMAIN_IN_USE"
+      );
+    }
+    const capability = await github.previewCapability(project.github_installation_id);
     if (!capability.ready) {
       throw conflict(
         "Die bestehende GitHub App benötigt Pull requests: Read und das pull_request-Webhook-Event. Aktualisiere die App-Berechtigungen und versuche es erneut.",
         "GITHUB_PREVIEW_CAPABILITY_MISSING"
       );
     }
-    if (!input.domainId) throw badRequest("Bitte eine aktive Projekt-Domain auswählen", "PREVIEW_DOMAIN_REQUIRED");
     const domain = database.getDomain(input.domainId);
     if (!domain || domain.project_id !== project.id || domain.status !== "active" || !domain.zone_id) {
       throw badRequest("Die ausgewählte Projekt-Domain ist nicht aktiv", "PREVIEW_DOMAIN_INVALID");
@@ -172,6 +194,7 @@ export function registerPullRequestPreviewRoutes(
     if (!project) throw notFound("Projekt nicht gefunden");
     const preview = database.requestPullRequestPreviewClose(project.id, request.params.previewId);
     if (!preview) throw notFound("Preview-Deployment nicht gefunden");
+    reconcileRouting(config, database);
     return reply.code(202).send({ preview: presentPreview(preview) });
   });
 }

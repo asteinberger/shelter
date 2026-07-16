@@ -37,7 +37,7 @@ export class PreviewDnsReconciler {
     const cleanup = this.database.nextPullRequestPreviewDnsCleanup();
     if (cleanup) {
       try {
-        await this.cloudflare.deleteDnsRecord(cleanup.zone_id, cleanup.dns_record_id, cleanup.hostname);
+        await this.cloudflare.deletePreviewDnsRecord(cleanup.zone_id, cleanup.dns_record_id, cleanup.hostname);
         this.database.clearPullRequestPreviewDns(cleanup.id, cleanup.dns_record_id);
       } catch (error) {
         this.database.recordPullRequestPreviewDnsFailure(
@@ -65,16 +65,16 @@ export class PreviewDnsReconciler {
       if (!availability.availability && availability.reason !== "CLOUDFLARE_DNS_RECORD_EXISTS") {
         throw new Error(`Preview hostname collision: ${availability.reason}`);
       }
-      // ensureDnsRecord adopts only a CNAME to this exact Shelter tunnel and
-      // refuses any foreign record. This makes retries after a crash safe.
-      provisioned = await this.cloudflare.ensureDnsRecord(preview.hostname, domain.zone_id);
+      // Preview DNS ownership additionally requires Shelter's exact marker.
+      // Same-tunnel records created manually or by another system are never adopted.
+      provisioned = await this.cloudflare.ensurePreviewDnsRecord(preview.hostname, domain.zone_id);
       if (!this.database.updatePullRequestPreviewDns(
         preview.id,
         preview.deployment_id,
         provisioned.zoneId,
         provisioned.recordId
       )) {
-        await this.cloudflare.deleteDnsRecord(provisioned.zoneId, provisioned.recordId, preview.hostname);
+        await this.cloudflare.deletePreviewDnsRecord(provisioned.zoneId, provisioned.recordId, preview.hostname);
       }
     } catch (error) {
       this.database.recordPullRequestPreviewDnsFailure(

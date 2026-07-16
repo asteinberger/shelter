@@ -175,7 +175,13 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
           get: { tags: ["Projects"], summary: "Analyze a GitHub repository at a branch SHA", security: sessionSecurity, responses: { "200": { description: "Detected applications cached by immutable branch SHA" }, "400": errorResponse, "401": errorResponse, "502": errorResponse } }
         },
         "/api/settings/github/preview-capability": {
-          get: { tags: ["Previews"], summary: "Check whether the installed GitHub App can deliver pull-request previews", security: sessionSecurity, responses: { "200": { description: "Permission and event readiness" }, "401": errorResponse, "502": errorResponse } }
+          get: {
+            tags: ["Previews"],
+            summary: "Check whether the GitHub App and an optional installation can deliver pull-request previews",
+            parameters: [{ name: "installationId", in: "query", schema: { type: "string", pattern: "^[0-9]+$" } }],
+            security: sessionSecurity,
+            responses: { "200": { description: "App and installation permission/event readiness" }, "401": errorResponse, "502": errorResponse }
+          }
         }
       },
       components: {

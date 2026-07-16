@@ -281,7 +281,12 @@ export interface PullRequestPreviewRow {
   repository_full_name: string;
   generation: number;
   latest_delivery_id: string;
+  /** The newest requested build. It may still be queued, building, or failed. */
   deployment_id: string | null;
+  /** The last successfully activated build that currently receives preview traffic. */
+  active_deployment_id: string | null;
+  /** Generation for which automatic worker-restart recovery was already consumed. */
+  worker_retry_generation: number | null;
   hostname: string;
   zone_id: string | null;
   dns_record_id: string | null;

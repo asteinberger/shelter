@@ -19,7 +19,7 @@ import {
   MANAGED_LABEL_NAMESPACES
 } from "./runtime-identity.js";
 
-type CloudflareDnsDeletion = Pick<CloudflareService, "deleteDnsRecord">;
+type CloudflareDnsDeletion = Pick<CloudflareService, "deleteDnsRecord" | "deletePreviewDnsRecord">;
 export type ProjectDeletionCommandRunner = (
   command: string,
   args: string[],
@@ -64,7 +64,7 @@ export class ProjectDeletionService {
       for (const preview of this.database.listPullRequestPreviews(projectId)) {
         this.database.requestPullRequestPreviewClose(projectId, preview.id);
         if (preview.zone_id || preview.dns_record_id) {
-          await this.cloudflare.deleteDnsRecord(preview.zone_id, preview.dns_record_id, preview.hostname);
+          await this.cloudflare.deletePreviewDnsRecord(preview.zone_id, preview.dns_record_id, preview.hostname);
           this.database.clearPullRequestPreviewDns(preview.id, preview.dns_record_id);
         }
         this.database.closePullRequestPreview(preview.id);

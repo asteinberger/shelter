@@ -54,6 +54,12 @@ interface CloudflareAccount {
 
 const CLOUDFLARE_PAGE_SIZE = 50;
 const MAX_CLOUDFLARE_PAGES = 100;
+const SHELTER_DNS_COMMENT = "Managed by Shelter";
+const LEGACY_SHELTER_DNS_COMMENT = "Managed by Portsmith";
+
+function isShelterManagedDnsRecord(record: Pick<CloudflareDnsRecord, "comment">): boolean {
+  return record.comment === SHELTER_DNS_COMMENT || record.comment === LEGACY_SHELTER_DNS_COMMENT;
+}
 
 function canonicalDnsName(value: string): string {
   return value.trim().toLowerCase().replace(/\.$/, "");
@@ -548,7 +554,23 @@ export class CloudflareService {
       accountId,
       hostname,
       tunnelId,
-      zoneIdInput?.trim()
+      zoneIdInput?.trim(),
+      false
+    );
+  }
+
+  async ensurePreviewDnsRecord(hostnameInput: string, zoneIdInput?: string): Promise<{ zoneId: string; recordId: string }> {
+    const hostname = normalizeHostname(hostnameInput);
+    const { accountId, apiToken } = await this.credentials();
+    const tunnelId = this.database.getSetting("cloudflare.tunnel_id");
+    if (!tunnelId) throw badRequest("Kein Cloudflare-Tunnel konfiguriert", "TUNNEL_NOT_CONFIGURED");
+    return this.ensureDnsRecordWith(
+      new CloudflareClient(apiToken),
+      accountId,
+      hostname,
+      tunnelId,
+      zoneIdInput?.trim(),
+      true
     );
   }
 
@@ -557,7 +579,8 @@ export class CloudflareService {
     accountId: string,
     hostname: string,
     tunnelId: string,
-    requestedZoneId?: string
+    requestedZoneId?: string,
+    requireShelterOwnership = false
   ): Promise<{ zoneId: string; recordId: string }> {
     const zone = await this.findZone(client, accountId, hostname, requestedZoneId);
     const target = `${tunnelId}.cfargotunnel.com`;
@@ -568,15 +591,22 @@ export class CloudflareService {
       page: "1"
     });
     const existing = await client.request<CloudflareDnsRecord[]>("GET", `/zones/${zone.id}/dns_records?${query.toString()}`);
-    const matching = existing.find((record) => record.name === hostname);
+    const matchingRecords = existing.filter((record) => canonicalDnsName(record.name) === hostname);
+    if (requireShelterOwnership && matchingRecords.length > 1) {
+      throw conflict(`DNS-Eintrag für ${hostname} ist nicht eindeutig und wird nicht übernommen`, "DNS_RECORD_EXISTS");
+    }
+    const matching = matchingRecords[0];
     if (matching) {
-      if (matching.type !== "CNAME" || matching.content.toLowerCase() !== target.toLowerCase()) {
+      if (matching.type.toUpperCase() !== "CNAME" || canonicalDnsName(matching.content) !== canonicalDnsName(target)) {
         throw conflict(`DNS-Eintrag für ${hostname} existiert bereits und wird nicht überschrieben`, "DNS_RECORD_EXISTS");
       }
-      if (!matching.proxied || matching.comment === "Managed by Portsmith") {
+      if (requireShelterOwnership && !isShelterManagedDnsRecord(matching)) {
+        throw conflict(`DNS-Eintrag für ${hostname} wird nicht von Shelter verwaltet`, "DNS_RECORD_EXISTS");
+      }
+      if (!matching.proxied || matching.comment === LEGACY_SHELTER_DNS_COMMENT) {
         await client.request<CloudflareDnsRecord>("PATCH", `/zones/${zone.id}/dns_records/${matching.id}`, {
           proxied: true,
-          ...(matching.comment === "Managed by Portsmith" ? { comment: "Managed by Shelter" } : {})
+          ...(matching.comment === LEGACY_SHELTER_DNS_COMMENT ? { comment: SHELTER_DNS_COMMENT } : {})
         });
       }
       return { zoneId: zone.id, recordId: matching.id };
@@ -588,7 +618,7 @@ export class CloudflareService {
       content: target,
       proxied: true,
       ttl: 1,
-      comment: "Managed by Shelter"
+      comment: SHELTER_DNS_COMMENT
     });
     return { zoneId: zone.id, recordId: record.id };
   }
@@ -603,7 +633,20 @@ export class CloudflareService {
     const client = new CloudflareClient(apiToken);
     const tunnelId = this.database.getSetting("cloudflare.tunnel_id");
     if (!tunnelId) throw badRequest("Kein Cloudflare-Tunnel konfiguriert", "TUNNEL_NOT_CONFIGURED");
-    await this.deleteDnsRecordWith(client, accountId, tunnelId, zoneId, recordId, expectedHostname);
+    await this.deleteDnsRecordWith(client, accountId, tunnelId, zoneId, recordId, expectedHostname, false);
+  }
+
+  async deletePreviewDnsRecord(
+    zoneId: string | null,
+    recordId: string | null,
+    expectedHostnameInput: string
+  ): Promise<void> {
+    const expectedHostname = normalizeHostname(expectedHostnameInput);
+    const { accountId, apiToken } = await this.credentials();
+    const client = new CloudflareClient(apiToken);
+    const tunnelId = this.database.getSetting("cloudflare.tunnel_id");
+    if (!tunnelId) throw badRequest("Kein Cloudflare-Tunnel konfiguriert", "TUNNEL_NOT_CONFIGURED");
+    await this.deleteDnsRecordWith(client, accountId, tunnelId, zoneId, recordId, expectedHostname, true);
   }
 
   private async deleteDnsRecordWith(
@@ -612,7 +655,8 @@ export class CloudflareService {
     tunnelId: string,
     zoneId: string | null,
     recordId: string | null,
-    expectedHostname: string
+    expectedHostname: string,
+    requireShelterOwnership = false
   ): Promise<void> {
     const effectiveZoneId = zoneId ?? (await this.findZone(client, accountId, expectedHostname)).id;
     let record: CloudflareDnsRecord | undefined;
@@ -656,6 +700,9 @@ export class CloudflareService {
       canonicalDnsName(record.content) !== target
     ) {
       throw conflict("DNS-Eintrag hat sich geändert und wurde deshalb nicht gelöscht", "DNS_RECORD_DRIFT");
+    }
+    if (requireShelterOwnership && !isShelterManagedDnsRecord(record)) {
+      throw conflict("DNS-Eintrag wird nicht von Shelter verwaltet und wurde deshalb nicht gelöscht", "DNS_RECORD_DRIFT");
     }
     try {
       await client.request(

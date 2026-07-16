@@ -609,8 +609,12 @@ export class DeploymentWorker {
     if (!isPreview && this.cancelIfSuperseded(project, deployment.id, commitSha)) return;
 
     const previousActiveDeploymentId = isPreview ? null : project.active_deployment_id;
-    const previousPreviewDeployment = isPreview && deployment.preview_id
-      ? this.database.latestReadyPreviewDeployment(deployment.preview_id, deployment.id)
+    const previewState = isPreview && deployment.preview_id
+      ? this.database.getPullRequestPreview(deployment.preview_id)
+      : undefined;
+    const previousPreviewDeployment = previewState?.active_deployment_id
+      && previewState.active_deployment_id !== deployment.id
+      ? this.database.getDeployment(previewState.active_deployment_id)
       : undefined;
     const previousRuntime = isPreview ? null : await this.currentRuntime(project, signal);
     const previousImage = previousRuntime?.image ?? null;
@@ -795,6 +799,22 @@ export class DeploymentWorker {
         this.safeLog(deploymentId, "stderr", `Aufräumen alter Preview-Images fehlgeschlagen: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
       }
     } catch (error) {
+      const currentPreview = this.database.getPullRequestPreview(preview.id);
+      if (currentPreview?.active_deployment_id === deploymentId) {
+        const restored = this.database.restorePullRequestPreviewActive(
+          preview.id,
+          deploymentId,
+          previousDeployment?.id ?? null
+        );
+        if (!restored) {
+          this.safeLog(
+            deploymentId,
+            "stderr",
+            "Automatischer Preview-Rollback fehlgeschlagen; der gesunde Candidate bleibt zur sicheren Wiederherstellung erhalten."
+          );
+          throw new DeploymentActivationError("Aktive Preview konnte nach dem Routing-Fehler nicht zurückgesetzt werden");
+        }
+      }
       await this.removeContainer(runtimeName);
       if (this.database.getDeployment(deploymentId)?.status === "ready") {
         this.database.updateDeployment(deploymentId, {
@@ -1187,8 +1207,11 @@ export class DeploymentWorker {
         .filter((deployment) => deployment.image_tag)
         .map((deployment) => deployment.image_tag as string)
     );
-    for (const deployment of this.database.listAllDeployments(projectId, 10_000)) {
-      if (deployment.deployment_scope === "preview" && deployment.status === "ready" && deployment.image_tag) {
+    for (const preview of this.database.listPullRequestPreviews(projectId)) {
+      const deployment = preview.active_deployment_id
+        ? this.database.getDeployment(preview.active_deployment_id)
+        : undefined;
+      if (deployment?.status === "ready" && deployment.image_tag) {
         keep.add(deployment.image_tag);
       }
     }
@@ -1206,8 +1229,11 @@ export class DeploymentWorker {
         .map((deployment) => deployment.image_tag)
         .filter((image): image is string => Boolean(image))
     );
-    for (const deployment of this.database.listAllDeployments(projectId, 10_000)) {
-      if (deployment.deployment_scope === "preview" && deployment.status === "ready" && deployment.image_tag) {
+    for (const preview of this.database.listPullRequestPreviews(projectId)) {
+      const deployment = preview.active_deployment_id
+        ? this.database.getDeployment(preview.active_deployment_id)
+        : undefined;
+      if (deployment?.status === "ready" && deployment.image_tag) {
         keep.add(deployment.image_tag);
       }
     }
@@ -1294,7 +1320,7 @@ export class DeploymentWorker {
         });
         if (deployment.preview_id) {
           this.database.failPullRequestPreview(deployment.preview_id, deployment.id, message);
-          this.database.materializePullRequestPreview(deployment.preview_id);
+          this.database.materializePullRequestPreview(deployment.preview_id, { allowWorkerRetry: true });
         }
         reconcileRouting(this.config, this.database);
         continue;
@@ -1510,7 +1536,7 @@ export class DeploymentWorker {
       if (!projectId || !deploymentId) continue;
       const project = this.database.getProject(projectId);
       const preview = this.database.getPullRequestPreviewByDeployment(deploymentId);
-      const isActivePreview = preview?.status === "ready" && preview.deployment_id === deploymentId;
+      const isActivePreview = preview?.active_deployment_id === deploymentId;
       if (project && project.active_deployment_id !== deploymentId && !isActivePreview) {
         await this.removeContainer(containerId);
       }

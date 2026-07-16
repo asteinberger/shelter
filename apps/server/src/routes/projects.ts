@@ -696,6 +696,7 @@ export function registerProjectRoutes(
     for (const preview of database.listPullRequestPreviews(project.id)) {
       if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
     }
+    reconcileRouting(config, database);
     return {
       project: presentApiProject(config,
         project,
@@ -730,6 +731,7 @@ export function registerProjectRoutes(
     for (const preview of database.listPullRequestPreviews(project.id)) {
       if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
     }
+    reconcileRouting(config, database);
     return {
       project: presentApiProject(config,
         project,
