@@ -150,7 +150,9 @@ describe("per-domain site access", () => {
       url: "/api/site-access/authorize?domainId=dom_site_access",
       headers: {
         "x-forwarded-host": "private.example.com",
-        "x-forwarded-proto": "https",
+        // cloudflared connects to Traefik over HTTP even though the visitor
+        // origin is always the public HTTPS hostname.
+        "x-forwarded-proto": "http",
         "x-forwarded-uri": "/secret?invite=1"
       }
     });

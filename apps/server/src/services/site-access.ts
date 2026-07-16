@@ -192,9 +192,7 @@ export function registerSiteAccessRoutes(
       return reply.code(204).send();
     }
     const returnPath = safeReturnPath(headerValue(request.headers["x-forwarded-uri"]));
-    const forwardedProtocol = headerValue(request.headers["x-forwarded-proto"]).split(",")[0]?.trim().toLowerCase();
-    const protocol = forwardedProtocol === "http" || forwardedProtocol === "https" ? forwardedProtocol : "https";
-    const accessUrl = new URL(`${SITE_ACCESS_PATH}/${encodeURIComponent(domain.id)}`, `${protocol}://${domain.hostname}`);
+    const accessUrl = new URL(`${SITE_ACCESS_PATH}/${encodeURIComponent(domain.id)}`, `https://${domain.hostname}`);
     accessUrl.searchParams.set("returnPath", returnPath);
     return reply
       .code(302)
