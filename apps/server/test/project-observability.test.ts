@@ -144,6 +144,8 @@ describe("project observability parsing and redaction", () => {
       message: "listening on 3000"
     });
     expect(parseRuntimeLogLine("not timestamped")).toBeNull();
+    expect(parseProjectStatsLine("observed|12.5%%|256MiB / 1GiB|1.5MB / 500kB|10MB / 2MB")?.stats.cpuUsagePercent)
+      .toBe(0);
   });
 
   it("redacts exact, multiline and short configured secret values", () => {

@@ -136,7 +136,8 @@ export function redactRuntimeLog(message: string, secretValues: string[]): strin
 export function parseProjectStatsLine(line: string): { name: string; stats: ContainerStats } | null {
   const [name = "", cpu = "", memory = "", network = "", block = ""] = line.split("|");
   if (!name) return null;
-  const cpuValue = Number.parseFloat(cpu.replace("%", "").replace(",", "."));
+  const cpuMatch = /^\s*([0-9]+(?:[.,][0-9]+)?)%\s*$/.exec(cpu);
+  const cpuValue = cpuMatch ? Number.parseFloat((cpuMatch[1] ?? "0").replaceAll(",", ".")) : Number.NaN;
   const [memoryUsedBytes, memoryLimitBytes] = parseBytePair(memory);
   const [networkReceivedBytes, networkTransmittedBytes] = parseBytePair(network);
   const [blockReadBytes, blockWriteBytes] = parseBytePair(block);
