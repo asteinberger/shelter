@@ -83,7 +83,12 @@ function uniqueAccessCookie(request: FastifyRequest): string | undefined {
 }
 
 function safeReturnPath(value: unknown): string {
-  if (typeof value !== "string" || value.length > 2_048 || !value.startsWith("/") || value.startsWith("//")) return "/";
+  if (
+    typeof value !== "string"
+    || value.length > 2_048
+    || !/^\/[^\\\u0000-\u001f\u007f]*$/.test(value)
+    || value.startsWith("//")
+  ) return "/";
   if (value.startsWith(SITE_ACCESS_PATH)) return "/";
   return value;
 }
@@ -179,16 +184,20 @@ export function registerSiteAccessRoutes(
   config: AppConfig,
   database: Database
 ): void {
-  app.get(`${SITE_ACCESS_PATH}/brand.png`, async (_request, reply) => {
-    const brandPath = path.join(config.WEB_DIST, "brand", "shelter-icon-64.png");
-    try {
-      const image = await fs.promises.readFile(brandPath);
-      reply.header("cache-control", "public, max-age=86400");
-      return reply.type("image/png").send(image);
-    } catch {
-      return reply.code(404).type("text/plain").send("Not found");
+  app.get(
+    `${SITE_ACCESS_PATH}/brand.png`,
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (_request, reply) => {
+      const brandPath = path.join(config.WEB_DIST, "brand", "shelter-icon-64.png");
+      try {
+        const image = await fs.promises.readFile(brandPath);
+        reply.header("cache-control", "public, max-age=86400");
+        return reply.type("image/png").send(image);
+      } catch {
+        return reply.code(404).type("text/plain").send("Not found");
+      }
     }
-  });
+  );
 
   app.get<{ Querystring: { domainId?: string } }>("/api/site-access/authorize", async (request, reply) => {
     reply.header("cache-control", "no-store");
@@ -228,7 +237,7 @@ export function registerSiteAccessRoutes(
       if (!requireMatchingDomainHost(request, reply, domain)) return;
       const returnPath = safeReturnPath(request.query.returnPath);
       if (validAccessToken(config, domain, uniqueAccessCookie(request))) {
-        return reply.redirect(returnPath);
+        return reply.code(303).header("location", returnPath).send();
       }
       const project = database.getProject(domain.project_id);
       return reply.type("text/html; charset=utf-8").send(

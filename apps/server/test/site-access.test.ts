@@ -228,6 +228,17 @@ describe("per-domain site access", () => {
       path: "/"
     });
 
+    const unsafeRedirect = await app.inject({
+      method: "GET",
+      url: "/_shelter/access/dom_site_access?returnPath=%2F%5C%5Cevil.example",
+      headers: {
+        host: "private.example.com",
+        cookie: `shelter_site_access=${accessCookie?.value ?? ""}`
+      }
+    });
+    expect(unsafeRedirect.statusCode).toBe(303);
+    expect(unsafeRedirect.headers.location).toBe("/");
+
     const authorized = await app.inject({
       method: "GET",
       url: "/api/site-access/authorize?domainId=dom_site_access",
