@@ -129,6 +129,20 @@ export function resolveUploadArchiveForDeployment(
   return project.source_archive;
 }
 
+export function startWorkerHeartbeat(
+  database: Pick<Database, "setSetting">,
+  intervalMs = 5_000
+): NodeJS.Timeout {
+  const heartbeat = (): void => {
+    database.setSetting("worker.heartbeat", new Date().toISOString());
+  };
+  heartbeat();
+  // Keep this timer referenced: the worker's top-level await needs a live
+  // handle while archive libraries briefly wait on callbacks that may not
+  // keep the Node.js process alive themselves.
+  return setInterval(heartbeat, intervalMs);
+}
+
 export class DeploymentWorker {
   private stopping = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -162,11 +176,7 @@ export class DeploymentWorker {
     await this.cleanupInactiveRuntimeContainers();
     this.database.reconcileGithubStatusOutbox();
     reconcileRouting(this.config, this.database);
-    this.database.setSetting("worker.heartbeat", new Date().toISOString());
-    this.heartbeatTimer = setInterval(() => {
-      this.database.setSetting("worker.heartbeat", new Date().toISOString());
-    }, 5_000);
-    this.heartbeatTimer.unref();
+    this.heartbeatTimer = startWorkerHeartbeat(this.database);
     this.metrics.start();
 
     try {
