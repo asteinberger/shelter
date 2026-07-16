@@ -602,6 +602,10 @@ export const api = {
     return request<GitHubManifestStartResult>('/api/settings/github/manifest/start', { method: 'POST' });
   },
 
+  startGitHubUpgradeManifest() {
+    return request<GitHubManifestStartResult>('/api/settings/github/manifest/upgrade/start', { method: 'POST' });
+  },
+
   disconnectGitHub() {
     return request<void>('/api/settings/github/connection', { method: 'DELETE' });
   },

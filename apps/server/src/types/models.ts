@@ -165,6 +165,41 @@ export interface GithubManifestFlowRow {
   created_at: string;
 }
 
+export interface GithubAppUpgradeFlowRow {
+  id: string;
+  manifest_state_hash: string;
+  manifest_browser_nonce_hash: string;
+  setup_state_hash: string;
+  setup_browser_nonce_hash: string | null;
+  user_id: string;
+  session_token_hash: string;
+  previous_app_id: string;
+  expected_owner_login: string;
+  expected_owner_type: "User" | "Organization";
+  candidate_app_id: string | null;
+  encrypted_candidate: string | null;
+  phase: "registering" | "converting" | "installing";
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GithubRetiredWebhookSourceRow {
+  app_id: string;
+  encrypted_webhook_secret: string;
+  previous_installation_id: string | null;
+  successor_installation_id: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GithubProjectBindingRow {
+  project_id: string;
+  installation_id: string;
+  repository_id: string;
+}
+
 export interface GithubPendingPushRow {
   project_id: string;
   delivery_id: string;

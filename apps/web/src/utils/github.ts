@@ -1,3 +1,5 @@
+import type { GitHubPreviewCapability } from '../types';
+
 function parseExactGithubUrl(value: string) {
   try {
     const url = new URL(value);
@@ -14,6 +16,23 @@ function parseExactGithubUrl(value: string) {
   } catch {
     return undefined;
   }
+}
+
+export type GitHubPreviewCapabilityStatus = 'ready' | 'update' | 'unavailable';
+
+export function githubPreviewCapabilityStatus(
+  capability?: Pick<GitHubPreviewCapability, 'ready' | 'upgradePending'> | null,
+): GitHubPreviewCapabilityStatus {
+  if (capability?.upgradePending) return 'update';
+  if (capability?.ready === true) return 'ready';
+  if (capability?.ready === false) return 'update';
+  return 'unavailable';
+}
+
+export function shouldRefetchGitHubPreviewCapability(
+  capability?: Pick<GitHubPreviewCapability, 'ready' | 'upgradePending'> | null,
+) {
+  return capability?.ready === false || Boolean(capability?.upgradePending);
 }
 
 export interface GitHubProjectDraftState {
@@ -44,7 +63,14 @@ export function shouldSynchronizeGitHubProjectDraft({
 
 export function trustedGitHubManifestRegistrationUrl(value: string) {
   const url = parseExactGithubUrl(value);
-  if (!url || url.pathname !== '/settings/apps/new') return undefined;
+  const owner = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?';
+  if (
+    !url
+    || (
+      url.pathname !== '/settings/apps/new'
+      && !new RegExp(`^/organizations/${owner}/settings/apps/new$`).test(url.pathname)
+    )
+  ) return undefined;
   const states = url.searchParams.getAll('state');
   const state = states[0];
   const keys = Array.from(url.searchParams.keys());
@@ -66,6 +92,17 @@ export function trustedGitHubAppUrl(value?: string | null) {
     !url
     || url.search
     || !/^\/apps\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?(?:\/installations\/new)?\/?$/.test(url.pathname)
+  ) return undefined;
+  return url.toString();
+}
+
+export function trustedGitHubAppInstallationUrl(value?: string | null) {
+  if (!value) return undefined;
+  const url = parseExactGithubUrl(value);
+  if (
+    !url
+    || url.search
+    || !/^\/apps\/[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?\/installations\/new$/.test(url.pathname)
   ) return undefined;
   return url.toString();
 }

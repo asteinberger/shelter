@@ -44,7 +44,8 @@ publishing it.
 - Only the worker may receive the Docker socket. The API, Traefik, and `cloudflared` must never mount it.
 - Traefik uses the file provider. Project containers must not expose public host ports.
 - Never overwrite or delete Cloudflare DNS records blindly. Verify ownership, zone, hostname collisions, and the current target first.
-- The GitHub App requests only permissions it actually needs. `installation` and `installation_repositories` are implicit GitHub App events; only `push` is used as a configurable default event.
+- The GitHub App requests only permissions it actually needs. `installation` and `installation_repositories` are implicit GitHub App events and must not be listed in the manifest; `push` and `pull_request` are the configurable default events.
+- Treat a manifest-based GitHub App upgrade as credential rotation, not an in-place update. Stage and verify the replacement without disturbing the active App or project links, switch only after installation checks pass, and never imply that Shelter can delete the old App registration on GitHub.
 - Do not bypass OAuth `state`, CSRF protection, session binding, or redirect-URI validation.
 - Keep upload and archive handling protected against path traversal, symlinks, device files, size abuse, and decompression abuse.
 - Keep project analysis advisory and bounded. Read only allowlisted manifests, never read real `.env` contents, ignore generated dependency/output trees, and revalidate source on the worker before building.

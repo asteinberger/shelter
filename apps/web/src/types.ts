@@ -151,6 +151,9 @@ export interface GitHubPreviewCapability {
   installationSuspended?: boolean;
   remediation: 'none' | 'configure_app' | 'update_existing_app' | 'approve_installation_update';
   remediationUrl?: string | null;
+  upgradePending: boolean;
+  upgradeInstallUrl: string | null;
+  upgradeExpiresAt: string | null;
 }
 
 export interface GitHubRepository {
@@ -621,9 +624,11 @@ export interface UpdateProjectGitHubInput {
   autoDeploy: boolean;
 }
 
+export type GitHubManifestPayload = string | Record<string, unknown>;
+
 export interface GitHubManifestStartResult {
   registrationUrl: string;
-  manifest: string | Record<string, unknown>;
+  manifest: GitHubManifestPayload;
 }
 
 export interface UploadProgress {
