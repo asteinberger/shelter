@@ -29,6 +29,7 @@ import { toast } from 'sonner';
 import { api } from '../api/client';
 import { NavigationGuard } from '../components/NavigationGuard';
 import { ProjectGitHubConnection } from '../components/ProjectGitHubConnection';
+import { ProjectPullRequestPreviews } from '../components/ProjectPullRequestPreviews';
 import { ProjectPreviewCard } from '../components/ProjectPreviewCard';
 import { ProjectObservabilityTab } from '../components/ProjectObservabilityTab';
 import { StaticBasePathControl } from '../components/StaticBasePathControl';
@@ -89,7 +90,14 @@ import {
 import { BRAND_NAME } from '../lib/brand';
 import { localize, useI18n } from '@/i18n';
 
-type ProjectTab = 'overview' | 'observability' | 'deployments' | 'domains' | 'environment' | 'settings';
+type ProjectTab =
+  | 'overview'
+  | 'observability'
+  | 'deployments'
+  | 'previews'
+  | 'domains'
+  | 'environment'
+  | 'settings';
 
 type ProjectBuildType = 'auto' | 'dockerfile' | 'node' | 'static';
 
@@ -107,7 +115,15 @@ interface ProjectSettingsDraft {
   cpuLimit: string;
 }
 
-const projectTabs: ProjectTab[] = ['overview', 'observability', 'deployments', 'domains', 'environment', 'settings'];
+const projectTabs: ProjectTab[] = [
+  'overview',
+  'observability',
+  'deployments',
+  'previews',
+  'domains',
+  'environment',
+  'settings',
+];
 const reservedEnvironmentKeys = new Set(['PORT', 'HOSTNAME', 'NODE_ENV']);
 const MAX_ENVIRONMENT_VARIABLES = 200;
 const MAX_ENVIRONMENT_KEY_LENGTH = 100;
@@ -269,6 +285,7 @@ export function ProjectPage() {
   const [environmentRemovalIndex, setEnvironmentRemovalIndex] = useState<number>();
   const [environment, setEnvironment] = useState<EnvironmentVariable[]>([]);
   const [githubSettingsDirty, setGithubSettingsDirty] = useState(false);
+  const [previewSettingsDirty, setPreviewSettingsDirty] = useState(false);
   const [settings, setSettings] = useState<ProjectSettingsDraft>({
     name: '',
     repositoryUrl: '',
@@ -392,6 +409,12 @@ export function ProjectPage() {
       setActiveTab('settings', true);
     }
   }, [deletionFailed, setActiveTab]);
+
+  useEffect(() => {
+    if (project && activeTab === 'previews' && (project.sourceType !== 'git' || fileStorage)) {
+      setActiveTab('overview', true);
+    }
+  }, [activeTab, fileStorage, project, setActiveTab]);
 
   useEffect(() => {
     if (zones.length === 0) {
@@ -618,14 +641,14 @@ export function ProjectPage() {
   ) : false;
 
   useEffect(() => {
-    if (!environmentDirty && !settingsDirty && !githubSettingsDirty) return undefined;
+    if (!environmentDirty && !settingsDirty && !githubSettingsDirty && !previewSettingsDirty) return undefined;
     const preventNavigation = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = '';
     };
     window.addEventListener('beforeunload', preventNavigation);
     return () => window.removeEventListener('beforeunload', preventNavigation);
-  }, [environmentDirty, githubSettingsDirty, settingsDirty]);
+  }, [environmentDirty, githubSettingsDirty, previewSettingsDirty, settingsDirty]);
 
   const checkedAvailability = (
     debouncedHostname === candidateHostname
@@ -732,6 +755,7 @@ export function ProjectPage() {
     { id: 'overview', label: t('Overview', 'Übersicht') },
     { id: 'observability', label: 'Observability' },
     { id: 'deployments', label: fileStorage ? t('Versions', 'Versionen') : 'Deployments', count: deployments.length },
+    ...(!fileStorage && project.sourceType === 'git' ? [{ id: 'previews' as const, label: t('Previews', 'Previews') }] : []),
     { id: 'domains', label: 'Domains', count: project.domains?.length ?? 0 },
     { id: 'environment', label: t('Environment', 'Umgebung'), count: project.environmentKeys?.length ?? 0 },
     { id: 'settings', label: t('Settings', 'Einstellungen') },
@@ -739,14 +763,16 @@ export function ProjectPage() {
   return (
     <div className="grid min-w-0 gap-6 sm:gap-7">
       <NavigationGuard
-        when={environmentDirty || settingsDirty || githubSettingsDirty}
+        when={environmentDirty || settingsDirty || githubSettingsDirty || previewSettingsDirty}
         title={t('Unsaved changes', 'Ungespeicherte Änderungen')}
-        description={[environmentDirty, settingsDirty, githubSettingsDirty].filter(Boolean).length > 1
+        description={[environmentDirty, settingsDirty, githubSettingsDirty, previewSettingsDirty].filter(Boolean).length > 1
           ? t('Leaving now will discard your unsaved changes to this project.', 'Beim Verlassen gehen deine noch nicht gespeicherten Änderungen an diesem Projekt verloren.')
           : environmentDirty
             ? t('Leaving now will discard your unsaved environment variables.', 'Beim Verlassen gehen deine noch nicht gespeicherten Umgebungsvariablen verloren.')
             : githubSettingsDirty
               ? t('Leaving now will discard your changes to the GitHub branch or auto-deploy setting.', 'Beim Verlassen gehen deine Änderungen an GitHub-Branch oder Auto-Deploy verloren.')
+              : previewSettingsDirty
+                ? t('Leaving now will discard your unsaved preview settings.', 'Beim Verlassen gehen deine noch nicht gespeicherten Preview-Einstellungen verloren.')
               : t('Leaving now will discard your unsaved project configuration.', 'Beim Verlassen geht deine noch nicht gespeicherte Projektkonfiguration verloren.')}
       />
 
@@ -1121,6 +1147,20 @@ export function ProjectPage() {
             </Card>
           </motion.section>
         </TabsContent>
+
+        {!fileStorage && project.sourceType === 'git' && (
+          <TabsContent value="previews" forceMount className="grid min-w-0 gap-5 data-[state=inactive]:hidden">
+            <motion.section className="grid min-w-0 gap-5" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }}>
+              <ProjectPullRequestPreviews
+                project={project}
+                active={activeTab === 'previews'}
+                highlightedPreviewId={searchParams.get('preview')}
+                onDirtyChange={setPreviewSettingsDirty}
+                onProjectChanged={invalidateProject}
+              />
+            </motion.section>
+          </TabsContent>
+        )}
 
         <TabsContent value="domains">
           <motion.section className="grid gap-5" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }}>
