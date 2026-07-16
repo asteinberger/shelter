@@ -36,6 +36,7 @@ function preview(overrides: Partial<PullRequestPreview> = {}): PullRequestPrevie
     baseRef: 'main',
     generation: 1,
     deploymentId: 'dep_123',
+    activeDeploymentId: 'dep_123',
     hostname: 'pr-42--shelter.example.com',
     url: 'https://pr-42--shelter.example.com',
     status: 'ready',
@@ -57,9 +58,12 @@ describe('pull request preview helpers', () => {
     expect(isTransitionalPullRequestPreview('failed')).toBe(false);
   });
 
-  it('only builds HTTPS links for ready previews with a valid hostname', () => {
+  it('only builds HTTPS links for active previews with a valid hostname', () => {
     expect(trustedPullRequestPreviewUrl(preview())).toBe('https://pr-42--shelter.example.com');
-    expect(trustedPullRequestPreviewUrl(preview({ status: 'building' }))).toBeUndefined();
+    expect(trustedPullRequestPreviewUrl(preview({ status: 'building' }))).toBe('https://pr-42--shelter.example.com');
+    expect(trustedPullRequestPreviewUrl(preview({ status: 'building', activeDeploymentId: null }))).toBeUndefined();
+    expect(trustedPullRequestPreviewUrl(preview({ status: 'failed' }))).toBe('https://pr-42--shelter.example.com');
+    expect(trustedPullRequestPreviewUrl(preview({ status: 'closing' }))).toBeUndefined();
     expect(trustedPullRequestPreviewUrl(preview({ hostname: 'javascript:alert(1)' }))).toBeUndefined();
     expect(trustedPullRequestPreviewUrl(preview({ hostname: 'a..example.com' }))).toBeUndefined();
   });
@@ -108,7 +112,7 @@ describe('PullRequestPreviewList', () => {
     expect(html).not.toContain('<img');
   });
 
-  it('localizes rebuilding and failure states and never links a non-ready hostname', () => {
+  it('keeps the last successful preview linked while a rebuild is running', () => {
     const html = render(<PullRequestPreviewList
       projectId="prj_123"
       previews={[preview({ status: 'building', generation: 3, error: 'Build fehlgeschlagen' })]}
@@ -118,7 +122,7 @@ describe('PullRequestPreviewList', () => {
     expect(html).toContain('Build läuft');
     expect(html).toContain('Neu-Build 3');
     expect(html).toContain('Build fehlgeschlagen');
-    expect(html).not.toContain('href="https://pr-42--shelter.example.com"');
+    expect(html).toContain('href="https://pr-42--shelter.example.com"');
   });
 
   it('explains the hard max-three state before another pull request is opened', () => {

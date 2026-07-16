@@ -279,6 +279,7 @@ export interface PullRequestPreview {
   baseRef: string;
   generation: number;
   deploymentId: string | null;
+  activeDeploymentId: string | null;
   hostname: string;
   url: string | null;
   status: PullRequestPreviewStatus;
@@ -300,7 +301,6 @@ export interface PullRequestPreviewSettings {
 
 export interface PullRequestPreviewsResponse {
   settings: PullRequestPreviewSettings;
-  previewCapability: GitHubPreviewCapability;
   environmentKeys: string[];
   previews: PullRequestPreview[];
 }

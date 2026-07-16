@@ -544,9 +544,12 @@ export const api = {
     ));
   },
 
-  async githubPreviewCapability() {
+  async githubPreviewCapability(installationId?: string | number) {
+    const query = installationId === undefined
+      ? ''
+      : `?installationId=${encodeURIComponent(String(installationId))}`;
     const payload = await request<{ previewCapability: GitHubPreviewCapability }>(
-      '/api/settings/github/preview-capability',
+      `/api/settings/github/preview-capability${query}`,
     );
     return payload.previewCapability;
   },

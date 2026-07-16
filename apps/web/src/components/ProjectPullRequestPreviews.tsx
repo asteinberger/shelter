@@ -63,8 +63,8 @@ export function isTransitionalPullRequestPreview(status: PullRequestPreviewStatu
   return transitionalPreviewStates.has(status);
 }
 
-export function trustedPullRequestPreviewUrl(preview: Pick<PullRequestPreview, 'hostname' | 'status'>) {
-  if (preview.status !== 'ready') return undefined;
+export function trustedPullRequestPreviewUrl(preview: Pick<PullRequestPreview, 'hostname' | 'status' | 'activeDeploymentId'>) {
+  if (!preview.activeDeploymentId || ['closing', 'closed', 'blocked'].includes(preview.status)) return undefined;
   const hostname = preview.hostname.trim().toLowerCase();
   const validLabels = hostname.split('.').every((label) => (
     label.length > 0
@@ -251,7 +251,9 @@ export function PullRequestPreviewList({
   onClose: (preview: PullRequestPreview) => void;
 }) {
   const { t, locale } = useI18n();
-  const activeCount = previews.filter((preview) => activePreviewStates.has(preview.status)).length;
+  const activeCount = previews.filter((preview) => (
+    Boolean(preview.activeDeploymentId) || activePreviewStates.has(preview.status)
+  )).length;
   if (previews.length === 0) {
     return (
       <Empty className="min-h-64 border-0">
@@ -310,7 +312,12 @@ export function PullRequestPreviewList({
                     <div><dt className="sr-only">{t('Expires', 'Läuft ab')}</dt><dd>{preview.status === 'closed' ? t('Closed {time}', 'Geschlossen {time}', { time: formatRelative(preview.closedAt ?? preview.updatedAt, locale) }) : <time dateTime={preview.expiresAt} title={formatDate(preview.expiresAt, locale)}>{t('Expires {time}', 'Läuft {time} ab', { time: formatRelative(preview.expiresAt, locale) })}</time>}</dd></div>
                   </dl>
                   {(preview.error || preview.status === 'failed' || preview.status === 'blocked') && (
-                    <p className="mt-3 rounded-md bg-destructive/8 px-3 py-2 text-xs leading-relaxed text-destructive" role="alert">{preview.error ?? t('The preview could not be created.', 'Die Preview konnte nicht erstellt werden.')}</p>
+                    <div className="mt-3 rounded-md bg-destructive/8 px-3 py-2 text-xs leading-relaxed text-destructive" role="alert">
+                      <p>{preview.error ?? t('The preview could not be created.', 'Die Preview konnte nicht erstellt werden.')}</p>
+                      {preview.activeDeploymentId && preview.status === 'failed' && (
+                        <p className="mt-1 text-muted-foreground">{t('The last successful preview stays online.', 'Die letzte erfolgreiche Preview bleibt online.')}</p>
+                      )}
+                    </div>
                   )}
                   {url && (
                     <a className="mt-3 block truncate font-mono text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" href={url} target="_blank" rel="noreferrer">{preview.hostname}</a>
@@ -369,8 +376,18 @@ export function ProjectPullRequestPreviews({
       ? false
       : query.state.data?.previews.some((preview) => isTransitionalPullRequestPreview(preview.status)) ? 3_000 : 15_000,
   });
+  const githubInstallationId = project.github?.installationId ?? project.githubInstallationId;
+  const capabilityQuery = useQuery({
+    queryKey: ['github-preview-capability', githubInstallationId],
+    queryFn: () => api.githubPreviewCapability(githubInstallationId!),
+    enabled: active && githubInstallationId !== undefined && githubInstallationId !== null,
+    retry: false,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnWindowFocus: false,
+  });
   const data = previewsQuery.data;
-  const capability = data?.previewCapability;
+  const capability = capabilityQuery.data;
   const activeDomains = (project.domains ?? []).filter((domain) => domain.status === 'active');
   const savedSettings = data?.settings;
   const savedEnvironmentKeys = data?.environmentKeys ?? [];
@@ -545,7 +562,7 @@ export function ProjectPullRequestPreviews({
           </div>
         </CardHeader>
         <CardContent className="grid gap-5">
-          <PreviewCapability capability={capability} refreshing={previewsQuery.isFetching} onRetry={() => previewsQuery.refetch()} />
+          <PreviewCapability capability={capability} refreshing={capabilityQuery.isFetching} onRetry={() => capabilityQuery.refetch()} />
 
           {!project.github && (
             <Alert>
