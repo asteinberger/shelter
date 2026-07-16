@@ -15,6 +15,7 @@ export interface CommandOptions {
   allowFailure?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  maxOutputChars?: number;
 }
 
 export class CommandTimeoutError extends Error {
@@ -53,6 +54,7 @@ export async function runCommand(command: string, args: string[], options: Comma
     let stderr = "";
     let timedOut = false;
     let aborted = false;
+    const maxOutputChars = options.maxOutputChars ?? 1_000_000;
     let forceKillTimer: NodeJS.Timeout | undefined;
     const terminate = (signal: NodeJS.Signals): void => {
       try {
@@ -89,11 +91,11 @@ export async function runCommand(command: string, args: string[], options: Comma
     const stdoutReader = readline.createInterface({ input: child.stdout });
     const stderrReader = readline.createInterface({ input: child.stderr });
     stdoutReader.on("line", (line) => {
-      stdout = `${stdout}${line}\n`.slice(-1_000_000);
+      stdout = `${stdout}${line}\n`.slice(-(maxOutputChars + 1));
       options.onStdout?.(line);
     });
     stderrReader.on("line", (line) => {
-      stderr = `${stderr}${line}\n`.slice(-1_000_000);
+      stderr = `${stderr}${line}\n`.slice(-(maxOutputChars + 1));
       options.onStderr?.(line);
     });
     child.once("error", (error) => {

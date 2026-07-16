@@ -43,7 +43,6 @@ function labelsFromRunArgs(args: string[]): Record<string, string> {
 
 function createOwnedHelperCommand(options: {
   runResult?: { stdout: string; stderr: string; exitCode: number };
-  onCopy?: () => void | Promise<void>;
 } = {}) {
   const containers = new Map<string, { id: string; labels: Record<string, string> }>();
   const containerIds = new Map<string, string>();
@@ -76,10 +75,6 @@ function createOwnedHelperCommand(options: {
       removedNames.push(name);
       containers.delete(name);
       return { stdout: name, stderr: "", exitCode: 0 };
-    }
-    if (args[0] === "cp") {
-      await options.onCopy?.();
-      return { stdout: "", stderr: "", exitCode: 0 };
     }
     throw new Error(`Unexpected docker command: ${args.join(" ")}`);
   });
@@ -193,14 +188,13 @@ describe("isolated project runtime helpers", () => {
     expect(target).not.toContain("%3F");
   });
 
-  it("captures a bounded PNG through docker cp without mounting host data", async () => {
+  it("captures a bounded PNG through stdout without mounting host data", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "shelter-helper-preview-"));
     directories.push(directory);
     const outputPath = path.join(directory, "preview.png");
     const controller = new AbortController();
     const harness = createOwnedHelperCommand({
-      runResult: { stdout: "", stderr: "", exitCode: 0 },
-      onCopy: () => fs.promises.writeFile(outputPath, PNG)
+      runResult: { stdout: PNG.toString("base64"), stderr: "", exitCode: 0 }
     });
 
     await expect(captureProjectContainerPreview({
@@ -213,12 +207,22 @@ describe("isolated project runtime helpers", () => {
     expect(runArgs).toEqual(expect.arrayContaining([
       "--network", input().networkName,
       "--read-only",
+      "--env", "HOME=/tmp",
+      "--env", "XDG_CONFIG_HOME=/tmp",
+      "--env", "XDG_CACHE_HOME=/tmp",
       "--memory", "512m",
       "--pids-limit", "256"
     ]));
+    const previewScript = runArgs[runArgs.indexOf("-e") + 1] ?? "";
+    expect(previewScript).toContain('"--disable-crash-reporter"');
+    expect(previewScript).toContain('"--disable-breakpad"');
     expect(runArgs.some((value) => value.includes(`${directory}:`))).toBe(false);
-    const copyCall = harness.command.mock.calls.find(([, args]) => args[0] === "cp");
-    expect(copyCall?.[2]).toMatchObject({ allowFailure: true, signal: controller.signal });
+    expect(harness.command.mock.calls.some(([, args]) => args[0] === "cp")).toBe(false);
+    expect(harness.command.mock.calls[0]?.[2]).toMatchObject({
+      allowFailure: true,
+      signal: controller.signal,
+      maxOutputChars: expect.any(Number)
+    });
     expect(fs.readFileSync(outputPath)).toEqual(PNG);
   });
 
