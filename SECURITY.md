@@ -32,7 +32,7 @@ Never send real administrator passwords, session cookies, CSRF tokens, `APP_SECR
 - GitHub App private key, webhook secret, and short-lived installation tokens,
 - short-lived OAuth values such as `state`, PKCE verifier, callback nonce, and pending account selection,
 - project environment variables,
-- source archives, Git contents, build logs, and generated images,
+- source archives, Git contents, build/deployment/runtime logs, and generated images,
 - SQLite database, DNS mappings, and Traefik routes.
 
 ### Trust boundaries
@@ -73,7 +73,7 @@ Shelter does not protect against:
 ### Control plane
 
 - API and worker run separately; only the worker mounts the Docker socket.
-- Server metrics are collected in the worker and reduced to bounded numeric snapshots in SQLite. The API reads those snapshots and never receives Docker access.
+- Host and per-project metrics are collected in the worker and reduced to bounded numeric snapshots in SQLite. Runtime output from the active deployment is also collected and bounded there. The session-only API reads those records and never receives Docker access.
 - Docker stats cover only containers with Shelter or legacy Portsmith management labels; raw inspect output, container IDs, names, labels, and environment values are not persisted or returned.
 - Control-plane containers use a read-only root filesystem, `no-new-privileges`, and no Linux capabilities.
 - The host publishes the panel only on `127.0.0.1`.
@@ -129,6 +129,7 @@ Cloudflare Access is not configured or verified automatically. Shelter exposes a
 - Automatic presets also use a non-secret per-deployment cache key so the secret-dependent build step cannot be incorrectly reused from an older cache. Custom Dockerfiles with project variables build without cache because their secret dependencies are unknown.
 - A candidate container must pass an HTTP health check from a disposable bounded helper on its own project network before activation.
 - Runtime containers receive memory, CPU, and PID limits, `no-new-privileges`, no Linux capabilities, and bounded local Docker logs.
+- Project observability accepts only Shelter-owned containers whose project/deployment labels match the current active deployment in SQLite. Worker collection has command and overall deadlines. Stored runtime output is limited by age and line count, returned only to an administrator session, and kept separate from deployment logs.
 - Website previews are captured by a separate disposable bounded helper on the project's network. Health and preview helpers have no Docker socket or host mount and are removed after ownership verification. The API returns a preview only to an authenticated administrator and accepts no caller-controlled capture target.
 
 These controls reduce accidental damage. They do not make build or runtime safe for untrusted tenants: all projects still share one kernel and Docker daemon, and the trusted worker retains host-equivalent Docker access. Build limits bound the dedicated BuildKit container and supported per-build execution, but they are not a hostile-code sandbox. BuildKit's cache target and minimum-free-space policy are garbage-collection guardrails, not a hard storage quota for a single in-progress build. Docker also does not provide Shelter with a portable per-container writable-layer quota, so a malicious build or runtime can still consume host storage until host-level storage limits intervene. A correctly used BuildKit secret mount does not automatically persist in an image layer, but a build script or custom Dockerfile can still print, copy, or embed its value.
@@ -192,13 +193,13 @@ The tunnel token is stored as `/tunnel/tunnel-token` in the separate `shelter-tu
 
 Saved values are never returned to the browser. The worker decrypts them for build and container startup. Generated Dockerfiles receive them during the actual build command through the BuildKit secret mount `/run/secrets/shelter_env` and use a non-secret cache key to force re-execution. A custom Dockerfile may use the same optional JSON mount; when variables exist, the build runs without cache. At runtime the values are Docker environment variables and are visible to host root, Docker administrators, and container inspection.
 
-Correct BuildKit usage does not automatically persist secrets in image layers, but build code is part of the trust boundary and can print secrets or embed them in files and client bundles. `NEXT_PUBLIC_*` and similar public variables are explicitly intended for visible client code and must not contain confidential values. Running applications can also read their variables and send them to logs or external systems.
+Correct BuildKit usage does not automatically persist secrets in image layers, but build code is part of the trust boundary and can print secrets or embed them in files and client bundles. `NEXT_PUBLIC_*` and similar public variables are explicitly intended for visible client code and must not contain confidential values. Running applications can also read their variables and send them to logs or external systems. Before persisting runtime output, Shelter replaces exact configured environment values (including multiline fragments) with a redaction marker. This cannot recognize derived, encoded, split, or reformatted values and does not make application output non-sensitive.
 
-Provide only necessary secrets, use separate credentials per project, rotate them regularly, and redact deployment logs before export.
+Provide only necessary secrets, use separate credentials per project, rotate them regularly, and review deployment and runtime logs before export.
 
 ### Backups
 
-A complete backup of `.env`, `shelter-data`, `shelter-routing`, and `shelter-tunnel` contains the full control-plane state and keys, including OAuth client secret, possible proxy credentials, decryptable access/refresh/API tokens, connector token, source archives, project previews, and decryptable project variables. Screenshots may contain confidential content shown on an application's homepage. Backups must be:
+A complete backup of `.env`, `shelter-data`, `shelter-routing`, and `shelter-tunnel` contains the full control-plane state and keys, including OAuth client secret, possible proxy credentials, decryptable access/refresh/API tokens, connector token, source archives, project previews, runtime output, and decryptable project variables. Screenshots and logs may contain confidential application content. Backups must be:
 
 - encrypted in storage and transit,
 - protected with restrictive file permissions,

@@ -14,6 +14,7 @@ import { registerApiTokenRoutes } from "./routes/api-tokens.js";
 import { registerOpenApiRoutes } from "./routes/openapi.js";
 import { registerGithubRoutes } from "./routes/github.js";
 import { registerProjectRoutes } from "./routes/projects.js";
+import { registerProjectObservabilityRoutes } from "./routes/project-observability.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerServerMetricsRoutes } from "./routes/server-metrics.js";
 import { bootstrapAdmin, installAuthHook, registerAuthRoutes } from "./services/auth.js";
@@ -75,6 +76,7 @@ export async function createApp(config: AppConfig, database = new Database(confi
   registerApiTokenRoutes(app, database);
   registerUploadRoutes(app, uploads);
   registerProjectRoutes(app, config, database, uploads, cloudflare, github);
+  registerProjectObservabilityRoutes(app, config, database);
   registerDeploymentRoutes(app, database);
   registerSettingsRoutes(app, cloudflare);
   registerGithubRoutes(app, github);

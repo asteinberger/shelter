@@ -13,8 +13,11 @@ import type {
   ApiTokenMetadataRow,
   GithubManifestFlowRow,
   GithubPendingPushRow,
+  ProjectMetricHistoryRow,
+  ProjectMetricSampleRow,
   ProjectDeletionRow,
   ProjectRow,
+  RuntimeLogRow,
   ServerActivityCounts,
   ServerMetricHistoryRow,
   ServerMetricSampleRow,
@@ -158,6 +161,45 @@ CREATE TABLE IF NOT EXISTS server_metric_samples (
   last_storage_maintenance_at TEXT,
   tunnel_configured INTEGER NOT NULL CHECK(tunnel_configured IN (0, 1))
 );
+
+CREATE TABLE IF NOT EXISTS project_metric_samples (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+  sampled_at INTEGER NOT NULL,
+  runtime_status TEXT NOT NULL CHECK(runtime_status IN ('created','running','paused','restarting','removing','exited','dead','missing','unknown')),
+  health_status TEXT NOT NULL CHECK(health_status IN ('healthy','unhealthy','starting','none','unknown')),
+  started_at TEXT,
+  uptime_seconds INTEGER NOT NULL CHECK(uptime_seconds >= 0),
+  restart_count INTEGER NOT NULL CHECK(restart_count >= 0),
+  oom_killed INTEGER NOT NULL CHECK(oom_killed IN (0, 1)),
+  cpu_usage_percent REAL NOT NULL CHECK(cpu_usage_percent >= 0),
+  cpu_limit_cores REAL NOT NULL CHECK(cpu_limit_cores > 0),
+  memory_used_bytes INTEGER NOT NULL CHECK(memory_used_bytes >= 0),
+  memory_limit_bytes INTEGER NOT NULL CHECK(memory_limit_bytes >= 0),
+  memory_usage_percent REAL NOT NULL CHECK(memory_usage_percent BETWEEN 0 AND 100),
+  network_received_bytes INTEGER NOT NULL CHECK(network_received_bytes >= 0),
+  network_transmitted_bytes INTEGER NOT NULL CHECK(network_transmitted_bytes >= 0),
+  network_receive_bytes_per_second REAL NOT NULL CHECK(network_receive_bytes_per_second >= 0),
+  network_transmit_bytes_per_second REAL NOT NULL CHECK(network_transmit_bytes_per_second >= 0),
+  block_read_bytes INTEGER NOT NULL CHECK(block_read_bytes >= 0),
+  block_write_bytes INTEGER NOT NULL CHECK(block_write_bytes >= 0),
+  PRIMARY KEY(project_id, sampled_at)
+);
+CREATE INDEX IF NOT EXISTS project_metric_samples_history_idx
+  ON project_metric_samples(project_id, sampled_at DESC);
+
+CREATE TABLE IF NOT EXISTS runtime_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+  stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+  message TEXT NOT NULL CHECK(length(message) BETWEEN 1 AND 4096),
+  source_timestamp TEXT NOT NULL,
+  collected_at TEXT NOT NULL,
+  UNIQUE(deployment_id, stream, source_timestamp, message)
+);
+CREATE INDEX IF NOT EXISTS runtime_logs_project_cursor_idx ON runtime_logs(project_id, id);
+CREATE INDEX IF NOT EXISTS runtime_logs_project_time_idx ON runtime_logs(project_id, source_timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
@@ -2480,6 +2522,161 @@ export class Database {
           SELECT sampled_at FROM server_metric_samples ORDER BY sampled_at DESC LIMIT ?
         )
       `).run(boundedLimit);
+    })();
+  }
+
+  insertProjectMetricSample(sample: ProjectMetricSampleRow): void {
+    this.sqlite.prepare(`
+      INSERT OR REPLACE INTO project_metric_samples (
+        project_id, deployment_id, sampled_at, runtime_status, health_status,
+        started_at, uptime_seconds, restart_count, oom_killed,
+        cpu_usage_percent, cpu_limit_cores,
+        memory_used_bytes, memory_limit_bytes, memory_usage_percent,
+        network_received_bytes, network_transmitted_bytes,
+        network_receive_bytes_per_second, network_transmit_bytes_per_second,
+        block_read_bytes, block_write_bytes
+      ) VALUES (
+        @project_id, @deployment_id, @sampled_at, @runtime_status, @health_status,
+        @started_at, @uptime_seconds, @restart_count, @oom_killed,
+        @cpu_usage_percent, @cpu_limit_cores,
+        @memory_used_bytes, @memory_limit_bytes, @memory_usage_percent,
+        @network_received_bytes, @network_transmitted_bytes,
+        @network_receive_bytes_per_second, @network_transmit_bytes_per_second,
+        @block_read_bytes, @block_write_bytes
+      )
+    `).run(sample);
+  }
+
+  latestProjectMetricSample(projectId: string): ProjectMetricSampleRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT * FROM project_metric_samples WHERE project_id = ? ORDER BY sampled_at DESC LIMIT 1
+    `).get(projectId) as ProjectMetricSampleRow | undefined;
+  }
+
+  listProjectMetricHistory(
+    projectId: string,
+    from: number,
+    to: number,
+    maxPoints = 180
+  ): ProjectMetricHistoryRow[] {
+    const boundedPoints = Math.max(1, Math.min(180, Math.trunc(maxPoints)));
+    const span = Math.max(1, Math.trunc(to) - Math.trunc(from));
+    const bucketSize = Math.max(1, Math.ceil(span / boundedPoints));
+    const bucketOrigin = Math.trunc(from) + 1;
+    return this.sqlite.prepare(`
+      WITH bucketed AS (
+        SELECT
+          CAST((sampled_at - @bucket_origin) / @bucket_size AS INTEGER) AS bucket,
+          sampled_at,
+          cpu_usage_percent,
+          memory_used_bytes,
+          memory_limit_bytes,
+          memory_usage_percent,
+          network_receive_bytes_per_second,
+          network_transmit_bytes_per_second,
+          block_read_bytes,
+          block_write_bytes
+        FROM project_metric_samples
+        WHERE project_id = @project_id AND sampled_at > @from AND sampled_at <= @to
+      )
+      SELECT
+        MAX(sampled_at) AS sampled_at,
+        AVG(cpu_usage_percent) AS cpu_usage_percent,
+        AVG(memory_used_bytes) AS memory_used_bytes,
+        AVG(memory_limit_bytes) AS memory_limit_bytes,
+        AVG(memory_usage_percent) AS memory_usage_percent,
+        AVG(network_receive_bytes_per_second) AS network_receive_bytes_per_second,
+        AVG(network_transmit_bytes_per_second) AS network_transmit_bytes_per_second,
+        MAX(block_read_bytes) AS block_read_bytes,
+        MAX(block_write_bytes) AS block_write_bytes
+      FROM bucketed
+      GROUP BY bucket
+      ORDER BY bucket ASC
+      LIMIT @max_points
+    `).all({
+      project_id: projectId,
+      bucket_origin: bucketOrigin,
+      bucket_size: bucketSize,
+      from: Math.trunc(from),
+      to: Math.trunc(to),
+      max_points: boundedPoints
+    }) as ProjectMetricHistoryRow[];
+  }
+
+  insertRuntimeLogs(rows: Array<Omit<RuntimeLogRow, "id">>): number {
+    if (rows.length === 0) return 0;
+    const insert = this.sqlite.prepare(`
+      INSERT OR IGNORE INTO runtime_logs (
+        project_id, deployment_id, stream, message, source_timestamp, collected_at
+      ) VALUES (
+        @project_id, @deployment_id, @stream, @message, @source_timestamp, @collected_at
+      )
+    `);
+    const persist = this.sqlite.transaction((entries: Array<Omit<RuntimeLogRow, "id">>) => {
+      let inserted = 0;
+      for (const row of entries.slice(0, 1_000)) inserted += insert.run(row).changes;
+      return inserted;
+    });
+    return persist.immediate(rows);
+  }
+
+  latestRuntimeLogTimestamp(deploymentId: string): string | undefined {
+    const row = this.sqlite.prepare(`
+      SELECT source_timestamp FROM runtime_logs
+      WHERE deployment_id = ?
+      ORDER BY source_timestamp DESC, id DESC LIMIT 1
+    `).get(deploymentId) as { source_timestamp: string } | undefined;
+    return row?.source_timestamp;
+  }
+
+  listRuntimeLogs(projectId: string, deploymentId: string, after = 0, limit = 500): RuntimeLogRow[] {
+    const boundedAfter = Math.max(0, Math.trunc(after));
+    const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.sqlite.prepare(`
+      SELECT * FROM runtime_logs
+      WHERE project_id = ? AND deployment_id = ? AND id > ?
+      ORDER BY id ASC LIMIT ?
+    `).all(projectId, deploymentId, boundedAfter, boundedLimit) as RuntimeLogRow[];
+  }
+
+  latestRuntimeLogs(projectId: string, deploymentId: string, limit = 500): RuntimeLogRow[] {
+    const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.sqlite.prepare(`
+      SELECT * FROM (
+        SELECT * FROM runtime_logs
+        WHERE project_id = ? AND deployment_id = ?
+        ORDER BY id DESC LIMIT ?
+      ) ORDER BY id ASC
+    `).all(projectId, deploymentId, boundedLimit) as RuntimeLogRow[];
+  }
+
+  pruneProjectObservability(cutoff: number, maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
+    const metricLimit = Math.max(1, Math.min(500_000, Math.trunc(maxMetricSamplesPerProject)));
+    const logLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLogLinesPerProject)));
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare("DELETE FROM project_metric_samples WHERE sampled_at < ?").run(Math.trunc(cutoff));
+      this.sqlite.prepare(`
+        DELETE FROM project_metric_samples
+        WHERE rowid IN (
+          SELECT rowid FROM (
+            SELECT rowid, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY sampled_at DESC) AS position
+            FROM project_metric_samples
+          ) WHERE position > ?
+        )
+      `).run(metricLimit);
+      this.sqlite.prepare(`
+        DELETE FROM runtime_logs
+        WHERE source_timestamp < ?
+      `).run(new Date(Math.trunc(cutoff)).toISOString());
+      this.sqlite.prepare(`
+        DELETE FROM runtime_logs
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY id DESC) AS position
+            FROM runtime_logs
+          ) WHERE position > ?
+        )
+      `).run(logLimit);
     })();
   }
 
