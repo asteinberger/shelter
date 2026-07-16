@@ -19,7 +19,7 @@ import {
   MANAGED_LABEL_NAMESPACES
 } from "./runtime-identity.js";
 
-type CloudflareDnsDeletion = Pick<CloudflareService, "deleteDnsRecord">;
+type CloudflareDnsDeletion = Pick<CloudflareService, "deleteDnsRecord" | "deletePreviewDnsRecord">;
 export type ProjectDeletionCommandRunner = (
   command: string,
   args: string[],
@@ -61,6 +61,14 @@ export class ProjectDeletionService {
       // Hiding the project from generated routing happens before any destructive
       // worker cleanup, so no new requests are sent to a container being removed.
       reconcileRouting(this.config, this.database);
+      for (const preview of this.database.listPullRequestPreviews(projectId)) {
+        this.database.requestPullRequestPreviewClose(projectId, preview.id);
+        if (preview.zone_id || preview.dns_record_id) {
+          await this.cloudflare.deletePreviewDnsRecord(preview.zone_id, preview.dns_record_id, preview.hostname);
+          this.database.clearPullRequestPreviewDns(preview.id, preview.dns_record_id);
+        }
+        this.database.closePullRequestPreview(preview.id);
+      }
       for (const domain of this.database.listDomains(projectId)) {
         // CloudflareService verifies that the record still targets this Shelter
         // tunnel. A drifted/foreign record is deliberately left untouched.

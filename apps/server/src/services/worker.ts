@@ -173,6 +173,7 @@ export class DeploymentWorker {
       while (!this.stopping) {
         await this.reconcileProjectNetworks();
         await this.reconcileCloudflaredRestart();
+        if (await this.cleanupNextPullRequestPreview()) continue;
         if (await this.projectDeletion.processNext()) continue;
         if (await this.github.processNextWebhookJob()) continue;
         if (await this.github.processNextCommitStatus()) continue;
@@ -221,11 +222,18 @@ export class DeploymentWorker {
               message,
               new Date().toISOString()
             );
+            if (failed?.deployment_scope === "preview" && failed.preview_id) {
+              this.database.failPullRequestPreview(failed.preview_id, failed.id, message);
+              reconcileRouting(this.config, this.database);
+            }
             if (failed) await this.reportGithubStatus(failed, "failure", "Deployment fehlgeschlagen");
           }
         } finally {
           cancellation.stop();
           this.activeDeploymentAbort = null;
+          if (deployment.deployment_scope === "preview" && deployment.preview_id) {
+            this.database.materializePullRequestPreview(deployment.preview_id);
+          }
           this.database.materializePendingGithubPush(deployment.project_id);
         }
         try {
@@ -233,7 +241,10 @@ export class DeploymentWorker {
         } catch (error) {
           this.safeLog(deployment.id, "stderr", `Aufräumen fehlgeschlagener Images fehlgeschlagen: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
         }
-        this.database.pruneDeploymentLogs(deployment.project_id);
+        this.database.pruneDeploymentLogsForScope(
+          deployment.project_id,
+          deployment.deployment_scope === "preview" ? "preview" : "production"
+        );
         await this.maintainDockerStorage(deployment.id);
       }
     } finally {
@@ -501,6 +512,12 @@ export class DeploymentWorker {
   private async process(deployment: DeploymentRow, signal: AbortSignal): Promise<void> {
     const project = this.database.getProject(deployment.project_id);
     if (!project) throw new Error("Projekt wurde gelöscht");
+    const isPreview = deployment.deployment_scope === "preview";
+    if (isPreview) {
+      if (!deployment.preview_id || !this.database.beginPullRequestPreviewBuild(deployment.preview_id, deployment.id)) {
+        throw new DeploymentCancelledError();
+      }
+    }
     this.log(deployment.id, "system", `Worker startet Deployment für ${project.name}.`);
     this.throwIfDeploymentCancelled(deployment.id, signal);
 
@@ -540,7 +557,9 @@ export class DeploymentWorker {
           (guardedSignal) => this.prepareSource(project, deployment, workspace, guardedSignal)
         );
         this.throwIfDeploymentCancelled(deployment.id, signal);
-        const sourceAnalysis = refreshProjectSourceAnalysis(this.database, project.id, sourceDirectory);
+        const sourceAnalysis = isPreview
+          ? safeAnalyzeProjectDirectory(sourceDirectory)
+          : refreshProjectSourceAnalysis(this.database, project.id, sourceDirectory);
         if (sourceAnalysis) {
           this.log(deployment.id, "system", `Source erkannt: ${sourceAnalysis.applications.length} Anwendung(en).`);
         } else {
@@ -575,7 +594,7 @@ export class DeploymentWorker {
           const result = await runCommand("git", ["-C", sourceDirectory, "rev-parse", "HEAD"], { allowFailure: true, signal });
           commitSha = result.exitCode === 0 ? result.stdout.trim() : null;
           this.database.updateDeployment(deployment.id, { commit_sha: commitSha });
-          this.database.clearPendingGithubPushIfSha(project.id, commitSha);
+          if (!isPreview) this.database.clearPendingGithubPushIfSha(project.id, commitSha);
           const identified = this.database.getDeployment(deployment.id);
           if (identified && !deployment.commit_sha) {
             await this.reportGithubStatus(identified, "pending", "Deployment wird von Shelter gebaut");
@@ -587,10 +606,17 @@ export class DeploymentWorker {
     }
 
     this.throwIfDeploymentCancelled(deployment.id, signal);
-    if (this.cancelIfSuperseded(project, deployment.id, commitSha)) return;
+    if (!isPreview && this.cancelIfSuperseded(project, deployment.id, commitSha)) return;
 
-    const previousActiveDeploymentId = project.active_deployment_id;
-    const previousRuntime = await this.currentRuntime(project, signal);
+    const previousActiveDeploymentId = isPreview ? null : project.active_deployment_id;
+    const previewState = isPreview && deployment.preview_id
+      ? this.database.getPullRequestPreview(deployment.preview_id)
+      : undefined;
+    const previousPreviewDeployment = previewState?.active_deployment_id
+      && previewState.active_deployment_id !== deployment.id
+      ? this.database.getDeployment(previewState.active_deployment_id)
+      : undefined;
+    const previousRuntime = isPreview ? null : await this.currentRuntime(project, signal);
     const previousImage = previousRuntime?.image ?? null;
     const runtimeName = deploymentContainerName(project.slug, deployment.id);
     this.database.updateDeployment(deployment.id, {
@@ -620,8 +646,13 @@ export class DeploymentWorker {
     }
 
     this.throwIfDeploymentCancelled(deployment.id, signal);
-    if (this.cancelIfSuperseded(project, deployment.id, commitSha)) {
+    if (!isPreview && this.cancelIfSuperseded(project, deployment.id, commitSha)) {
       await this.removeContainer(runtimeName);
+      return;
+    }
+
+    if (isPreview) {
+      await this.activatePullRequestPreview(project, deployment.id, runtimeName, imageTag, internalPort, previousPreviewDeployment);
       return;
     }
 
@@ -729,6 +760,108 @@ export class DeploymentWorker {
         `Website-Vorschau konnte nicht gespeichert werden (Deployment bleibt aktiv): ${error instanceof Error ? error.message : "unbekannter Fehler"}`
       );
     }
+  }
+
+  private async activatePullRequestPreview(
+    project: ProjectRow,
+    deploymentId: string,
+    runtimeName: string,
+    imageTag: string,
+    internalPort: number,
+    previousDeployment?: DeploymentRow
+  ): Promise<void> {
+    const deployment = this.database.getDeployment(deploymentId);
+    const previewId = deployment?.preview_id;
+    if (!deployment || !previewId) throw new DeploymentActivationError("Preview-Zuordnung fehlt");
+    const preview = this.database.getPullRequestPreview(previewId);
+    if (!preview || preview.deployment_id !== deploymentId || preview.status === "closing") {
+      await this.removeContainer(runtimeName);
+      throw new DeploymentCancelledError();
+    }
+
+    try {
+      if (!preview.zone_id || !preview.dns_record_id) {
+        throw new DeploymentActivationError("Preview-DNS ist noch nicht durch die Control Plane bereitgestellt");
+      }
+
+      if (!this.database.completePullRequestPreview(preview.id, deploymentId)) {
+        throw new DeploymentActivationError("Preview-Status hat sich vor der Aktivierung geändert");
+      }
+      reconcileRouting(this.config, this.database);
+      this.safeLog(deploymentId, "system", `Preview ist unter https://${preview.hostname} bereit.`);
+
+      if (previousDeployment?.runtime_container && previousDeployment.runtime_container !== runtimeName) {
+        await this.removeContainer(previousDeployment.runtime_container);
+      }
+      try {
+        await this.pruneImages(project.id, imageTag);
+      } catch (error) {
+        this.safeLog(deploymentId, "stderr", `Aufräumen alter Preview-Images fehlgeschlagen: ${error instanceof Error ? error.message : "unbekannter Fehler"}`);
+      }
+    } catch (error) {
+      const currentPreview = this.database.getPullRequestPreview(preview.id);
+      if (currentPreview?.active_deployment_id === deploymentId) {
+        const restored = this.database.restorePullRequestPreviewActive(
+          preview.id,
+          deploymentId,
+          previousDeployment?.id ?? null
+        );
+        if (!restored) {
+          this.safeLog(
+            deploymentId,
+            "stderr",
+            "Automatischer Preview-Rollback fehlgeschlagen; der gesunde Candidate bleibt zur sicheren Wiederherstellung erhalten."
+          );
+          throw new DeploymentActivationError("Aktive Preview konnte nach dem Routing-Fehler nicht zurückgesetzt werden");
+        }
+      }
+      await this.removeContainer(runtimeName);
+      if (this.database.getDeployment(deploymentId)?.status === "ready") {
+        this.database.updateDeployment(deploymentId, {
+          status: "failed",
+          failure_kind: "activation",
+          error: error instanceof Error ? error.message : "Preview-Aktivierung fehlgeschlagen",
+          finished_at: new Date().toISOString()
+        });
+      }
+      this.database.failPullRequestPreview(
+        preview.id,
+        deploymentId,
+        error instanceof Error ? error.message : "Preview-Aktivierung fehlgeschlagen"
+      );
+      reconcileRouting(this.config, this.database);
+      throw error;
+    }
+  }
+
+  private async cleanupNextPullRequestPreview(): Promise<boolean> {
+    const preview = this.database.nextPullRequestPreviewCleanup();
+    if (!preview) return false;
+    const deployments = this.database.listPreviewDeployments(preview.id);
+    const active = deployments.find((deployment) => (
+      ["preparing", "building", "checking", "switching"].includes(deployment.status)
+    ));
+    if (active) {
+      this.database.requestDeploymentCancellation(active.id);
+      return false;
+    }
+    for (const deployment of deployments) {
+      if (deployment.runtime_container) await this.removeContainer(deployment.runtime_container);
+    }
+    reconcileRouting(this.config, this.database);
+    if (preview.status !== "closing") {
+      this.database.requestPullRequestPreviewClose(preview.project_id, preview.id);
+      return true;
+    }
+    // The API-side DNS reconciler owns Cloudflare credentials. Keep the local
+    // preview in `closing` until it has safely removed the exact owned record.
+    if (preview.zone_id || preview.dns_record_id) return false;
+    this.database.closePullRequestPreview(preview.id);
+    reconcileRouting(this.config, this.database);
+    for (const image of new Set(deployments.map((deployment) => deployment.image_tag).filter((value): value is string => Boolean(value)))) {
+      await this.command("docker", ["image", "rm", image], { allowFailure: true });
+    }
+    return true;
   }
 
   private async backfillProjectPreviews(): Promise<void> {
@@ -863,10 +996,14 @@ export class DeploymentWorker {
         "--resource", `cpu-quota=${this.buildCpuQuota()}`
       );
     }
+    const deployment = this.database.getDeployment(deploymentId);
+    const environmentRows = deployment?.deployment_scope === "preview"
+      ? this.database.listPreviewEnvironment(project.id)
+      : this.database.listEnvironment(project.id);
     const environment = fileStorage
       ? {}
       : Object.fromEntries(
-          this.database.listEnvironment(project.id).map((entry) => [
+          environmentRows.map((entry) => [
             entry.key,
             decryptString(entry.encrypted_value, this.config.APP_SECRET)
           ])
@@ -908,9 +1045,13 @@ export class DeploymentWorker {
     const runtimeKind = deploymentId
       ? this.database.getDeployment(deploymentId)?.runtime_kind
       : null;
+    const deployment = deploymentId ? this.database.getDeployment(deploymentId) : undefined;
+    const environmentRows = deployment?.deployment_scope === "preview"
+      ? this.database.listPreviewEnvironment(project.id)
+      : this.database.listEnvironment(project.id);
     const environment = runtimeKind === "files"
       ? []
-      : this.database.listEnvironment(project.id).map((entry) => [
+      : environmentRows.map((entry) => [
           entry.key,
           decryptString(entry.encrypted_value, this.config.APP_SECRET)
         ] as const).filter(([key]) => !["PORT", "HOSTNAME", "NODE_ENV"].includes(key));
@@ -1066,9 +1207,17 @@ export class DeploymentWorker {
         .filter((deployment) => deployment.image_tag)
         .map((deployment) => deployment.image_tag as string)
     );
+    for (const preview of this.database.listPullRequestPreviews(projectId)) {
+      const deployment = preview.active_deployment_id
+        ? this.database.getDeployment(preview.active_deployment_id)
+        : undefined;
+      if (deployment?.status === "ready" && deployment.image_tag) {
+        keep.add(deployment.image_tag);
+      }
+    }
     keep.add(activeImage);
     for (const image of this.database.listRollbackLeasedImages(projectId)) keep.add(image);
-    const old = this.database.listDeployments(projectId, 100)
+    const old = this.database.listAllDeployments(projectId, 100)
       .map((deployment) => deployment.image_tag)
       .filter((image): image is string => Boolean(image) && !keep.has(image as string));
     for (const image of new Set(old)) await runCommand("docker", ["image", "rm", image], { allowFailure: true });
@@ -1080,13 +1229,21 @@ export class DeploymentWorker {
         .map((deployment) => deployment.image_tag)
         .filter((image): image is string => Boolean(image))
     );
+    for (const preview of this.database.listPullRequestPreviews(projectId)) {
+      const deployment = preview.active_deployment_id
+        ? this.database.getDeployment(preview.active_deployment_id)
+        : undefined;
+      if (deployment?.status === "ready" && deployment.image_tag) {
+        keep.add(deployment.image_tag);
+      }
+    }
     const project = this.database.getProject(projectId);
     if (project?.active_deployment_id) {
       const activeImage = this.database.getDeployment(project.active_deployment_id)?.image_tag;
       if (activeImage) keep.add(activeImage);
     }
     for (const image of this.database.listRollbackLeasedImages(projectId)) keep.add(image);
-    const prunable = this.database.listDeployments(projectId, 10_000)
+    const prunable = this.database.listAllDeployments(projectId, 10_000)
       .filter((deployment) => deployment.status === "failed" || deployment.status === "cancelled")
       .map((deployment) => deployment.image_tag)
       .filter((image): image is string => typeof image === "string" && isManagedImage(image) && !keep.has(image));
@@ -1145,6 +1302,27 @@ export class DeploymentWorker {
           error: "Project disappeared while recovering an interrupted deployment",
           finished_at: new Date().toISOString()
         });
+        continue;
+      }
+
+      if (deployment.deployment_scope === "preview") {
+        for (const runtimeName of deploymentContainerNames(
+          project.slug,
+          deployment.id,
+          deployment.runtime_container
+        )) await this.removeContainer(runtimeName);
+        const message = "Preview-Deployment wurde durch einen Worker-Neustart unterbrochen";
+        this.database.updateDeployment(deployment.id, {
+          status: "failed",
+          failure_kind: "worker",
+          error: message,
+          finished_at: new Date().toISOString()
+        });
+        if (deployment.preview_id) {
+          this.database.failPullRequestPreview(deployment.preview_id, deployment.id, message);
+          this.database.materializePullRequestPreview(deployment.preview_id, { allowWorkerRetry: true });
+        }
+        reconcileRouting(this.config, this.database);
         continue;
       }
 
@@ -1357,7 +1535,11 @@ export class DeploymentWorker {
       ]);
       if (!projectId || !deploymentId) continue;
       const project = this.database.getProject(projectId);
-      if (project && project.active_deployment_id !== deploymentId) await this.removeContainer(containerId);
+      const preview = this.database.getPullRequestPreviewByDeployment(deploymentId);
+      const isActivePreview = preview?.active_deployment_id === deploymentId;
+      if (project && project.active_deployment_id !== deploymentId && !isActivePreview) {
+        await this.removeContainer(containerId);
+      }
     }
   }
 
@@ -1430,6 +1612,14 @@ export function refreshProjectSourceAnalysis(
   try {
     const analysis = analyzeProjectDirectory(sourceDirectory);
     return database.updateProjectSourceAnalysis(projectId, JSON.stringify(analysis)) ? analysis : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeAnalyzeProjectDirectory(sourceDirectory: string): ProjectAnalysis | null {
+  try {
+    return analyzeProjectDirectory(sourceDirectory);
   } catch {
     return null;
   }

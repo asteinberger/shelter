@@ -92,6 +92,11 @@ export interface ProjectRow {
   github_repository_full_name?: string | null;
   github_installation_id?: string | null;
   auto_deploy?: 0 | 1;
+  /** Pull-request preview deployments are explicit opt-in and GitHub-App only. */
+  preview_deployments_enabled?: 0 | 1;
+  preview_domain_id?: string | null;
+  preview_domain_suffix?: string | null;
+  preview_ttl_hours?: number;
   github_connection_error?: string | null;
   /** Last server-validated source analysis. Optional for backwards-compatible tests/migrations. */
   source_analysis_json?: string | null;
@@ -140,6 +145,9 @@ export interface DeploymentRow {
   commit_url?: string | null;
   trigger?: DeploymentTrigger;
   github_delivery_id?: string | null;
+  /** Preview deployments never become projects.active_deployment_id. */
+  deployment_scope?: "production" | "preview";
+  preview_id?: string | null;
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -311,6 +319,47 @@ export interface EnvironmentVariableRow {
   updated_at: string;
 }
 
+export type PullRequestPreviewStatus =
+  | "queued"
+  | "building"
+  | "ready"
+  | "failed"
+  | "closing"
+  | "closed"
+  | "blocked";
+
+export interface PullRequestPreviewRow {
+  id: string;
+  project_id: string;
+  pull_request_number: number;
+  head_sha: string;
+  head_ref: string;
+  base_ref: string;
+  repository_id: string;
+  repository_full_name: string;
+  generation: number;
+  latest_delivery_id: string;
+  /** The newest requested build. It may still be queued, building, or failed. */
+  deployment_id: string | null;
+  /** The last successfully activated build that currently receives preview traffic. */
+  active_deployment_id: string | null;
+  /** Generation for which automatic worker-restart recovery was already consumed. */
+  worker_retry_generation: number | null;
+  hostname: string;
+  zone_id: string | null;
+  dns_record_id: string | null;
+  dns_attempts: number;
+  dns_next_attempt_at: string;
+  status: PullRequestPreviewStatus;
+  error: string | null;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+}
+
+export interface PreviewEnvironmentVariableRow extends EnvironmentVariableRow {}
+
 export interface PublicProject {
   id: string;
   name: string;
@@ -336,6 +385,10 @@ export interface PublicProject {
   githubInstallationId: string | null;
   githubConnectionError: string | null;
   autoDeploy: boolean;
+  previewDeploymentsEnabled: boolean;
+  previewDomainId: string | null;
+  previewDomainSuffix: string | null;
+  previewTtlHours: number;
   sourceAnalysis: ProjectAnalysis | null;
   createdAt: string;
   updatedAt: string;
@@ -377,6 +430,8 @@ export interface PublicDeployment {
   commitAuthor: string | null;
   commitUrl: string | null;
   trigger: DeploymentTrigger;
+  scope: "production" | "preview";
+  pullRequestPreviewId: string | null;
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;

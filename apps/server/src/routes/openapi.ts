@@ -37,6 +37,7 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
         { name: "Projects" },
         { name: "Observability" },
         { name: "Deployments" },
+        { name: "Previews" },
         { name: "Uploads" },
         { name: "Domains" }
       ],
@@ -130,6 +131,32 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
             responses: { "202": { description: "Queued rollback deployment" }, "400": errorResponse, "404": errorResponse, "409": errorResponse }
           }
         },
+        "/api/projects/{projectId}/previews": {
+          parameters: [{ $ref: "#/components/parameters/ProjectId" }],
+          get: { tags: ["Previews"], summary: "List pull-request previews and their isolated configuration", security: bearerSecurity, responses: { "200": { description: "Preview settings, keys, and lifecycle state" }, "404": errorResponse } }
+        },
+        "/api/projects/{projectId}/previews/settings": {
+          parameters: [{ $ref: "#/components/parameters/ProjectId" }],
+          put: {
+            tags: ["Previews"], summary: "Opt a GitHub App project into pull-request previews", security: bearerSecurity,
+            description: "Requires pull_requests:read plus the pull_request GitHub App event and an active project domain. At most three previews are active per project.",
+            requestBody: { required: true, content: { "application/json": { schema: { type: "object", additionalProperties: false, required: ["enabled"], properties: { enabled: { type: "boolean" }, domainId: { type: "string" }, ttlHours: { type: "integer", minimum: 1, maximum: 168, default: 72 } } } } } },
+            responses: { "200": { description: "Saved fail-closed preview configuration" }, "400": errorResponse, "404": errorResponse, "409": errorResponse }
+          }
+        },
+        "/api/projects/{projectId}/previews/environment": {
+          parameters: [{ $ref: "#/components/parameters/ProjectId" }],
+          put: {
+            tags: ["Previews"], summary: "Replace preview-only environment variables", security: bearerSecurity,
+            description: "Preview deployments never inherit production variables.",
+            requestBody: { required: true, content: { "application/json": { schema: { type: "object", additionalProperties: false, required: ["variables"], properties: { variables: { type: "array", maxItems: 200, items: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string" }, value: { type: "string" } } } } } } } } },
+            responses: { "200": { description: "Preview environment keys" }, "400": errorResponse, "404": errorResponse, "409": errorResponse }
+          }
+        },
+        "/api/projects/{projectId}/previews/{previewId}": {
+          parameters: [{ $ref: "#/components/parameters/ProjectId" }, { name: "previewId", in: "path", required: true, schema: { type: "string", pattern: "^prv_" } }],
+          delete: { tags: ["Previews"], summary: "Remove a preview runtime, route, and owned DNS record", security: bearerSecurity, responses: { "202": { description: "Cleanup requested" }, "404": errorResponse } }
+        },
         "/api/projects/{projectId}/source": {
           parameters: [{ $ref: "#/components/parameters/ProjectId" }],
           put: { tags: ["Uploads"], summary: "Replace an upload project's source", security: bearerSecurity, requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["uploadId"], properties: { uploadId: { type: "string" }, staticBasePath: { type: ["string", "null"] } } } } } }, responses: { "202": { description: "Project and queued deployment" }, "400": errorResponse, "409": errorResponse } }
@@ -187,6 +214,15 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
             { name: "branch", in: "query", required: true, schema: { type: "string" } }
           ],
           get: { tags: ["Projects"], summary: "Analyze a GitHub repository at a branch SHA", security: sessionSecurity, responses: { "200": { description: "Detected applications cached by immutable branch SHA" }, "400": errorResponse, "401": errorResponse, "502": errorResponse } }
+        },
+        "/api/settings/github/preview-capability": {
+          get: {
+            tags: ["Previews"],
+            summary: "Check whether the GitHub App and an optional installation can deliver pull-request previews",
+            parameters: [{ name: "installationId", in: "query", schema: { type: "string", pattern: "^[0-9]+$" } }],
+            security: sessionSecurity,
+            responses: { "200": { description: "App and installation permission/event readiness" }, "401": errorResponse, "502": errorResponse }
+          }
         }
       },
       components: {
