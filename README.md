@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="apps/web/public/favicon.svg" width="88" height="88" alt="Shelter frog" />
+  <img src="apps/web/public/brand/shelter-icon-192.png" width="88" height="88" alt="Shelter frog" />
   <h1>Shelter</h1>
   <p><strong>give your code a home</strong></p>
   <p>

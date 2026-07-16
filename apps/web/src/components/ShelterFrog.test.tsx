@@ -10,13 +10,13 @@ describe('Shelter brand', () => {
     expect(SESSION_EXPIRED_EVENT).toBe('shelter:session-expired');
   });
 
-  it('renders the frog as an accessible code-based SVG without raster assets', () => {
+  it('renders the photographic frog icon with accessible alternative text', () => {
     const markup = renderToStaticMarkup(<ShelterFrog title="Shelter Frosch" />);
-    expect(markup).toContain('<svg');
-    expect(markup).toContain('<title');
-    expect(markup).toContain('Shelter Frosch');
-    expect(markup).toContain('aria-labelledby');
-    expect(markup).not.toContain('<image');
+    expect(markup).toContain('<img');
+    expect(markup).toContain('src="/brand/shelter-icon-64.png"');
+    expect(markup).toContain('alt="Shelter Frosch"');
+    expect(markup).toContain('width="64"');
+    expect(markup).toContain('height="64"');
+    expect(markup).not.toContain('<svg');
   });
 });
-
