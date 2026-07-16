@@ -86,6 +86,18 @@ jobs:
           # may be introduced before its trusted policy script exists on dev.
           # Inspect the fetched Git objects only; never check out or execute the
           # pull request's scripts during this path.
+          for required_blob in \
+            .github/workflows/pr-policy.yml \
+            ops/check-pr-policy.mjs \
+            ops/lib/development-policy.mjs \
+            ops/prepare-release.mjs; do
+            mode=$(git ls-tree refs/shelter-policy/head -- "$required_blob" | awk '{ print $1 }')
+            if [[ "$mode" != "100644" && "$mode" != "100755" ]]; then
+              echo "Bootstrap policy file is missing or not a regular Git blob: ${required_blob}" >&2
+              exit 1
+            fi
+          done
+
           if [[ "$BASE_BRANCH" == "main" ]]; then
             if [[ "$HEAD_BRANCH" != "dev" \
               || "$BASE_REPOSITORY" != "$EVENT_REPOSITORY" \
@@ -226,15 +238,4 @@ jobs:
             exit 1
           fi
 
-          for required_blob in \
-            .github/workflows/pr-policy.yml \
-            ops/check-pr-policy.mjs \
-            ops/lib/development-policy.mjs \
-            ops/prepare-release.mjs; do
-            mode=$(git ls-tree refs/shelter-policy/head -- "$required_blob" | awk '{ print $1 }')
-            if [[ "$mode" != "100644" && "$mode" != "100755" ]]; then
-              echo "Bootstrap policy file is missing or not a regular Git blob: ${required_blob}" >&2
-              exit 1
-            fi
-          done
           echo "One-time development policy bootstrap passed without executing pull request code."

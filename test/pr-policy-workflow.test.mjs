@@ -41,9 +41,11 @@ test("bootstrap is one exact same-repository branch and executes no head scripts
   const trustedPolicy = workflow.indexOf("if [[ -f ops/check-pr-policy.mjs ]]");
   const trustedExecution = workflow.indexOf("node ops/check-pr-policy.mjs", trustedPolicy);
   const trustedExit = workflow.indexOf("exit 0", trustedExecution);
+  const requiredBlobs = workflow.indexOf("for required_blob in", trustedExit);
   const bootstrap = workflow.indexOf('HEAD_BRANCH" != "agent/development-workflow"', trustedExit);
   assert.ok(trustedPolicy >= 0 && trustedPolicy < trustedExecution);
   assert.ok(trustedExecution < trustedExit && trustedExit < bootstrap);
+  assert.ok(trustedExit < requiredBlobs && requiredBlobs < workflow.indexOf('BASE_BRANCH" == "main"'));
   assert.match(workflow, /HEAD_REPOSITORY" != "\$BASE_REPOSITORY"/);
   assert.match(workflow, /BASE_REPOSITORY" != "\$EVENT_REPOSITORY"/);
 
@@ -52,6 +54,7 @@ test("bootstrap is one exact same-repository branch and executes no head scripts
   assert.doesNotMatch(bootstrapBody, /node .*refs\/shelter-policy\/head/);
   assert.match(bootstrapBody, /git (?:diff|show|ls-tree)/);
   assert.match(bootstrapBody, /must not change or desynchronize the release version/);
+  assert.match(workflow, /Bootstrap policy file is missing or not a regular Git blob/);
 });
 
 test("bootstrap changed paths remain an exact reviewed set", () => {
