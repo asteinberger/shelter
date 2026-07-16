@@ -41,6 +41,15 @@ assert_not_contains() {
   fi
 }
 
+file_mode() {
+  local mode
+  mode=$(stat -c '%a' "$1" 2>/dev/null || true)
+  case "$mode" in
+    ''|*[!0-9]*) stat -f '%Lp' "$1" ;;
+    *) printf '%s\n' "$mode" ;;
+  esac
+}
+
 assert_absent() {
   [[ ! -e "$1" && ! -L "$1" ]] || fail_test "expected no path at $1"
 }
@@ -498,7 +507,7 @@ EOF
   run_remote_helper prepare "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
   assert_status 0
   incoming=$installation/releases/.incoming
-  [[ "$(stat -f '%Lp' "$incoming" 2>/dev/null || stat -c '%a' "$incoming")" = 700 ]] ||
+  [[ "$(file_mode "$incoming")" = 700 ]] ||
     fail_test 'incoming directory is not mode 0700'
   populate_remote_stage "$installation" "$TEST_TOKEN"
   run_remote_helper activate "$installation" "$TEST_TAG" "$TEST_TOKEN" "$TEST_MANIFEST_SHA" 0
