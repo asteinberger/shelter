@@ -81,6 +81,11 @@ async function context(): Promise<{
     APP_SECRET: "a".repeat(64),
     LOG_LEVEL: "silent"
   });
+  fs.mkdirSync(path.join(config.WEB_DIST, "brand"), { recursive: true });
+  fs.writeFileSync(
+    path.join(config.WEB_DIST, "brand", "shelter-icon-64.png"),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  );
   const database = new Database(config);
   const projectId = "prj_site_access";
   const deploymentId = "dep_site_access";
@@ -177,7 +182,18 @@ describe("per-domain site access", () => {
     expect(page.headers["x-robots-tag"]).toContain("noindex");
     expect(page.body).toContain("Diese Seite ist geschützt");
     expect(page.body).toContain("Private launch");
+    expect(page.body).toContain('src="/_shelter/access/brand.png"');
+    expect(page.body).not.toContain('class="frog"');
     expect(page.body).not.toContain("Admin");
+
+    const brand = await app.inject({
+      method: "GET",
+      url: "/_shelter/access/brand.png",
+      headers: { host: "private.example.com" }
+    });
+    expect(brand.statusCode).toBe(200);
+    expect(brand.headers["content-type"]).toContain("image/png");
+    expect(brand.rawPayload).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
 
     const wrongPassword = await app.inject({
       method: "POST",

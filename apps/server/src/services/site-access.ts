@@ -1,4 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
@@ -132,7 +134,7 @@ function renderAccessPage(
     @media(prefers-color-scheme:dark){:root{--bg:#0b0d0b;--card:rgba(21,24,21,.9);--ink:#f2f5f1;--muted:#9da69e;--line:rgba(255,255,255,.11);--accent:#80dd60;--accent-ink:#10220d;--danger:#ff8b85;--shadow:0 28px 90px rgba(0,0,0,.46)}}
     *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,rgba(120,214,91,.14),transparent 34rem),var(--bg);color:var(--ink);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
     main{min-height:100vh;display:grid;place-items:center;padding:28px}.shell{width:min(100%,430px)}
-    .brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:22px;font-size:14px;font-weight:680;letter-spacing:-.01em}.frog{position:relative;width:31px;height:27px;border-radius:11px 11px 13px 13px;background:var(--accent);box-shadow:inset 0 -4px 0 rgba(25,76,15,.12)}.frog:before,.frog:after{content:"";position:absolute;top:-4px;width:12px;height:12px;border-radius:50%;background:var(--accent);box-shadow:inset 0 0 0 4px var(--ink)}.frog:before{left:2px}.frog:after{right:2px}
+    .brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:22px;font-size:14px;font-weight:680;letter-spacing:-.01em}.brand img{width:34px;height:34px;border-radius:12px;object-fit:cover;filter:drop-shadow(0 4px 10px rgba(28,60,22,.18))}
     .card{border:1px solid var(--line);border-radius:24px;background:var(--card);padding:30px;box-shadow:var(--shadow);backdrop-filter:blur(18px)}
     .eyebrow{display:inline-flex;align-items:center;gap:7px;margin:0 0 17px;padding:6px 9px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
     h1{margin:0;font-size:30px;line-height:1.08;letter-spacing:-.04em}p{margin:12px 0 0;color:var(--muted);font-size:14px;line-height:1.55}.host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -145,7 +147,7 @@ function renderAccessPage(
 <body>
   <main>
     <div class="shell">
-      <div class="brand"><span class="frog" aria-hidden="true"></span><span>Shelter</span></div>
+      <div class="brand"><img src="${SITE_ACCESS_PATH}/brand.png" width="64" height="64" alt=""><span>Shelter</span></div>
       <section class="card">
         <p class="eyebrow"><span class="dot"></span><span class="host">${html(domain.hostname)}</span></p>
         <h1>${title}</h1>
@@ -177,6 +179,17 @@ export function registerSiteAccessRoutes(
   config: AppConfig,
   database: Database
 ): void {
+  app.get(`${SITE_ACCESS_PATH}/brand.png`, async (_request, reply) => {
+    const brandPath = path.join(config.WEB_DIST, "brand", "shelter-icon-64.png");
+    try {
+      const image = await fs.promises.readFile(brandPath);
+      reply.header("cache-control", "public, max-age=86400");
+      return reply.type("image/png").send(image);
+    } catch {
+      return reply.code(404).type("text/plain").send("Not found");
+    }
+  });
+
   app.get<{ Querystring: { domainId?: string } }>("/api/site-access/authorize", async (request, reply) => {
     reply.header("cache-control", "no-store");
     const domain = request.query.domainId ? database.getDomain(request.query.domainId) : undefined;
