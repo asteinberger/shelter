@@ -471,6 +471,40 @@ test_separate_installation_fails_closed_on_lock_and_unsafe_target() {
     fail_test 'failed synchronization did not leave its fail-closed marker'
 }
 
+test_external_release_lock_handoff_is_verified_and_preserved() {
+  create_bundle
+  installation=$TEST_TMP/installation
+  external_token=dddddddddddddddddddddddddddddddd
+  mkdir -p "$installation/.shelter-install.lock"
+  printf 'APP_SECRET=keep-this-exact-value\n' > "$installation/.env"
+  printf '%s\n' "$external_token" > "$installation/.shelter-install.lock/owner"
+  printf '%s\n' release-deploy > "$installation/.shelter-install.lock/kind"
+  printf '%s\n' "$$" > "$installation/.shelter-install.lock/pid"
+
+  export SHELTER_RELEASE_INSTALL_LOCK_TOKEN=$external_token
+  run_command "$BUNDLE/ops/install-release-bundle.sh" \
+    --bundle "$BUNDLE" --installation "$installation" -- --non-interactive --no-pull
+  unset SHELTER_RELEASE_INSTALL_LOCK_TOKEN
+  assert_status 0
+  assert_contains "$MOCK_INSTALL_LOG" "REVISION=release:${TEST_VERSION}-${TEST_COMMIT}"
+  [[ -d "$installation/.shelter-install.lock" ]] ||
+    fail_test 'externally managed release lock was removed'
+  assert_contains "$installation/.shelter-install.lock/owner" "$external_token"
+  assert_contains "$installation/.shelter-install.lock/kind" 'release-deploy'
+
+  : > "$MOCK_DOCKER_LOG"
+  rm -f "$MOCK_INSTALL_LOG"
+  export SHELTER_RELEASE_INSTALL_LOCK_TOKEN=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  run_command "$BUNDLE/ops/install-release-bundle.sh" \
+    --bundle "$BUNDLE" --installation "$installation" -- --non-interactive
+  unset SHELTER_RELEASE_INSTALL_LOCK_TOKEN
+  assert_status 1
+  assert_contains "$COMMAND_OUTPUT" 'different owner'
+  [[ ! -s "$MOCK_DOCKER_LOG" ]] || fail_test 'invalid external lock contacted Docker'
+  assert_absent "$MOCK_INSTALL_LOG"
+  assert_contains "$installation/.shelter-install.lock/owner" "$external_token"
+}
+
 run_test() {
   local name=$1
   local function_name=$2
@@ -505,6 +539,7 @@ run_test 'pull failures and tag collisions never run install.sh' test_pull_and_l
 run_test 'bundle is revalidated after the potentially slow pull' test_bundle_is_revalidated_after_pull
 run_test 'separate release updates preserve env and use central lock' test_separate_installation_preserves_env_and_uses_central_lock
 run_test 'separate updates reject locks and unsafe targets' test_separate_installation_fails_closed_on_lock_and_unsafe_target
+run_test 'external release lock handoff is verified and preserved' test_external_release_lock_handoff_is_verified_and_preserved
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [[ "$failed" -eq 0 ]]

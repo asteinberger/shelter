@@ -13,6 +13,9 @@ dry_run=0
 release_lock=
 release_lock_token=
 release_lock_acquired=0
+release_lock_managed_externally=0
+external_release_lock_token=${SHELTER_RELEASE_INSTALL_LOCK_TOKEN:-}
+unset SHELTER_RELEASE_INSTALL_LOCK_TOKEN
 sync_marker=
 sync_temporary_file=
 
@@ -42,7 +45,9 @@ cleanup() {
     rm -f "$sync_temporary_file"
     sync_temporary_file=
   fi
-  if [ "$release_lock_acquired" -eq 1 ] && [ -n "$release_lock" ]; then
+  if [ "$release_lock_acquired" -eq 1 ] &&
+     [ "$release_lock_managed_externally" -eq 0 ] &&
+     [ -n "$release_lock" ]; then
     current_owner=
     if [ -f "$release_lock/owner" ]; then
       IFS= read -r current_owner < "$release_lock/owner" || true
@@ -142,27 +147,72 @@ if [ -L "$release_lock" ] || { [ -e "$release_lock" ] && [ ! -d "$release_lock" 
   shelter_release_error "the installer lock path is unsafe: ${release_lock}"
   exit 1
 fi
-release_lock_token=$(openssl rand -hex 16)
-case "$release_lock_token" in
-  *[!0-9a-f]*|'')
+if [ -n "$external_release_lock_token" ]; then
+  case "$external_release_lock_token" in
+    *[!0-9a-f]*|'')
+      shelter_release_error "the external release operation-lock token is invalid"
+      exit 1
+      ;;
+  esac
+  [ "${#external_release_lock_token}" -eq 32 ] || {
+    shelter_release_error "the external release operation-lock token is invalid"
+    exit 1
+  }
+  [ -d "$release_lock" ] || {
+    shelter_release_error "the externally managed release operation lock is missing"
+    exit 1
+  }
+  [ -f "$release_lock/owner" ] && [ ! -L "$release_lock/owner" ] ||
+    {
+      shelter_release_error "the externally managed release operation lock has an unsafe owner file"
+      exit 1
+    }
+  [ -f "$release_lock/kind" ] && [ ! -L "$release_lock/kind" ] ||
+    {
+      shelter_release_error "the externally managed release operation lock has an unsafe kind file"
+      exit 1
+    }
+  external_lock_owner=
+  external_lock_kind=
+  IFS= read -r external_lock_owner < "$release_lock/owner" || true
+  IFS= read -r external_lock_kind < "$release_lock/kind" || true
+  [ "$external_lock_owner" = "$external_release_lock_token" ] ||
+    {
+      shelter_release_error "the externally managed release operation lock has a different owner"
+      exit 1
+    }
+  [ "$external_lock_kind" = release-deploy ] ||
+    {
+      shelter_release_error "the externally managed release operation lock has an invalid kind"
+      exit 1
+    }
+  release_lock_token=$external_release_lock_token
+  release_lock_acquired=1
+  release_lock_managed_externally=1
+  external_release_lock_token=
+else
+  release_lock_token=$(openssl rand -hex 16)
+  case "$release_lock_token" in
+    *[!0-9a-f]*|'')
+      shelter_release_error "OpenSSL returned an invalid operation-lock token"
+      exit 1
+      ;;
+  esac
+  [ "${#release_lock_token}" -eq 32 ] || {
     shelter_release_error "OpenSSL returned an invalid operation-lock token"
     exit 1
-    ;;
-esac
-[ "${#release_lock_token}" -eq 32 ] || {
-  shelter_release_error "OpenSSL returned an invalid operation-lock token"
-  exit 1
-}
-if ! mkdir "$release_lock" 2>/dev/null; then
-  shelter_release_error "another Shelter install, release, or deploy operation is active"
-  exit 1
-fi
-release_lock_acquired=1
-if ! printf '%s\n' "$$" > "$release_lock/pid" ||
-   ! printf '%s\n' "$release_lock_token" > "$release_lock/owner" ||
-   ! printf '%s\n' release > "$release_lock/kind"; then
-  shelter_release_error "the release operation lock could not be initialized"
-  exit 1
+  }
+  if ! mkdir "$release_lock" 2>/dev/null; then
+    shelter_release_error "another Shelter install, release, or deploy operation is active"
+    exit 1
+  fi
+  release_lock_acquired=1
+  if ! printf '%s\n' "$$" > "$release_lock/pid" ||
+     ! printf '%s\n' "$release_lock_token" > "$release_lock/owner" ||
+     ! printf '%s\n' release > "$release_lock/kind"; then
+    shelter_release_error "the release operation lock could not be initialized"
+    exit 1
+  fi
 fi
 
 printf 'Pulling the verified image digest…\n'

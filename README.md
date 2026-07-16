@@ -500,25 +500,33 @@ Redeploy every project on a new VPS so application images and stable containers 
 
 ## Update
 
-For production, download the desired immutable release into a new directory and
-run its release installer:
+For production, use the verified-release deployer from a trusted local Shelter
+checkout. It authenticates the immutable GitHub Release and asset attestation
+locally, transports only that bundle, verifies it again in a root-owned remote
+staging directory, publishes the release directory atomically, installs the OCI
+image by digest, and finishes with `doctor`:
 
 ```sh
-./ops/download-release.sh \
-  --repo asteinberger/shelter \
-  --tag v0.2.1 \
-  --destination ../shelter-v0.2.1
-cd ../shelter-v0.2.1
-./ops/install-release-bundle.sh \
-  --installation /opt/shelter \
-  -- --non-interactive
-/opt/shelter/install.sh doctor
+cp .env.server.example .env.server
+chmod 600 .env.server
+# Fill in .env.server; use the root SSH account and prefer an SSH key.
+./ops/deploy-release.sh --tag v0.2.1 --dry-run
+./ops/deploy-release.sh --tag v0.2.1
 ```
 
+The dry run still transfers the authenticated bundle into a unique protected
+temporary directory so the VPS can repeat bundle verification and the release
+installer's own dry run. Cleanup removes that stage; no release is published or
+installed. The real run keeps immutable bundles under
+`/opt/shelter/releases/vMAJOR.MINOR.PATCH`. Repeating the same tag is safe only
+when its authenticated manifest is byte-for-byte identical; different content
+under an existing tag fails closed. Use `--repo OWNER/REPOSITORY` for a reviewed
+fork release and `--server-env FILE` for another protected target file.
+
 The release path verifies GitHub's signed release and asset attestations,
-bundle checksums, and the OCI digest. It does not rebuild the control plane on
-the VPS. See [Shelter releases](docs/RELEASES.md) for prerequisites and
-independent verification commands.
+bundle checksums, and the OCI digest. It never rebuilds the control plane on the
+VPS. See [Shelter releases](docs/RELEASES.md) for prerequisites, the manual
+download/install alternative, and independent verification commands.
 
 For an intentionally reviewed source build, fetch the desired revision and let
 the normal installer build it locally:
@@ -577,7 +585,12 @@ chmod 600 .env.server
 ./ops/deploy.sh
 ```
 
-The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, serializes remote deploys, protects installer locks and in-repository backups from rsync deletion, and invokes the same `./install.sh --non-interactive` path on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup.
+The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, serializes remote deploys, protects installer locks, immutable release directories, and in-repository backups from rsync deletion, and invokes the same `./install.sh --non-interactive` path on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup. Clone and worktree `.git` metadata is excluded entirely so a local worktree pointer can never be copied to the host.
+
+`ops/deploy.sh` intentionally deploys reviewed source and builds on the VPS. For
+production releases, use `ops/deploy-release.sh` instead. Both helpers share the
+same strict `.env.server`, SSH key/password handling, and protected
+`SSH_ASKPASS` connection setup; neither prints or transfers server credentials.
 
 ## Security
 
@@ -617,6 +630,7 @@ docker compose logs --tail=200 api worker traefik cloudflared
 - **A Portsmith migration failed after a Shelter API container was created:** the deploy helper deliberately leaves both generations of API and worker stopped. Rerun the Shelter installer to finish the forward migration, or restore the verified pre-update snapshot before starting legacy binaries. Never run both generations against the same volume.
 - **Image pull is temporarily unavailable:** retry normally first. `--no-pull` is only appropriate when every required runtime and base image is already present and trusted locally.
 - **A stale operation lock remains after a hard crash:** verify that no `install.sh` or `ops/deploy.sh` process is running. Remove only the `pid`, `owner`, and `kind` files that exist inside `.shelter-install.lock`, remove the empty directory, and retry.
+- **A verified-release deploy was interrupted between SSH steps:** verify that no `ops/deploy-release.sh`, `ops/deploy.sh`, `install.sh`, or rollback process still targets the VPS. Inspect the shared `/opt/shelter/.shelter-install.lock` and its token-owned directory below `releases/.incoming`; remove only that matching stale stage plus the lock's `pid`, `owner`, and `kind` files. Never replace or delete an existing version directory to retry a tag.
 
 Treat `.shelter-install.log` as operationally sensitive and redact it before sharing. On success the installer removes it automatically.
 
