@@ -150,11 +150,14 @@ describe("per-domain site access", () => {
       url: "/api/site-access/authorize?domainId=dom_site_access",
       headers: {
         "x-forwarded-host": "private.example.com",
+        "x-forwarded-proto": "https",
         "x-forwarded-uri": "/secret?invite=1"
       }
     });
     expect(unauthorized.statusCode).toBe(302);
-    expect(unauthorized.headers.location).toContain("returnPath=%2Fsecret%3Finvite%3D1");
+    expect(unauthorized.headers.location).toBe(
+      "https://private.example.com/_shelter/access/dom_site_access?returnPath=%2Fsecret%3Finvite%3D1"
+    );
 
     const wrongHost = await app.inject({
       method: "GET",

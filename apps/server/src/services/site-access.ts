@@ -192,9 +192,16 @@ export function registerSiteAccessRoutes(
       return reply.code(204).send();
     }
     const returnPath = safeReturnPath(headerValue(request.headers["x-forwarded-uri"]));
+    const forwardedProtocol = headerValue(request.headers["x-forwarded-proto"]).split(",")[0]?.trim().toLowerCase();
+    const protocol = forwardedProtocol === "http" || forwardedProtocol === "https" ? forwardedProtocol : "https";
+    const accessUrl = new URL(`${SITE_ACCESS_PATH}/${encodeURIComponent(domain.id)}`, `${protocol}://${domain.hostname}`);
+    accessUrl.searchParams.set("returnPath", returnPath);
     return reply
       .code(302)
-      .header("location", `${SITE_ACCESS_PATH}/${encodeURIComponent(domain.id)}?returnPath=${encodeURIComponent(returnPath)}`)
+      // ForwardAuth responses are produced by the internal API service. A
+      // relative Location would therefore be resolved by Traefik against
+      // http://api:7080 instead of the visitor-facing hostname.
+      .header("location", accessUrl.toString())
       .send();
   });
 
