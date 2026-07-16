@@ -13,6 +13,7 @@ import type {
   Domain,
   EnvironmentVariable,
   GitHubBranch,
+  GitHubPreviewCapability,
   GitHubManifestStartResult,
   GitHubProjectInput,
   GitHubRepository,
@@ -21,6 +22,7 @@ import type {
   HostnameAvailability,
   Overview,
   Project,
+  PullRequestPreviewsResponse,
   ProjectSourceAnalysis,
   ServerMetricsRange,
   ServerMetricsResponse,
@@ -540,6 +542,41 @@ export const api = {
     return unwrapGitHub(await request<GitHubSettings | { data: GitHubSettings } | { github: GitHubSettings }>(
       '/api/settings/github',
     ));
+  },
+
+  async githubPreviewCapability() {
+    const payload = await request<{ previewCapability: GitHubPreviewCapability }>(
+      '/api/settings/github/preview-capability',
+    );
+    return payload.previewCapability;
+  },
+
+  projectPullRequestPreviews(id: string) {
+    return request<PullRequestPreviewsResponse>(`/api/projects/${encodeURIComponent(id)}/previews`);
+  },
+
+  updateProjectPullRequestPreviewSettings(
+    id: string,
+    input: { enabled: boolean; domainId?: string; ttlHours: number },
+  ) {
+    return request<{ enabled: boolean; domainId: string | null; domainSuffix: string | null; ttlHours: number }>(
+      `/api/projects/${encodeURIComponent(id)}/previews/settings`,
+      { method: 'PUT', body: JSON.stringify(input) },
+    );
+  },
+
+  updateProjectPullRequestPreviewEnvironment(id: string, variables: EnvironmentVariable[]) {
+    return request<{ environmentKeys: string[]; inheritsProductionEnvironment: false }>(
+      `/api/projects/${encodeURIComponent(id)}/previews/environment`,
+      { method: 'PUT', body: JSON.stringify({ variables }) },
+    );
+  },
+
+  closeProjectPullRequestPreview(id: string, previewId: string) {
+    return request<{ preview: PullRequestPreviewsResponse['previews'][number] }>(
+      `/api/projects/${encodeURIComponent(id)}/previews/${encodeURIComponent(previewId)}`,
+      { method: 'DELETE' },
+    );
   },
 
   startGitHubManifest() {

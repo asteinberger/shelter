@@ -104,6 +104,8 @@ export interface Deployment {
   commitAuthor?: string;
   commitUrl?: string;
   trigger?: 'manual' | 'github_push' | 'rollback' | string;
+  scope?: 'production' | 'preview';
+  pullRequestPreviewId?: string | null;
   createdAt?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -134,7 +136,20 @@ export interface GitHubSettings {
   appUrl: string | null;
   installUrl: string | null;
   installations: GitHubInstallation[];
+  previewCapability?: GitHubPreviewCapability | null;
   error?: string | null;
+}
+
+export interface GitHubPreviewCapability {
+  ready: boolean;
+  configured: boolean;
+  pullRequestsPermission: boolean;
+  pullRequestEvent: boolean;
+  installationChecked?: boolean;
+  installationPullRequestsPermission?: boolean;
+  installationPullRequestEvent?: boolean;
+  installationSuspended?: boolean;
+  remediation: 'none' | 'configure_app' | 'update_existing_app' | 'approve_installation_update';
 }
 
 export interface GitHubRepository {
@@ -236,10 +251,58 @@ export interface Project {
   githubRepositoryPrivate?: boolean | null;
   githubConnectionError?: string | null;
   autoDeploy?: boolean;
+  previewDeploymentsEnabled?: boolean;
+  previewDomainId?: string | null;
+  previewDomainSuffix?: string | null;
+  previewTtlHours?: number;
   deletionStatus?: 'failed' | 'preparing' | 'queued' | 'running' | string | null;
   deletionError?: string | null;
   preview?: ProjectPreview;
   sourceAnalysis?: ProjectSourceAnalysis | null;
+}
+
+export type PullRequestPreviewStatus =
+  | 'queued'
+  | 'building'
+  | 'ready'
+  | 'failed'
+  | 'closing'
+  | 'closed'
+  | 'blocked';
+
+export interface PullRequestPreview {
+  id: string;
+  projectId: string;
+  pullRequestNumber: number;
+  headSha: string;
+  headRef: string;
+  baseRef: string;
+  generation: number;
+  deploymentId: string | null;
+  hostname: string;
+  url: string | null;
+  status: PullRequestPreviewStatus;
+  error: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+}
+
+export interface PullRequestPreviewSettings {
+  enabled: boolean;
+  domainId: string | null;
+  domainSuffix: string | null;
+  ttlHours: number;
+  maxActive: number;
+  inheritsProductionEnvironment: false;
+}
+
+export interface PullRequestPreviewsResponse {
+  settings: PullRequestPreviewSettings;
+  previewCapability: GitHubPreviewCapability;
+  environmentKeys: string[];
+  previews: PullRequestPreview[];
 }
 
 export interface OverviewStats {
