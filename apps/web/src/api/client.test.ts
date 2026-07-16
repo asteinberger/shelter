@@ -343,6 +343,67 @@ describe('github api', () => {
   });
 });
 
+describe('pull request preview api', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('loads capability and project preview state through encoded paths', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ previewCapability: {
+        ready: true,
+        configured: true,
+        pullRequestsPermission: true,
+        pullRequestEvent: true,
+        remediation: 'none',
+      } }))
+      .mockResolvedValueOnce(Response.json({
+        settings: { enabled: false, domainId: null, domainSuffix: null, ttlHours: 72, maxActive: 3, inheritsProductionEnvironment: false },
+        previewCapability: {
+          ready: true,
+          configured: true,
+          pullRequestsPermission: true,
+          pullRequestEvent: true,
+          installationChecked: true,
+          installationPullRequestsPermission: true,
+          installationPullRequestEvent: true,
+          installationSuspended: false,
+          remediation: 'none',
+        },
+        environmentKeys: [],
+        previews: [],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.githubPreviewCapability(123)).resolves.toMatchObject({ ready: true });
+    await expect(api.projectPullRequestPreviews('prj/42')).resolves.toMatchObject({ previews: [] });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/settings/github/preview-capability?installationId=123', expect.objectContaining({ credentials: 'include' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/projects/prj%2F42/previews', expect.objectContaining({ credentials: 'include' }));
+  });
+
+  it('sends strict preview settings, isolated environment, and cleanup requests', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ enabled: true, domainId: 'dom_1', domainSuffix: 'example.com', ttlHours: 48 }))
+      .mockResolvedValueOnce(Response.json({ environmentKeys: ['PREVIEW_TOKEN'], inheritsProductionEnvironment: false }))
+      .mockResolvedValueOnce(Response.json({ preview: { id: 'preview/1', status: 'closing' } }, { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.updateProjectPullRequestPreviewSettings('prj/42', { enabled: true, domainId: 'dom_1', ttlHours: 48 });
+    await api.updateProjectPullRequestPreviewEnvironment('prj/42', [{ key: 'PREVIEW_TOKEN', value: 'secret' }]);
+    await api.closeProjectPullRequestPreview('prj/42', 'preview/1');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/projects/prj%2F42/previews/settings', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ enabled: true, domainId: 'dom_1', ttlHours: 48 }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/projects/prj%2F42/previews/environment', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ variables: [{ key: 'PREVIEW_TOKEN', value: 'secret' }] }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/projects/prj%2F42/previews/preview%2F1', expect.objectContaining({ method: 'DELETE' }));
+  });
+});
+
 describe('access token api', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

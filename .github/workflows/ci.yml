@@ -106,11 +106,19 @@ jobs:
           set -euo pipefail
           dash -n install.sh \
             ops/create-release-manifest.sh \
+            ops/lib/deploy-release-remote.sh \
             ops/download-release.sh \
             ops/install-release-bundle.sh \
             ops/lib/release-bundle.sh \
             ops/verify-release-bundle.sh
-          bash -n ops/deploy.sh test/install.test.sh test/release-bundle.test.sh
+          bash -n \
+            ops/deploy.sh \
+            ops/deploy-release.sh \
+            ops/lib/server-connection.sh \
+            test/development-workflow.test.sh \
+            test/deploy-release.test.sh \
+            test/install.test.sh \
+            test/release-bundle.test.sh
 
       - name: Test installer
         shell: bash
@@ -118,6 +126,7 @@ jobs:
           set -euo pipefail
           bash test/install.test.sh
           bash test/release-bundle.test.sh
+          bash test/deploy-release.test.sh
 
   compose:
     name: Compose configuration
@@ -154,3 +163,38 @@ jobs:
 
       - name: Build control-plane image
         run: docker build --pull --tag "shelter-ci:${GITHUB_SHA}" .
+
+  development-integration:
+    name: Development integration gate
+    if: ${{ always() }}
+    needs:
+      - workflows
+      - application
+      - installer
+      - compose
+      - container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the complete integration suite
+        shell: bash
+        env:
+          APPLICATION_RESULT: ${{ needs.application.result }}
+          COMPOSE_RESULT: ${{ needs.compose.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+          INSTALLER_RESULT: ${{ needs.installer.result }}
+          WORKFLOW_RESULT: ${{ needs.workflows.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "$WORKFLOW_RESULT" \
+            "$APPLICATION_RESULT" \
+            "$INSTALLER_RESULT" \
+            "$COMPOSE_RESULT" \
+            "$CONTAINER_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "The full development integration suite did not pass." >&2
+              exit 1
+            fi
+          done
+          echo "Application, installer, Compose, container, and workflow checks passed together."

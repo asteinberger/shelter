@@ -14,14 +14,17 @@ import { registerApiTokenRoutes } from "./routes/api-tokens.js";
 import { registerOpenApiRoutes } from "./routes/openapi.js";
 import { registerGithubRoutes } from "./routes/github.js";
 import { registerProjectRoutes } from "./routes/projects.js";
+import { registerProjectObservabilityRoutes } from "./routes/project-observability.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { registerServerMetricsRoutes } from "./routes/server-metrics.js";
+import { registerPullRequestPreviewRoutes } from "./routes/pull-request-previews.js";
 import { bootstrapAdmin, installAuthHook, registerAuthRoutes } from "./services/auth.js";
 import { CloudflareService } from "./services/cloudflare.js";
 import { GitHubService } from "./services/github.js";
 import { panelHostnames } from "./services/panel-domains.js";
 import { reconcileRouting } from "./services/routing.js";
 import { registerUploadRoutes, UploadService } from "./services/uploads.js";
+import { PreviewDnsReconciler } from "./services/preview-dns-reconciler.js";
 
 export async function createApp(config: AppConfig, database = new Database(config)): Promise<FastifyInstance> {
   await bootstrapAdmin(config, database);
@@ -70,15 +73,20 @@ export async function createApp(config: AppConfig, database = new Database(confi
   const uploads = new UploadService(config, database);
   const cloudflare = new CloudflareService(config, database);
   const github = new GitHubService(config, database);
+  const previewDns = new PreviewDnsReconciler(database, cloudflare);
   registerAuthRoutes(app, config, database);
   registerOpenApiRoutes(app);
   registerApiTokenRoutes(app, database);
   registerUploadRoutes(app, uploads);
   registerProjectRoutes(app, config, database, uploads, cloudflare, github);
+  registerPullRequestPreviewRoutes(app, config, database, cloudflare, github);
+  registerProjectObservabilityRoutes(app, config, database);
   registerDeploymentRoutes(app, database);
   registerSettingsRoutes(app, cloudflare);
   registerGithubRoutes(app, github);
   registerServerMetricsRoutes(app, config, database);
+  previewDns.start();
+  app.addHook("onClose", async () => previewDns.stop());
 
   app.get("/api/healthz", async () => {
     const heartbeat = database.getSetting("worker.heartbeat");

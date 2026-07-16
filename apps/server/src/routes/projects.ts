@@ -658,6 +658,15 @@ export function registerProjectRoutes(
       mutableProject(database, current.id);
       throw conflict("Projektstatus hat sich während der Änderung geändert", "PROJECT_MUTATION_CONFLICT");
     }
+    if (
+      input.repositoryBranch !== undefined
+      && input.repositoryBranch !== current.repository_branch
+    ) {
+      for (const preview of database.listPullRequestPreviews(project.id)) {
+        if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
+      }
+      reconcileRouting(config, database);
+    }
     return { project: presentApiProject(config, project, database.listDomains(current.id), database.listDeployments(current.id)) };
   });
 
@@ -686,10 +695,17 @@ export function registerProjectRoutes(
         github_installation_id: input.installationId,
         github_connection_error: null,
         source_analysis_json: sourceAnalysis ? JSON.stringify(sourceAnalysis) : null,
-        auto_deploy: input.autoDeploy ? 1 : 0
+        auto_deploy: input.autoDeploy ? 1 : 0,
+        preview_deployments_enabled: 0,
+        preview_domain_id: null,
+        preview_domain_suffix: null
       }, { clearPendingGithubPush: true }),
       "Projektstatus hat sich während der GitHub-Verknüpfung geändert"
     );
+    for (const preview of database.listPullRequestPreviews(project.id)) {
+      if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
+    }
+    reconcileRouting(config, database);
     return {
       project: presentApiProject(config,
         project,
@@ -714,10 +730,17 @@ export function registerProjectRoutes(
         github_repository_full_name: null,
         github_installation_id: null,
         github_connection_error: null,
-        auto_deploy: 0
+        auto_deploy: 0,
+        preview_deployments_enabled: 0,
+        preview_domain_id: null,
+        preview_domain_suffix: null
       }, { clearPendingGithubPush: true }),
       "Projektstatus hat sich während der GitHub-Trennung geändert"
     );
+    for (const preview of database.listPullRequestPreviews(project.id)) {
+      if (preview.status !== "closed") database.requestPullRequestPreviewClose(project.id, preview.id);
+    }
+    reconcileRouting(config, database);
     return {
       project: presentApiProject(config,
         project,
@@ -865,7 +888,13 @@ export function registerProjectRoutes(
   });
 
   app.delete<{ Params: { id: string; domainId: string } }>("/api/projects/:id/domains/:domainId", { preHandler: requireScopedMutation("domains:write") }, async (request, reply) => {
-    mutableProject(database, request.params.id);
+    const project = mutableProject(database, request.params.id);
+    if (project.preview_deployments_enabled === 1 && project.preview_domain_id === request.params.domainId) {
+      throw conflict(
+        "Deaktiviere Pull-Request-Previews oder wähle zuerst eine andere Preview-Domain",
+        "PREVIEW_DOMAIN_IN_USE"
+      );
+    }
     const claimed = database.claimDomainDeletion(request.params.id, request.params.domainId);
     if (claimed.kind === "project_unavailable") {
       mutableProject(database, request.params.id);

@@ -18,6 +18,8 @@ import {
   type ProjectAnalysis,
   type ProjectFileFact
 } from "./project-analysis.js";
+import { pullRequestPreviewHostname } from "./pull-request-previews.js";
+import { reconcileRouting } from "./routing.js";
 
 export const GITHUB_MANIFEST_CALLBACK_PATH = "/api/settings/github/manifest/callback";
 export const GITHUB_SETUP_CALLBACK_PATH = "/api/settings/github/setup/callback";
@@ -69,7 +71,9 @@ const InstallationSchema = z.object({
     avatar_url: z.url().nullable().optional()
   }),
   repository_selection: z.enum(["all", "selected"]).optional().default("selected"),
-  suspended_at: z.string().nullable().optional()
+  suspended_at: z.string().nullable().optional(),
+  permissions: z.record(z.string(), z.string()).optional().default({}),
+  events: z.array(z.string()).optional().default([])
 }).passthrough();
 
 const RepositorySchema = z.object({
@@ -104,6 +108,11 @@ const InstallationTokenSchema = z.object({
   expires_at: z.iso.datetime()
 }).passthrough();
 
+const AppCapabilitySchema = z.object({
+  permissions: z.record(z.string(), z.string()).default({}),
+  events: z.array(z.string()).default([])
+}).passthrough();
+
 const GitTreeSchema = z.object({
   sha: z.string().regex(/^[a-f0-9]{40,64}$/i),
   truncated: z.boolean().optional().default(false),
@@ -131,6 +140,36 @@ const PushSchema = z.object({
   })
 }).passthrough();
 
+const PullRequestEventSchema = z.object({
+  action: z.enum(["opened", "reopened", "synchronize", "closed"]),
+  installation: z.object({ id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]) }),
+  repository: z.object({
+    id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]),
+    full_name: z.string().min(3).max(512)
+  }),
+  sender: z.object({ login: z.string().min(1).max(255) }),
+  pull_request: z.object({
+    number: z.number().int().positive().max(2_147_483_647),
+    title: z.string().max(4096),
+    html_url: z.url(),
+    head: z.object({
+      sha: z.string().regex(/^[a-f0-9]{40,64}$/i),
+      ref: z.string().min(1).max(255),
+      repo: z.object({
+        id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]),
+        full_name: z.string().min(3).max(512)
+      }).nullable()
+    }),
+    base: z.object({
+      ref: z.string().min(1).max(255),
+      repo: z.object({
+        id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]),
+        full_name: z.string().min(3).max(512)
+      })
+    })
+  })
+}).passthrough();
+
 const InstallationEventSchema = z.object({
   action: z.string().min(1).max(64),
   installation: z.object({ id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]) })
@@ -155,8 +194,8 @@ export interface GitHubManifest {
   setup_url: string;
   public: false;
   request_oauth_on_install: false;
-  default_permissions: { contents: "read"; statuses: "write"; metadata: "read" };
-  default_events: ["push"];
+  default_permissions: { contents: "read"; statuses: "write"; metadata: "read"; pull_requests: "read" };
+  default_events: ["push", "pull_request"];
 }
 
 export interface GitHubInstallation {
@@ -197,6 +236,18 @@ export interface GitHubState {
   appUrl: string | null;
   htmlUrl: string | null;
   installUrl: string | null;
+}
+
+export interface GitHubPreviewCapability {
+  ready: boolean;
+  configured: boolean;
+  pullRequestsPermission: boolean;
+  pullRequestEvent: boolean;
+  installationChecked: boolean;
+  installationPullRequestsPermission: boolean | null;
+  installationPullRequestEvent: boolean | null;
+  installationSuspended: boolean | null;
+  remediation: "none" | "configure_app" | "update_existing_app" | "approve_installation_update";
 }
 
 interface GithubFetchOptions {
@@ -247,6 +298,64 @@ export class GitHubService {
     };
   }
 
+  async previewCapability(installationId?: string): Promise<GitHubPreviewCapability> {
+    if (!this.state().configured) {
+      return {
+        ready: false,
+        configured: false,
+        pullRequestsPermission: false,
+        pullRequestEvent: false,
+        installationChecked: Boolean(installationId),
+        installationPullRequestsPermission: installationId ? false : null,
+        installationPullRequestEvent: installationId ? false : null,
+        installationSuspended: null,
+        remediation: "configure_app"
+      };
+    }
+    const app = this.parseUpstream(
+      AppCapabilitySchema,
+      await this.githubRequest<unknown>("/app", { appAuthentication: true })
+    );
+    const pullRequestsPermission = app.permissions.pull_requests === "read" || app.permissions.pull_requests === "write";
+    const pullRequestEvent = app.events.includes("pull_request");
+    if (installationId) {
+      const installation = this.parseUpstream(InstallationSchema, await this.githubRequest<unknown>(
+        `/app/installations/${this.installationId(installationId)}`,
+        { appAuthentication: true }
+      ));
+      const installationPullRequestsPermission = installation.permissions.pull_requests === "read"
+        || installation.permissions.pull_requests === "write";
+      const installationPullRequestEvent = installation.events.includes("pull_request");
+      const installationSuspended = Boolean(installation.suspended_at);
+      const appReady = pullRequestsPermission && pullRequestEvent;
+      const installationReady = installationPullRequestsPermission
+        && installationPullRequestEvent
+        && !installationSuspended;
+      return {
+        ready: appReady && installationReady,
+        configured: true,
+        pullRequestsPermission,
+        pullRequestEvent,
+        installationChecked: true,
+        installationPullRequestsPermission,
+        installationPullRequestEvent,
+        installationSuspended,
+        remediation: !appReady ? "update_existing_app" : installationReady ? "none" : "approve_installation_update"
+      };
+    }
+    return {
+      ready: pullRequestsPermission && pullRequestEvent,
+      configured: true,
+      pullRequestsPermission,
+      pullRequestEvent,
+      installationChecked: false,
+      installationPullRequestsPermission: null,
+      installationPullRequestEvent: null,
+      installationSuspended: null,
+      remediation: pullRequestsPermission && pullRequestEvent ? "none" : "update_existing_app"
+    };
+  }
+
   startManifest(userId: string, sessionTokenHash: string): {
     registrationUrl: string;
     manifest: GitHubManifest;
@@ -279,10 +388,10 @@ export class GitHubService {
       setup_url: `${origin}${GITHUB_SETUP_CALLBACK_PATH}?state=${encodeURIComponent(setupState)}`,
       public: false,
       request_oauth_on_install: false,
-      default_permissions: { contents: "read", statuses: "write", metadata: "read" },
+      default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
       // GitHub Apps always receive installation and installation_repositories.
       // GitHub rejects manifests that try to subscribe to those implicit events.
-      default_events: ["push"]
+      default_events: ["push", "pull_request"]
     };
     return {
       registrationUrl: `${GITHUB_REGISTRATION_URL}?state=${encodeURIComponent(state)}`,
@@ -324,6 +433,7 @@ export class GitHubService {
       this.database.setSetting(SETUP_STATE_HASH_KEY, hashToken(setupState));
       this.database.deleteGithubManifestFlows();
     })();
+    reconcileRouting(this.config, this.database);
     this.invalidateAllInstallationTokens();
     return { installUrl: `${appUrl}/installations/new` };
   }
@@ -351,6 +461,7 @@ export class GitHubService {
       this.database.deleteGithubManifestFlows();
       this.database.disconnectGithubProjects();
     })();
+    reconcileRouting(this.config, this.database);
     this.invalidateAllInstallationTokens();
     return this.state();
   }
@@ -516,17 +627,25 @@ export class GitHubService {
     projectId: string
   ): Promise<void> {
     const token = await this.installationToken(status.installation_id, status.repository_id);
-    const panelDomain = this.database.getSetting("cloudflare.panel_domain");
-    const targetUrl = panelDomain
-      ? `https://${panelDomain}/projects/${encodeURIComponent(projectId)}?tab=deployments&deployment=${encodeURIComponent(status.deployment_id)}`
+    const deployment = this.database.getDeployment(status.deployment_id);
+    const preview = deployment?.deployment_scope === "preview" && deployment.preview_id
+      ? this.database.getPullRequestPreview(deployment.preview_id)
       : undefined;
+    const panelDomain = this.database.getSetting("cloudflare.panel_domain");
+    const targetUrl = preview?.status === "ready"
+      ? `https://${preview.hostname}`
+      : panelDomain
+        ? deployment?.deployment_scope === "preview"
+          ? `https://${panelDomain}/projects/${encodeURIComponent(projectId)}?tab=previews&preview=${encodeURIComponent(preview?.id ?? "")}`
+          : `https://${panelDomain}/projects/${encodeURIComponent(projectId)}?tab=deployments&deployment=${encodeURIComponent(status.deployment_id)}`
+        : undefined;
     await this.githubRequest(`/repos/${this.repositoryPath(status.repository_full_name)}/statuses/${encodeURIComponent(status.commit_sha)}`, {
       method: "POST",
       token,
       body: {
         state: status.desired_state,
         description: status.description,
-        context: "shelter/deploy",
+        context: deployment?.deployment_scope === "preview" ? "shelter/preview" : "shelter/deploy",
         ...(targetUrl ? { target_url: targetUrl } : {})
       }
     });
@@ -571,16 +690,25 @@ export class GitHubService {
       }
       const result = eventName === "push"
         ? this.acceptPush(deliveryId, payload)
+        : eventName === "pull_request"
+          ? this.acceptPullRequest(deliveryId, payload)
         : eventName === "installation"
           ? this.handleInstallation(payload)
           : eventName === "installation_repositories"
             ? this.handleInstallationRepositories(payload)
             : { queued: 0, pending: 0, ignored: 1 };
-      const status = result.pending > 0 ? "processed" : "ignored";
+      const status = result.pending > 0 || result.queued > 0 ? "processed" : "ignored";
       this.database.finishGithubWebhookDelivery(deliveryId, status);
       return { duplicate: false, ...result };
     });
-    return accept.immediate();
+    const result = accept.immediate();
+    // A close or GitHub-App/repository revocation must unpublish the route even
+    // when the worker is offline. Reconcile duplicates as well: if the atomic
+    // file replacement failed, GitHub's retry gets another safe attempt.
+    if (["pull_request", "installation", "installation_repositories"].includes(eventName)) {
+      reconcileRouting(this.config, this.database);
+    }
+    return result;
   }
 
   async processNextWebhookJob(): Promise<boolean> {
@@ -666,6 +794,80 @@ export class GitHubService {
       deliveryId
     });
     return { queued: 0, pending: linked.length, ignored: 0 };
+  }
+
+  private acceptPullRequest(deliveryId: string, rawPayload: unknown): {
+    queued: number;
+    pending: number;
+    ignored: number;
+  } {
+    const payload = PullRequestEventSchema.parse(rawPayload);
+    const installationId = String(payload.installation.id);
+    const repositoryId = String(payload.repository.id);
+    const pullRequest = payload.pull_request;
+
+    // GitHub's outer repository and PR base repository must describe the exact
+    // installation repository. Never trust head metadata for project lookup.
+    if (
+      String(pullRequest.base.repo.id) !== repositoryId ||
+      pullRequest.base.repo.full_name.toLowerCase() !== payload.repository.full_name.toLowerCase()
+    ) return { queued: 0, pending: 0, ignored: 1 };
+
+    const projects = this.database.listGithubPreviewProjects(
+      installationId,
+      repositoryId,
+      pullRequest.base.ref
+    );
+    if (projects.length === 0) return { queued: 0, pending: 0, ignored: 1 };
+
+    if (payload.action === "closed") {
+      let closed = 0;
+      for (const project of projects) {
+        const preview = this.database.findPullRequestPreview(project.id, pullRequest.number);
+        if (preview && this.database.requestPullRequestPreviewClose(project.id, preview.id)) closed += 1;
+      }
+      return { queued: 0, pending: closed, ignored: closed === 0 ? 1 : 0 };
+    }
+
+    // A fork (including a deleted/null head repository) is untrusted. Shelter
+    // deliberately has no opt-out for this guard because builds can execute a
+    // repository-controlled Dockerfile.
+    if (
+      !pullRequest.head.repo ||
+      String(pullRequest.head.repo.id) !== repositoryId ||
+      pullRequest.head.repo.full_name.toLowerCase() !== payload.repository.full_name.toLowerCase()
+    ) return { queued: 0, pending: 0, ignored: projects.length };
+
+    let queued = 0;
+    let pending = 0;
+    let ignored = 0;
+    for (const project of projects) {
+      const suffix = project.preview_domain_suffix;
+      if (!suffix) {
+        ignored += 1;
+        continue;
+      }
+      const hostname = pullRequestPreviewHostname(pullRequest.number, project.slug, suffix);
+      const result = this.database.queuePullRequestPreview({
+        projectId: project.id,
+        pullRequestNumber: pullRequest.number,
+        headSha: pullRequest.head.sha.toLowerCase(),
+        headRef: pullRequest.head.ref,
+        baseRef: pullRequest.base.ref,
+        repositoryId,
+        repositoryFullName: payload.repository.full_name,
+        deliveryId,
+        hostname,
+        expiresAt: new Date(Date.now() + (project.preview_ttl_hours ?? 72) * 60 * 60_000).toISOString(),
+        commitMessage: pullRequest.title.slice(0, 4096),
+        commitAuthor: payload.sender.login.slice(0, 255),
+        commitUrl: this.validatedGithubUrl(pullRequest.html_url)
+      });
+      if (result.kind === "queued") queued += 1;
+      else if (result.kind === "coalesced") pending += 1;
+      else ignored += 1;
+    }
+    return { queued, pending, ignored };
   }
 
   private handleInstallation(rawPayload: unknown): { queued: 0; pending: 0; ignored: number } {

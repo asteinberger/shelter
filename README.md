@@ -51,7 +51,7 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 - **Safe activation:** a disposable, resource-bounded helper probes each candidate on its project-only network before Traefik receives the new route.
 - **Cloudflare integration:** OAuth, tunnels, zones, DNS, hostname availability, apex domains, and multiple project domains in one place.
 - **Instant context:** successful website deployments receive an automatic screenshot preview in the project overview.
-- **Operator-ready:** dashboard, live deployment logs, rollbacks, project deletion, encrypted variables, and resource limits.
+- **Operator-ready:** dashboard, deployment logs, rollbacks, project deletion, encrypted variables, resource limits, and per-project runtime observability.
 - **Automation-ready:** scoped, expiring personal access tokens, a documented HTTP API, OpenAPI, and an installable `shelter` CLI.
 - **Verifiable releases:** immutable GitHub Releases, digest-pinned multi-platform images, signed provenance, downloadable SBOMs, and a fail-closed release installer.
 - **Multilingual panel:** English and German with browser detection and a persistent language preference.
@@ -140,7 +140,9 @@ Only the worker mounts `/var/run/docker.sock`. The worker stays on the control n
 
 Candidate health probes and screenshot captures run in disposable containers on the matching project network. They have no Docker socket or host bind mount, use a read-only root filesystem, drop all capabilities, enforce memory/CPU/PID/time bounds, and are ownership-checked before removal. Builds use Shelter's dedicated Docker-container BuildKit builder with independently configured memory, swap, CPU, PID, and maximum-parallelism bounds plus a builder-cache GC target. A continuously sampled free-space guard cancels cancellable source/build work and refuses completion when the data filesystem falls below `BUILD_MIN_FREE_GB`.
 
-The worker samples host capacity and managed-container aggregates every 15 seconds. It stores at most the configured retention window in SQLite; Docker stats are limited to Shelter-labelled containers and refreshed no more than once per minute. The session-only metrics endpoint never receives the Docker socket.
+The worker samples host capacity, managed-container aggregates, and each active project's production runtime at the configured metrics interval (15 seconds by default). It stores at most the configured retention window in SQLite; Docker inspection is restricted to Shelter-owned containers whose project and active-deployment labels match database state. Host and project observability endpoints are administrator-session-only and never receive the Docker socket.
+
+Runtime output is collected by the worker on that same interval, separately from immutable build/deployment logs. Shelter keeps at most 5,000 runtime lines per project and serves at most 500 lines at a time for the active deployment. Exact configured environment-variable values are redacted before persistence, but applications can still emit derived, encoded, reformatted, or otherwise sensitive data. Treat runtime logs as sensitive administrator data and do not describe the interval-based view as instantaneous streaming.
 
 ## Installation
 
@@ -315,6 +317,14 @@ Per project, choose whether push-to-deploy is enabled:
 
 **Deploy current source** always fetches the latest branch HEAD and creates a new deployment. Installation and webhook state are checked server-side. Private clones use short-lived, repository-scoped installation tokens.
 
+#### Pull-request preview deployments
+
+GitHub App projects can explicitly opt into pull-request previews and select one active project domain as their Cloudflare zone source. Shelter publishes a successful preview at a single-label zone hostname such as `pr-42--my-app-ab12cd34.example.com`, reports every admitted or limit-blocked build through the `shelter/preview` commit status, and removes the bounded runtime, route, image, and exact owned DNS record when the pull request closes or its 1–168 hour TTL expires. During a rebuild or failed update, the last successful generation stays routed until a healthy replacement switches atomically.
+
+Preview builds are deliberately fail-closed: the PR base branch must equal the project's configured branch, the head repository ID and full name must exactly equal the installed repository, and fork PRs are never built. A project can have at most three active previews. Synchronize events coalesce to the newest SHA and cooperatively cancel a running obsolete build. Preview variables live in a separate encrypted set and production variables are never inherited.
+
+Newly registered Shelter GitHub Apps request `Pull requests: Read-only` and subscribe to the `pull_request` event. Apps registered before this feature must be updated under **GitHub → Settings → Developer settings → GitHub Apps → Shelter → Permissions & events** and their installation must accept the changed permission. The separately cached `/api/settings/github/preview-capability?installationId=...` check distinguishes App configuration from installation approval without coupling local preview lifecycle polling to GitHub availability; Shelter refuses opt-in until both are ready instead of silently assuming that events will arrive.
+
 ### HTTPS Git
 
 Provide a public HTTPS repository URL and branch. Embedded credentials, custom ports, URL queries and fragments, local paths, SSH URLs, and interactive Git authentication are rejected.
@@ -382,6 +392,7 @@ Each domain is routed through the same Cloudflare Tunnel to Traefik. A domain ne
 - **Replace source:** upload a new ZIP or folder for upload-backed projects.
 - **Redeploy:** fetch the latest configured Git branch or rebuild the current uploaded source.
 - **Rollback:** reactivate a previously successful deployment.
+- **Observe:** inspect active-container CPU and memory against project limits, network and block I/O, uptime, restarts, OOM and health state, bounded history, and near-live runtime output.
 - **Delete project:** remove routes, project containers and images, stored source, previews, deployments, and owned DNS associations after confirmation.
 
 Each deployment runs in a version-bound container on its project's own bridge network. The current runtime stays online while its candidate is built and probed by a disposable bounded helper on that same project network; the worker itself never joins the network. Shelter then changes the persisted active deployment and Traefik routing atomically, and removes the previous runtime only after the switch commits. Screenshot capture uses a separate bounded helper with the same isolation. A failed candidate or routing update keeps or restores the previous deployment. Deployment logs are streamed in the panel.
@@ -408,8 +419,8 @@ Start from `.env.example`. The most commonly changed settings are:
 | `BUILD_PIDS_LIMIT` | `1024` | Dedicated BuildKit builder PID limit |
 | `BUILD_MAX_PARALLELISM` | `2` | Maximum concurrent BuildKit solver work per builder |
 | `BUILD_MIN_FREE_GB` | `5` | Minimum free data-filesystem space required before a build |
-| `METRICS_INTERVAL_SECONDS` | `15` | Server-metrics sample interval |
-| `METRICS_RETENTION_HOURS` | `48` | Raw server-metrics retention window |
+| `METRICS_INTERVAL_SECONDS` | `15` | Host/project metrics and runtime-log collection interval |
+| `METRICS_RETENTION_HOURS` | `48` | Raw host/project metrics and runtime-log retention window |
 | `SESSION_TTL_HOURS` | `24` | Administrator session lifetime |
 | `LOG_LEVEL` | `info` | API and worker log level |
 | `CLOUDFLARE_ACCOUNT_ID` | empty | Optional API-token fallback account |
@@ -489,25 +500,33 @@ Redeploy every project on a new VPS so application images and stable containers 
 
 ## Update
 
-For production, download the desired immutable release into a new directory and
-run its release installer:
+For production, use the verified-release deployer from a trusted local Shelter
+checkout. It authenticates the immutable GitHub Release and asset attestation
+locally, transports only that bundle, verifies it again in a root-owned remote
+staging directory, publishes the release directory atomically, installs the OCI
+image by digest, and finishes with `doctor`:
 
 ```sh
-./ops/download-release.sh \
-  --repo asteinberger/shelter \
-  --tag v0.2.1 \
-  --destination ../shelter-v0.2.1
-cd ../shelter-v0.2.1
-./ops/install-release-bundle.sh \
-  --installation /opt/shelter \
-  -- --non-interactive
-/opt/shelter/install.sh doctor
+cp .env.server.example .env.server
+chmod 600 .env.server
+# Fill in .env.server; use the root SSH account and prefer an SSH key.
+./ops/deploy-release.sh --tag v0.2.1 --dry-run
+./ops/deploy-release.sh --tag v0.2.1
 ```
 
+The dry run still transfers the authenticated bundle into a unique protected
+temporary directory so the VPS can repeat bundle verification and the release
+installer's own dry run. Cleanup removes that stage; no release is published or
+installed. The real run keeps immutable bundles under
+`/opt/shelter/releases/vMAJOR.MINOR.PATCH`. Repeating the same tag is safe only
+when its authenticated manifest is byte-for-byte identical; different content
+under an existing tag fails closed. Use `--repo OWNER/REPOSITORY` for a reviewed
+fork release and `--server-env FILE` for another protected target file.
+
 The release path verifies GitHub's signed release and asset attestations,
-bundle checksums, and the OCI digest. It does not rebuild the control plane on
-the VPS. See [Shelter releases](docs/RELEASES.md) for prerequisites and
-independent verification commands.
+bundle checksums, and the OCI digest. It never rebuilds the control plane on the
+VPS. See [Shelter releases](docs/RELEASES.md) for prerequisites, the manual
+download/install alternative, and independent verification commands.
 
 For an intentionally reviewed source build, fetch the desired revision and let
 the normal installer build it locally:
@@ -566,7 +585,12 @@ chmod 600 .env.server
 ./ops/deploy.sh
 ```
 
-The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, serializes remote deploys, protects installer locks and in-repository backups from rsync deletion, and invokes the same `./install.sh --non-interactive` path on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup.
+The helper refuses group- or world-readable configuration, verifies the SSH host key with `accept-new`, serializes remote deploys, protects installer locks, immutable release directories, and in-repository backups from rsync deletion, and invokes the same `./install.sh --non-interactive` path on the VPS. Runtime `.env` and persistent data are preserved. Password fallback uses a temporary `SSH_ASKPASS` helper, but an SSH key remains the recommended permanent setup. Clone and worktree `.git` metadata is excluded entirely so a local worktree pointer can never be copied to the host.
+
+`ops/deploy.sh` intentionally deploys reviewed source and builds on the VPS. For
+production releases, use `ops/deploy-release.sh` instead. Both helpers share the
+same strict `.env.server`, SSH key/password handling, and protected
+`SSH_ASKPASS` connection setup; neither prints or transfers server credentials.
 
 ## Security
 
@@ -576,6 +600,7 @@ The helper refuses group- or world-readable configuration, verifies the SSH host
 - Allow inbound SSH only. Shelter needs no public ports 80, 443, or 7080.
 - Prefer SSH keys, restrict root login, and update the host, Docker Engine, and images regularly.
 - Never share `.env`, volume backups, Cloudflare credentials, or unredacted deployment logs.
+- Runtime logs are administrator-only and bounded, but they remain application-controlled output. Exact environment values are redacted; derived or reformatted secrets may remain and must not be shared without review.
 
 The worker's Docker socket is effectively host-root access. API, Traefik, `cloudflared`, and project containers do not receive it. This reduces attack surface but does not create safe hostile multi-tenancy. Read [SECURITY.md](SECURITY.md) for the full threat model and secret handling rules.
 
@@ -605,6 +630,7 @@ docker compose logs --tail=200 api worker traefik cloudflared
 - **A Portsmith migration failed after a Shelter API container was created:** the deploy helper deliberately leaves both generations of API and worker stopped. Rerun the Shelter installer to finish the forward migration, or restore the verified pre-update snapshot before starting legacy binaries. Never run both generations against the same volume.
 - **Image pull is temporarily unavailable:** retry normally first. `--no-pull` is only appropriate when every required runtime and base image is already present and trusted locally.
 - **A stale operation lock remains after a hard crash:** verify that no `install.sh` or `ops/deploy.sh` process is running. Remove only the `pid`, `owner`, and `kind` files that exist inside `.shelter-install.lock`, remove the empty directory, and retry.
+- **A verified-release deploy was interrupted between SSH steps:** verify that no `ops/deploy-release.sh`, `ops/deploy.sh`, `install.sh`, or rollback process still targets the VPS. Inspect the shared `/opt/shelter/.shelter-install.lock` and its token-owned directory below `releases/.incoming`; remove only that matching stale stage plus the lock's `pid`, `owner`, and `kind` files. Never replace or delete an existing version directory to retry a tag.
 
 Treat `.shelter-install.log` as operationally sensitive and redact it before sharing. On success the installer removes it automatically.
 
@@ -680,7 +706,7 @@ A real end-to-end smoke test requires a disposable VPS, an active Cloudflare zon
 - no hostile multi-tenancy or sandbox for untrusted Docker builds,
 - one dedicated local BuildKit builder and cache per Shelter installation,
 - GitHub App support for private repositories, but no other private Git providers, SSH keys, or deploy tokens,
-- no pull-request preview deployments or branch-per-environment model,
+- pull-request previews are GitHub-App only; there is no general branch-per-environment model,
 - no Shelter-managed persistent application volumes or database services,
 - HTTP applications only; no TCP or UDP proxying,
 - domains must be active zones in the connected Cloudflare account,

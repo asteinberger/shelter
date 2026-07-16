@@ -1,0 +1,7 @@
+# Distribution and repository-policy changes need explicit maintainer review.
+/.github/workflows/ @asteinberger
+/.github/CODEOWNERS @asteinberger
+/ops/check-pr-policy.mjs @asteinberger
+/ops/lib/development-policy.mjs @asteinberger
+/ops/prepare-release.mjs @asteinberger
+/docs/RELEASES.md @asteinberger

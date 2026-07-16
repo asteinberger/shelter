@@ -92,6 +92,11 @@ export interface ProjectRow {
   github_repository_full_name?: string | null;
   github_installation_id?: string | null;
   auto_deploy?: 0 | 1;
+  /** Pull-request preview deployments are explicit opt-in and GitHub-App only. */
+  preview_deployments_enabled?: 0 | 1;
+  preview_domain_id?: string | null;
+  preview_domain_suffix?: string | null;
+  preview_ttl_hours?: number;
   github_connection_error?: string | null;
   /** Last server-validated source analysis. Optional for backwards-compatible tests/migrations. */
   source_analysis_json?: string | null;
@@ -140,6 +145,9 @@ export interface DeploymentRow {
   commit_url?: string | null;
   trigger?: DeploymentTrigger;
   github_delivery_id?: string | null;
+  /** Preview deployments never become projects.active_deployment_id. */
+  deployment_scope?: "production" | "preview";
+  preview_id?: string | null;
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -234,6 +242,64 @@ export interface ServerMetricHistoryRow {
   application_network_transmit_bytes_per_second: number;
 }
 
+export type ProjectRuntimeStatus =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead"
+  | "missing"
+  | "unknown";
+
+export type ProjectRuntimeHealth = "healthy" | "unhealthy" | "starting" | "none" | "unknown";
+
+export interface ProjectMetricSampleRow {
+  project_id: string;
+  deployment_id: string;
+  sampled_at: number;
+  runtime_status: ProjectRuntimeStatus;
+  health_status: ProjectRuntimeHealth;
+  started_at: string | null;
+  uptime_seconds: number;
+  restart_count: number;
+  oom_killed: 0 | 1;
+  cpu_usage_percent: number;
+  cpu_limit_cores: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_usage_percent: number;
+  network_received_bytes: number;
+  network_transmitted_bytes: number;
+  network_receive_bytes_per_second: number;
+  network_transmit_bytes_per_second: number;
+  block_read_bytes: number;
+  block_write_bytes: number;
+}
+
+export interface ProjectMetricHistoryRow {
+  sampled_at: number;
+  cpu_usage_percent: number;
+  memory_used_bytes: number;
+  memory_limit_bytes: number;
+  memory_usage_percent: number;
+  network_receive_bytes_per_second: number;
+  network_transmit_bytes_per_second: number;
+  block_read_bytes: number;
+  block_write_bytes: number;
+}
+
+export interface RuntimeLogRow {
+  id: number;
+  project_id: string;
+  deployment_id: string;
+  stream: "stdout" | "stderr";
+  message: string;
+  source_timestamp: string;
+  collected_at: string;
+}
+
 export interface ServerActivityCounts {
   projects: number;
   live_projects: number;
@@ -252,6 +318,47 @@ export interface EnvironmentVariableRow {
   created_at: string;
   updated_at: string;
 }
+
+export type PullRequestPreviewStatus =
+  | "queued"
+  | "building"
+  | "ready"
+  | "failed"
+  | "closing"
+  | "closed"
+  | "blocked";
+
+export interface PullRequestPreviewRow {
+  id: string;
+  project_id: string;
+  pull_request_number: number;
+  head_sha: string;
+  head_ref: string;
+  base_ref: string;
+  repository_id: string;
+  repository_full_name: string;
+  generation: number;
+  latest_delivery_id: string;
+  /** The newest requested build. It may still be queued, building, or failed. */
+  deployment_id: string | null;
+  /** The last successfully activated build that currently receives preview traffic. */
+  active_deployment_id: string | null;
+  /** Generation for which automatic worker-restart recovery was already consumed. */
+  worker_retry_generation: number | null;
+  hostname: string;
+  zone_id: string | null;
+  dns_record_id: string | null;
+  dns_attempts: number;
+  dns_next_attempt_at: string;
+  status: PullRequestPreviewStatus;
+  error: string | null;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+}
+
+export interface PreviewEnvironmentVariableRow extends EnvironmentVariableRow {}
 
 export interface PublicProject {
   id: string;
@@ -278,6 +385,10 @@ export interface PublicProject {
   githubInstallationId: string | null;
   githubConnectionError: string | null;
   autoDeploy: boolean;
+  previewDeploymentsEnabled: boolean;
+  previewDomainId: string | null;
+  previewDomainSuffix: string | null;
+  previewTtlHours: number;
   sourceAnalysis: ProjectAnalysis | null;
   createdAt: string;
   updatedAt: string;
@@ -319,6 +430,8 @@ export interface PublicDeployment {
   commitAuthor: string | null;
   commitUrl: string | null;
   trigger: DeploymentTrigger;
+  scope: "production" | "preview";
+  pullRequestPreviewId: string | null;
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;

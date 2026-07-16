@@ -32,7 +32,7 @@ Never send real administrator passwords, session cookies, CSRF tokens, `APP_SECR
 - GitHub App private key, webhook secret, and short-lived installation tokens,
 - short-lived OAuth values such as `state`, PKCE verifier, callback nonce, and pending account selection,
 - project environment variables,
-- source archives, Git contents, build logs, and generated images,
+- source archives, Git contents, build/deployment/runtime logs, and generated images,
 - SQLite database, DNS mappings, and Traefik routes.
 
 ### Trust boundaries
@@ -73,7 +73,7 @@ Shelter does not protect against:
 ### Control plane
 
 - API and worker run separately; only the worker mounts the Docker socket.
-- Server metrics are collected in the worker and reduced to bounded numeric snapshots in SQLite. The API reads those snapshots and never receives Docker access.
+- Host and per-project metrics are collected in the worker and reduced to bounded numeric snapshots in SQLite. Runtime output from the active deployment is also collected and bounded there. The session-only API reads those records and never receives Docker access.
 - Docker stats cover only containers with Shelter or legacy Portsmith management labels; raw inspect output, container IDs, names, labels, and environment values are not persisted or returned.
 - Control-plane containers use a read-only root filesystem, `no-new-privileges`, and no Linux capabilities.
 - The host publishes the panel only on `127.0.0.1`.
@@ -129,6 +129,7 @@ Cloudflare Access is not configured or verified automatically. Shelter exposes a
 - Automatic presets also use a non-secret per-deployment cache key so the secret-dependent build step cannot be incorrectly reused from an older cache. Custom Dockerfiles with project variables build without cache because their secret dependencies are unknown.
 - A candidate container must pass an HTTP health check from a disposable bounded helper on its own project network before activation.
 - Runtime containers receive memory, CPU, and PID limits, `no-new-privileges`, no Linux capabilities, and bounded local Docker logs.
+- Project observability accepts only Shelter-owned containers whose project/deployment labels match the current active deployment in SQLite. Worker collection has command and overall deadlines. Stored runtime output is limited by age and line count, returned only to an administrator session, and kept separate from deployment logs.
 - Website previews are captured by a separate disposable bounded helper on the project's network. Health and preview helpers have no Docker socket or host mount and are removed after ownership verification. The API returns a preview only to an authenticated administrator and accepts no caller-controlled capture target.
 
 These controls reduce accidental damage. They do not make build or runtime safe for untrusted tenants: all projects still share one kernel and Docker daemon, and the trusted worker retains host-equivalent Docker access. Build limits bound the dedicated BuildKit container and supported per-build execution, but they are not a hostile-code sandbox. BuildKit's cache target and minimum-free-space policy are garbage-collection guardrails, not a hard storage quota for a single in-progress build. Docker also does not provide Shelter with a portable per-container writable-layer quota, so a malicious build or runtime can still consume host storage until host-level storage limits intervene. A correctly used BuildKit secret mount does not automatically persist in an image layer, but a build script or custom Dockerfile can still print, copy, or embed its value.
@@ -138,6 +139,10 @@ These controls reduce accidental damage. They do not make build or runtime safe 
 Manifest registration begins only from an authenticated administrator session. Shelter binds the cryptographic manifest `state` to the user, session, and a short-lived `SameSite=Lax` browser cookie; that callback value is consumed once. A separately hashed setup `state` remains valid for later installations of the same private app and is checked with the App ID. Public callback and webhook origins are set server-side. The private key and webhook secret are purpose-encrypted with AES-256-GCM under `APP_SECRET`.
 
 Webhook signatures are verified against the unmodified request body with HMAC-SHA-256 and constant-time comparison. Valid push events are persisted and resolved by the worker; the HTTP response does not depend on subsequent GitHub API calls or builds. Repository, installation, and branch IDs must match the saved project connection. Multiple pushes coalesce to the latest branch HEAD, older builds are cancelled before activation, and commit-status updates use a persistent retry queue.
+
+Pull-request previews are opt-in and fail closed. Shelter accepts only `opened`, `reopened`, `synchronize`, and `closed`, requires the base branch to equal the configured production branch, and compares both the numeric ID and canonical full name of the head repository with the installed base repository. Fork and deleted-head PRs are never built. Existing GitHub Apps must expose `pull_requests:read` and the `pull_request` event through the capability check before opt-in. At most three previews may be active per project, synchronize events coalesce without running two builds for one PR, and every preview has a bounded TTL.
+
+Preview deployments have their own persisted lifecycle, runtime container, route, commit-status context, and encrypted environment-variable table. They never write `projects.active_deployment_id`, clear pending production pushes, capture the production screenshot, or inherit production variables. They still execute repository-controlled build code in the host-equivalent worker and therefore are restricted to same-repository PRs; this is not a hostile-code sandbox.
 
 This does not prevent deployment of deliberately malicious repository code. Anyone who can write to the selected branch of a linked repository can build and run code on the VPS. Keep write access, branch protection, and GitHub App installation scope as narrow as possible. Disconnecting or suspending an installation pauses new automatic deployments without forgetting the selected auto-deploy preference.
 
@@ -149,6 +154,7 @@ After each processed deployment, the worker limits only Shelter's dedicated buil
 - Shelter searches zones only under the configured account ID.
 - An existing DNS record that does not target the Shelter tunnel is not adopted or overwritten.
 - A DNS record is deleted only if it still points to Shelter's tunnel.
+- Preview DNS is reconciled only by the API control plane, which owns Cloudflare credentials. The Docker-socket worker receives no Cloudflare management credential and waits for persisted DNS readiness before claiming a preview build. Remote DNS deletion and local runtime cleanup remain independently retryable so a partial failure does not silently forget an owned record.
 - When the panel domain changes, Shelter first creates the new CNAME. The previous domain remains a routed alias for sessions, OAuth callbacks, and rollback. Shelter currently has no automatic cleanup endpoint for that alias.
 
 A dedicated tunnel name is required. Shelter rejects initial setup when an unrelated tunnel already uses the name. After creating its own tunnel, Shelter immediately persists the account, ID, and name ownership before configuration and token steps. A partially failed setup can therefore resume with the exact tunnel. Changing account or tunnel ID still requires a planned migration. The stored tunnel's name can be changed: Shelter first checks for collisions, updates the exact stored tunnel ID through Cloudflare, and writes the local name only after the remote request succeeds.
@@ -192,13 +198,13 @@ The tunnel token is stored as `/tunnel/tunnel-token` in the separate `shelter-tu
 
 Saved values are never returned to the browser. The worker decrypts them for build and container startup. Generated Dockerfiles receive them during the actual build command through the BuildKit secret mount `/run/secrets/shelter_env` and use a non-secret cache key to force re-execution. A custom Dockerfile may use the same optional JSON mount; when variables exist, the build runs without cache. At runtime the values are Docker environment variables and are visible to host root, Docker administrators, and container inspection.
 
-Correct BuildKit usage does not automatically persist secrets in image layers, but build code is part of the trust boundary and can print secrets or embed them in files and client bundles. `NEXT_PUBLIC_*` and similar public variables are explicitly intended for visible client code and must not contain confidential values. Running applications can also read their variables and send them to logs or external systems.
+Correct BuildKit usage does not automatically persist secrets in image layers, but build code is part of the trust boundary and can print secrets or embed them in files and client bundles. `NEXT_PUBLIC_*` and similar public variables are explicitly intended for visible client code and must not contain confidential values. Running applications can also read their variables and send them to logs or external systems. Before persisting runtime output, Shelter replaces exact configured environment values (including multiline fragments) with a redaction marker. This cannot recognize derived, encoded, split, or reformatted values and does not make application output non-sensitive.
 
-Provide only necessary secrets, use separate credentials per project, rotate them regularly, and redact deployment logs before export.
+Provide only necessary secrets, use separate credentials per project, rotate them regularly, and review deployment and runtime logs before export.
 
 ### Backups
 
-A complete backup of `.env`, `shelter-data`, `shelter-routing`, and `shelter-tunnel` contains the full control-plane state and keys, including OAuth client secret, possible proxy credentials, decryptable access/refresh/API tokens, connector token, source archives, project previews, and decryptable project variables. Screenshots may contain confidential content shown on an application's homepage. Backups must be:
+A complete backup of `.env`, `shelter-data`, `shelter-routing`, and `shelter-tunnel` contains the full control-plane state and keys, including OAuth client secret, possible proxy credentials, decryptable access/refresh/API tokens, connector token, source archives, project previews, runtime output, and decryptable project variables. Screenshots and logs may contain confidential application content. Backups must be:
 
 - encrypted in storage and transit,
 - protected with restrictive file permissions,

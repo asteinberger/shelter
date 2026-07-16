@@ -189,8 +189,8 @@ describe("GitHub App manifest and API authentication", () => {
       redirect_url: "https://hosting.example.com/api/settings/github/manifest/callback",
       public: false,
       request_oauth_on_install: false,
-      default_permissions: { contents: "read", statuses: "write", metadata: "read" },
-      default_events: ["push"]
+      default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
+      default_events: ["push", "pull_request"]
     });
     const state = new URL(started.registrationUrl).searchParams.get("state")!;
     await github.completeManifest(state, started.browserNonce, "manifest-code");
@@ -270,6 +270,47 @@ describe("GitHub App manifest and API authentication", () => {
       state: "success",
       context: "shelter/deploy",
       target_url: "https://hosting.example.com/projects/prj_github?tab=deployments&deployment=dep_active"
+    });
+    database.close();
+  });
+
+  it("requires the selected installation to approve pull-request preview permissions", async () => {
+    let installationApproved = false;
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.endsWith("/app")) {
+        return json({ permissions: { pull_requests: "read" }, events: ["push", "pull_request"] });
+      }
+      if (url.endsWith("/app/installations/123")) {
+        return json({
+          id: 123,
+          app_id: 42,
+          account: { login: "example", type: "Organization", avatar_url: null },
+          repository_selection: "selected",
+          suspended_at: null,
+          permissions: installationApproved ? { pull_requests: "read" } : { contents: "read" },
+          events: installationApproved ? ["push", "pull_request"] : ["push"]
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    await expect(github.previewCapability("123")).resolves.toMatchObject({
+      ready: false,
+      installationChecked: true,
+      installationPullRequestsPermission: false,
+      installationPullRequestEvent: false,
+      remediation: "approve_installation_update"
+    });
+    installationApproved = true;
+    await expect(github.previewCapability("123")).resolves.toMatchObject({
+      ready: true,
+      installationPullRequestsPermission: true,
+      installationPullRequestEvent: true,
+      remediation: "none"
     });
     database.close();
   });

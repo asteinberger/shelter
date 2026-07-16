@@ -104,6 +104,8 @@ export interface Deployment {
   commitAuthor?: string;
   commitUrl?: string;
   trigger?: 'manual' | 'github_push' | 'rollback' | string;
+  scope?: 'production' | 'preview';
+  pullRequestPreviewId?: string | null;
   createdAt?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -134,7 +136,20 @@ export interface GitHubSettings {
   appUrl: string | null;
   installUrl: string | null;
   installations: GitHubInstallation[];
+  previewCapability?: GitHubPreviewCapability | null;
   error?: string | null;
+}
+
+export interface GitHubPreviewCapability {
+  ready: boolean;
+  configured: boolean;
+  pullRequestsPermission: boolean;
+  pullRequestEvent: boolean;
+  installationChecked?: boolean;
+  installationPullRequestsPermission?: boolean;
+  installationPullRequestEvent?: boolean;
+  installationSuspended?: boolean;
+  remediation: 'none' | 'configure_app' | 'update_existing_app' | 'approve_installation_update';
 }
 
 export interface GitHubRepository {
@@ -236,10 +251,58 @@ export interface Project {
   githubRepositoryPrivate?: boolean | null;
   githubConnectionError?: string | null;
   autoDeploy?: boolean;
+  previewDeploymentsEnabled?: boolean;
+  previewDomainId?: string | null;
+  previewDomainSuffix?: string | null;
+  previewTtlHours?: number;
   deletionStatus?: 'failed' | 'preparing' | 'queued' | 'running' | string | null;
   deletionError?: string | null;
   preview?: ProjectPreview;
   sourceAnalysis?: ProjectSourceAnalysis | null;
+}
+
+export type PullRequestPreviewStatus =
+  | 'queued'
+  | 'building'
+  | 'ready'
+  | 'failed'
+  | 'closing'
+  | 'closed'
+  | 'blocked';
+
+export interface PullRequestPreview {
+  id: string;
+  projectId: string;
+  pullRequestNumber: number;
+  headSha: string;
+  headRef: string;
+  baseRef: string;
+  generation: number;
+  deploymentId: string | null;
+  activeDeploymentId: string | null;
+  hostname: string;
+  url: string | null;
+  status: PullRequestPreviewStatus;
+  error: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+}
+
+export interface PullRequestPreviewSettings {
+  enabled: boolean;
+  domainId: string | null;
+  domainSuffix: string | null;
+  ttlHours: number;
+  maxActive: number;
+  inheritsProductionEnvironment: false;
+}
+
+export interface PullRequestPreviewsResponse {
+  settings: PullRequestPreviewSettings;
+  environmentKeys: string[];
+  previews: PullRequestPreview[];
 }
 
 export interface OverviewStats {
@@ -370,6 +433,87 @@ export interface ServerMetricsResponse {
     status: ServerHealthStatus;
   }>;
   history: ServerMetricsHistoryPoint[];
+}
+
+export type ProjectObservabilityRange = '15m' | '1h' | '6h' | '24h' | '48h';
+export type ProjectObservabilityStatus = 'collecting' | 'healthy' | 'warning' | 'critical' | 'stale';
+export type ProjectRuntimeStatus = 'created' | 'running' | 'paused' | 'restarting' | 'removing' | 'exited' | 'dead' | 'missing' | 'unknown';
+export type ProjectRuntimeHealth = 'healthy' | 'unhealthy' | 'starting' | 'none' | 'unknown';
+
+export interface ProjectObservabilityCurrent {
+  deploymentId: string;
+  runtime: {
+    status: ProjectRuntimeStatus;
+    health: ProjectRuntimeHealth;
+    startedAt: string | null;
+    uptimeSeconds: number;
+    restartCount: number;
+    oomKilled: boolean;
+  };
+  cpu: {
+    usagePercent: number;
+    limitCores: number;
+    limitUsagePercent: number;
+  };
+  memory: {
+    usedBytes: number;
+    limitBytes: number;
+    usagePercent: number;
+  };
+  network: {
+    receivedBytes: number;
+    transmittedBytes: number;
+    receiveBytesPerSecond: number;
+    transmitBytesPerSecond: number;
+  };
+  blockIo: {
+    readBytes: number;
+    writeBytes: number;
+  };
+}
+
+export interface ProjectObservabilityHistoryPoint {
+  sampledAt: string;
+  cpuUsagePercent: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryUsagePercent: number;
+  networkReceiveBytesPerSecond: number;
+  networkTransmitBytesPerSecond: number;
+  blockReadBytes: number;
+  blockWriteBytes: number;
+}
+
+export interface ProjectObservabilityWarning {
+  id: 'runtime' | 'health' | 'oom' | 'restarts' | 'cpu' | 'memory';
+  severity: 'warning' | 'critical';
+  value?: number;
+}
+
+export interface ProjectObservabilityResponse {
+  status: ProjectObservabilityStatus;
+  sampledAt: string | null;
+  intervalSeconds: number;
+  retentionHours: number;
+  range: ProjectObservabilityRange;
+  activeDeploymentId: string | null;
+  current: ProjectObservabilityCurrent | null;
+  warnings: ProjectObservabilityWarning[];
+  history: ProjectObservabilityHistoryPoint[];
+}
+
+export interface RuntimeLog {
+  id: number;
+  deploymentId: string;
+  stream: 'stdout' | 'stderr';
+  message: string;
+  timestamp: string;
+  collectedAt: string;
+}
+
+export interface RuntimeLogsResponse {
+  activeDeploymentId: string | null;
+  logs: RuntimeLog[];
 }
 
 export interface CloudflareAccount {
