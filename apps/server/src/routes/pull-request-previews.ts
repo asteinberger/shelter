@@ -41,7 +41,8 @@ export function registerPullRequestPreviewRoutes(
   github: GitHubService
 ): void {
   app.get<{ Params: { id: string } }>("/api/projects/:id/previews", {
-    preHandler: requireScopedAuth("projects:read")
+    preHandler: requireScopedAuth("projects:read"),
+    config: { rateLimit: { max: 120, timeWindow: "1 minute" } }
   }, async (request, reply) => {
     const project = database.getProject(request.params.id);
     if (!project) throw notFound("Projekt nicht gefunden");
@@ -61,7 +62,8 @@ export function registerPullRequestPreviewRoutes(
   });
 
   app.put<{ Params: { id: string }; Body: unknown }>("/api/projects/:id/previews/settings", {
-    preHandler: requireScopedMutation("projects:write")
+    preHandler: requireScopedMutation("projects:write"),
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
   }, async (request) => {
     const project = database.getMutableProject(request.params.id);
     if (!project) throw notFound("Projekt nicht gefunden");
@@ -115,7 +117,8 @@ export function registerPullRequestPreviewRoutes(
   });
 
   app.put<{ Params: { id: string }; Body: unknown }>("/api/projects/:id/previews/environment", {
-    preHandler: requireScopedMutation("environment:write")
+    preHandler: requireScopedMutation("environment:write"),
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
   }, async (request) => {
     const project = database.getMutableProject(request.params.id);
     if (!project) throw notFound("Projekt nicht gefunden");
@@ -162,7 +165,8 @@ export function registerPullRequestPreviewRoutes(
   });
 
   app.delete<{ Params: { id: string; previewId: string } }>("/api/projects/:id/previews/:previewId", {
-    preHandler: requireScopedMutation("deployments:write")
+    preHandler: requireScopedMutation("deployments:write"),
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } }
   }, async (request, reply) => {
     const project = database.getMutableProject(request.params.id);
     if (!project) throw notFound("Projekt nicht gefunden");
