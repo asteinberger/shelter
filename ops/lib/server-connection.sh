@@ -91,8 +91,19 @@ shelter_server_connection_init() {
       -o BatchMode=yes
     )
   elif [[ -n "$SHELTER_SERVER_PASSWORD" ]]; then
-    SHELTER_SERVER_TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/${temporary_prefix}.XXXXXX") || return 1
-    chmod 700 "$SHELTER_SERVER_TEMPORARY_DIRECTORY"
+    # Unix-domain socket paths are capped at roughly 100 bytes on common
+    # platforms. TMPDIR is often much longer in macOS app sandboxes, so keep
+    # the ControlMaster socket in an atomic, operator-only directory under the
+    # deliberately short /tmp spelling instead of resolving that symlink.
+    [[ -d /tmp && -w /tmp ]] ||
+      shelter_server_connection_error "/tmp is required and must be writable for password-based SSH connections." || return 1
+    SHELTER_SERVER_TEMPORARY_DIRECTORY=$(mktemp -d /tmp/shelter-ssh.XXXXXX) || return 1
+    if ! chmod 700 "$SHELTER_SERVER_TEMPORARY_DIRECTORY"; then
+      rm -rf -- "$SHELTER_SERVER_TEMPORARY_DIRECTORY"
+      SHELTER_SERVER_TEMPORARY_DIRECTORY=
+      shelter_server_connection_error "Could not protect the temporary SSH directory."
+      return 1
+    fi
     askpass="$SHELTER_SERVER_TEMPORARY_DIRECTORY/askpass"
     cat > "$askpass" <<'ASKPASS'
 #!/bin/sh
@@ -106,7 +117,14 @@ ASKPASS
     export SSH_ASKPASS="$askpass"
     export SSH_ASKPASS_REQUIRE=force
     export DISPLAY="${DISPLAY:-shelter-askpass}"
-    SHELTER_SERVER_CONTROL_PATH="$SHELTER_SERVER_TEMPORARY_DIRECTORY/ssh-control"
+    SHELTER_SERVER_CONTROL_PATH="$SHELTER_SERVER_TEMPORARY_DIRECTORY/c"
+    if ((${#SHELTER_SERVER_CONTROL_PATH} > 90)); then
+      rm -rf -- "$SHELTER_SERVER_TEMPORARY_DIRECTORY"
+      SHELTER_SERVER_TEMPORARY_DIRECTORY=
+      SHELTER_SERVER_CONTROL_PATH=
+      shelter_server_connection_error "The protected SSH ControlMaster path is unexpectedly too long."
+      return 1
+    fi
     SHELTER_SERVER_SSH_ARGS+=(
       -o BatchMode=no
       -o NumberOfPasswordPrompts=1

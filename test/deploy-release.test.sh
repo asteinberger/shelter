@@ -198,6 +198,32 @@ test_operator_dry_run_verifies_and_stages_safely() {
   assert_not_contains "$MOCK_RSYNC_LOG" "$TEST_PASSWORD"
 }
 
+test_password_control_socket_ignores_long_tmpdir() {
+  long_tmp=$TEST_TMP/$(printf 'long-tmpdir-segment-%.0s' {1..8})
+  mkdir -p "$long_tmp"
+  run_command env TMPDIR="$long_tmp" \
+    "$REPO_ROOT/ops/deploy-release.sh" \
+    --server-env "$SERVER_ENV" \
+    --repo example/shelter \
+    --tag "$TEST_TAG" \
+    --dry-run
+  assert_status 0
+
+  control_path=$(sed -n 's/.*<ControlPath=\([^>]*\)>.*/\1/p' "$MOCK_SSH_LOG" | head -n 1)
+  [[ -n "$control_path" ]] || fail_test 'SSH invocation did not contain a ControlPath'
+  case "$control_path" in
+    /tmp/shelter-ssh.*/c) ;;
+    *) fail_test "ControlPath did not use the compact protected /tmp directory: ${control_path}" ;;
+  esac
+  [[ "${#control_path}" -le 90 ]] ||
+    fail_test "ControlPath is too long for a portable Unix socket: ${#control_path} bytes"
+  [[ "$control_path" != "$long_tmp"* ]] ||
+    fail_test 'ControlPath inherited the long caller TMPDIR'
+  assert_absent "${control_path%/c}"
+  assert_not_contains "$COMMAND_OUTPUT" "$TEST_PASSWORD"
+  assert_not_contains "$MOCK_SSH_LOG" "$TEST_PASSWORD"
+}
+
 test_operator_real_run_requests_install_and_doctor() {
   run_deployer
   assert_status 0
@@ -422,6 +448,7 @@ printf 'Shelter verified-release deploy tests (%s)\n\n' "$TEST_SHELL"
 
 run_test 'operator and remote helpers parse with their declared shells' test_shell_syntax
 run_test 'dry run authenticates, stages with -rlpt, and redacts secrets' test_operator_dry_run_verifies_and_stages_safely
+run_test 'password ControlMaster socket stays short with a long TMPDIR' test_password_control_socket_ignores_long_tmpdir
 run_test 'real workflow requests remote activation and doctor' test_operator_real_run_requests_install_and_doctor
 run_test 'transport failure cleans its owned remote stage' test_operator_failure_cleans_remote_stage
 run_test 'unsafe tags and server configuration fail before network' test_operator_rejects_unsafe_inputs_before_network
