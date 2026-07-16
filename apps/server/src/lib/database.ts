@@ -13,8 +13,11 @@ import type {
   PullRequestPreviewRow,
   ApiTokenRow,
   ApiTokenMetadataRow,
+  GithubAppUpgradeFlowRow,
   GithubManifestFlowRow,
   GithubPendingPushRow,
+  GithubProjectBindingRow,
+  GithubRetiredWebhookSourceRow,
   ProjectMetricHistoryRow,
   ProjectMetricSampleRow,
   ProjectDeletionRow,
@@ -115,6 +118,26 @@ CREATE TABLE IF NOT EXISTS github_manifest_flows (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS github_manifest_flows_expires_idx ON github_manifest_flows(expires_at);
+
+CREATE TABLE IF NOT EXISTS github_app_upgrade_flows (
+  id TEXT PRIMARY KEY,
+  manifest_state_hash TEXT NOT NULL UNIQUE,
+  manifest_browser_nonce_hash TEXT NOT NULL,
+  setup_state_hash TEXT NOT NULL UNIQUE,
+  setup_browser_nonce_hash TEXT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_token_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+  previous_app_id TEXT NOT NULL,
+  expected_owner_login TEXT NOT NULL,
+  expected_owner_type TEXT NOT NULL CHECK(expected_owner_type IN ('User', 'Organization')),
+  candidate_app_id TEXT,
+  encrypted_candidate TEXT,
+  phase TEXT NOT NULL CHECK(phase IN ('registering', 'converting', 'installing')),
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS github_app_upgrade_flows_expires_idx ON github_app_upgrade_flows(expires_at);
 
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
@@ -255,6 +278,11 @@ CREATE TABLE IF NOT EXISTS domains (
   dns_record_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'active', 'error')),
   error TEXT,
+  password_protection_enabled INTEGER NOT NULL DEFAULT 0 CHECK(password_protection_enabled IN (0, 1)),
+  password_hash TEXT,
+  access_session_version INTEGER NOT NULL DEFAULT 1 CHECK(access_session_version >= 1),
+  access_session_ttl_hours INTEGER NOT NULL DEFAULT 168 CHECK(access_session_ttl_hours BETWEEN 1 AND 720),
+  seo_indexing INTEGER NOT NULL DEFAULT 1 CHECK(seo_indexing IN (0, 1)),
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS domains_project_idx ON domains(project_id);
@@ -333,16 +361,43 @@ CREATE INDEX IF NOT EXISTS pull_request_previews_project_idx
   ON pull_request_previews(project_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS pull_request_previews_cleanup_idx
   ON pull_request_previews(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS github_pull_request_event_watermarks (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  repository_id TEXT NOT NULL,
+  pull_request_number INTEGER NOT NULL CHECK(pull_request_number BETWEEN 1 AND 2147483647),
+  github_updated_at TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('opened', 'reopened', 'synchronize', 'closed')),
+  delivery_id TEXT NOT NULL,
+  PRIMARY KEY(project_id, repository_id, pull_request_number)
+);
+
 CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
-  delivery_id TEXT PRIMARY KEY,
+  source_app_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
   event_name TEXT NOT NULL,
   payload_hash TEXT,
-  status TEXT NOT NULL CHECK(status IN ('processing', 'processed', 'ignored', 'failed')),
+  raw_body BLOB,
+  status TEXT NOT NULL CHECK(status IN ('buffered', 'processing', 'processed', 'ignored', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
   error TEXT,
   received_at TEXT NOT NULL,
-  processed_at TEXT
+  processed_at TEXT,
+  PRIMARY KEY(source_app_id, delivery_id)
 );
 CREATE INDEX IF NOT EXISTS github_webhook_deliveries_received_idx ON github_webhook_deliveries(received_at);
+
+CREATE TABLE IF NOT EXISTS github_retired_webhook_sources (
+  app_id TEXT PRIMARY KEY,
+  encrypted_webhook_secret TEXT NOT NULL,
+  previous_installation_id TEXT,
+  successor_installation_id TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS github_retired_webhook_sources_expires_idx
+  ON github_retired_webhook_sources(expires_at);
 
 CREATE TABLE IF NOT EXISTS github_dirty_refs (
   installation_id TEXT NOT NULL,
@@ -494,6 +549,20 @@ export interface GithubDirtyRefRow {
   updated_at: string;
 }
 
+export interface GithubBufferedWebhookRow {
+  source_app_id: string;
+  delivery_id: string;
+  event_name: "push" | "pull_request";
+  payload_hash: string;
+  raw_body: Buffer;
+  received_at: string;
+}
+
+export interface GithubBufferedWebhookUsage {
+  count: number;
+  bytes: number;
+}
+
 export class Database {
   readonly sqlite: BetterSqlite3.Database;
   private readonly logWritesSincePrune = new Map<string, number>();
@@ -556,6 +625,22 @@ export class Database {
     }
     if (!projectColumns.some((column) => column.name === "preview_ttl_hours")) {
       this.sqlite.exec("ALTER TABLE projects ADD COLUMN preview_ttl_hours INTEGER NOT NULL DEFAULT 72 CHECK(preview_ttl_hours BETWEEN 1 AND 168)");
+    }
+    const domainColumns = this.sqlite.pragma("table_info(domains)") as Array<{ name: string }>;
+    if (!domainColumns.some((column) => column.name === "password_protection_enabled")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN password_protection_enabled INTEGER NOT NULL DEFAULT 0 CHECK(password_protection_enabled IN (0, 1))");
+    }
+    if (!domainColumns.some((column) => column.name === "password_hash")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN password_hash TEXT");
+    }
+    if (!domainColumns.some((column) => column.name === "access_session_version")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN access_session_version INTEGER NOT NULL DEFAULT 1 CHECK(access_session_version >= 1)");
+    }
+    if (!domainColumns.some((column) => column.name === "access_session_ttl_hours")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN access_session_ttl_hours INTEGER NOT NULL DEFAULT 168 CHECK(access_session_ttl_hours BETWEEN 1 AND 720)");
+    }
+    if (!domainColumns.some((column) => column.name === "seo_indexing")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN seo_indexing INTEGER NOT NULL DEFAULT 1 CHECK(seo_indexing IN (0, 1))");
     }
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS projects_github_link_idx
@@ -678,10 +763,104 @@ export class Database {
         ON deployments(project_id, github_delivery_id)
         WHERE github_delivery_id IS NOT NULL AND deployment_scope = 'production'
     `);
-    const githubDeliveryColumns = this.sqlite.pragma("table_info(github_webhook_deliveries)") as Array<{ name: string }>;
+    let githubDeliveryColumns = this.sqlite.pragma("table_info(github_webhook_deliveries)") as Array<{ name: string }>;
     if (!githubDeliveryColumns.some((column) => column.name === "payload_hash")) {
       this.sqlite.exec("ALTER TABLE github_webhook_deliveries ADD COLUMN payload_hash TEXT");
+      githubDeliveryColumns = this.sqlite.pragma("table_info(github_webhook_deliveries)") as Array<{ name: string }>;
     }
+    if (!githubDeliveryColumns.some((column) => column.name === "source_app_id")) {
+      let legacySourceAppId = "legacy";
+      const metadata = this.sqlite.prepare("SELECT value FROM settings WHERE key = ?")
+        .get("github.app_metadata") as { value: string } | undefined;
+      if (metadata) {
+        try {
+          const parsed = JSON.parse(metadata.value) as { appId?: unknown };
+          if (typeof parsed.appId === "string" && /^\d+$/.test(parsed.appId)) {
+            legacySourceAppId = parsed.appId;
+          }
+        } catch {
+          // Keep a non-colliding legacy namespace when stored metadata is corrupt.
+        }
+      }
+      const migrateGithubDeliveries = this.sqlite.transaction(() => {
+        this.sqlite.exec(`
+          DROP INDEX IF EXISTS github_webhook_deliveries_received_idx;
+          ALTER TABLE github_webhook_deliveries RENAME TO github_webhook_deliveries_legacy;
+          CREATE TABLE github_webhook_deliveries (
+            source_app_id TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            payload_hash TEXT,
+            raw_body BLOB,
+            status TEXT NOT NULL CHECK(status IN ('buffered', 'processing', 'processed', 'ignored', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            error TEXT,
+            received_at TEXT NOT NULL,
+            processed_at TEXT,
+            PRIMARY KEY(source_app_id, delivery_id)
+          );
+        `);
+        this.sqlite.prepare(`
+          INSERT INTO github_webhook_deliveries (
+            source_app_id, delivery_id, event_name, payload_hash, raw_body,
+            status, attempts, error, received_at, processed_at
+          )
+          SELECT ?, delivery_id, event_name, payload_hash, NULL,
+                 status, 0, error, received_at, processed_at
+          FROM github_webhook_deliveries_legacy
+        `).run(legacySourceAppId);
+        this.sqlite.exec(`
+          DROP TABLE github_webhook_deliveries_legacy;
+          CREATE INDEX github_webhook_deliveries_received_idx
+            ON github_webhook_deliveries(received_at);
+        `);
+      });
+      migrateGithubDeliveries.immediate();
+    }
+    githubDeliveryColumns = this.sqlite.pragma("table_info(github_webhook_deliveries)") as Array<{ name: string }>;
+    if (!githubDeliveryColumns.some((column) => column.name === "attempts")) {
+      this.sqlite.exec(`
+        ALTER TABLE github_webhook_deliveries
+        ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
+      `);
+    }
+    const githubUpgradeFlowColumns = this.sqlite.pragma(
+      "table_info(github_app_upgrade_flows)"
+    ) as Array<{ name: string }>;
+    if (!githubUpgradeFlowColumns.some((column) => column.name === "candidate_app_id")) {
+      this.sqlite.exec("ALTER TABLE github_app_upgrade_flows ADD COLUMN candidate_app_id TEXT");
+    }
+    // Upgrade candidates can receive webhooks before activation. Tie those
+    // BLOBs to the flow lifecycle even when a session is deleted by logout,
+    // password rotation or startup pruning. On successful activation the
+    // candidate metadata is written first, so its buffered deliveries survive
+    // deleting the completed flow and can be drained by the worker.
+    this.sqlite.exec(`
+      CREATE TRIGGER IF NOT EXISTS github_app_upgrade_flow_delete_buffer
+      AFTER DELETE ON github_app_upgrade_flows
+      WHEN OLD.candidate_app_id IS NOT NULL
+      BEGIN
+        DELETE FROM github_webhook_deliveries
+        WHERE source_app_id = OLD.candidate_app_id
+          AND status IN ('buffered', 'processing')
+          AND raw_body IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE key = 'github.app_metadata'
+              AND (
+                CASE
+                  WHEN json_valid(value)
+                    THEN CAST(json_extract(value, '$.appId') AS TEXT)
+                  ELSE NULL
+                END
+              ) = OLD.candidate_app_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM github_retired_webhook_sources
+            WHERE app_id = OLD.candidate_app_id
+          );
+      END
+    `);
     const githubStatusColumns = this.sqlite.pragma("table_info(github_status_outbox)") as Array<{ name: string }>;
     for (const column of ["installation_id", "repository_id", "repository_full_name", "commit_sha"] as const) {
       if (!githubStatusColumns.some((candidate) => candidate.name === column)) {
@@ -710,6 +889,7 @@ export class Database {
     this.pruneExpiredSessions();
     this.pruneExpiredCloudflareOAuthState();
     this.pruneExpiredGithubState();
+    this.recoverProcessingGithubWebhooks();
   }
 
   close(): void {
@@ -848,6 +1028,7 @@ export class Database {
   pruneExpiredGithubState(): void {
     const now = new Date().toISOString();
     this.sqlite.prepare("DELETE FROM github_manifest_flows WHERE expires_at <= ?").run(now);
+    this.sqlite.prepare("DELETE FROM github_retired_webhook_sources WHERE expires_at <= ?").run(now);
     this.sqlite.prepare(`
       DELETE FROM github_webhook_deliveries
       WHERE received_at <= ?
@@ -886,6 +1067,191 @@ export class Database {
 
   deleteGithubManifestFlows(): void {
     this.sqlite.prepare("DELETE FROM github_manifest_flows").run();
+  }
+
+  createGithubAppUpgradeFlow(flow: GithubAppUpgradeFlowRow): void {
+    const create = this.sqlite.transaction(() => {
+      const now = new Date().toISOString();
+      this.sqlite.prepare("DELETE FROM github_app_upgrade_flows WHERE expires_at <= ?").run(now);
+      const active = this.sqlite.prepare(
+        "SELECT 1 FROM github_app_upgrade_flows WHERE expires_at > ? LIMIT 1"
+      ).get(now);
+      if (active) {
+        throw conflict("Ein GitHub-App-Upgrade läuft bereits", "GITHUB_UPGRADE_IN_PROGRESS");
+      }
+      this.sqlite.prepare(`
+        INSERT INTO github_app_upgrade_flows (
+          id, manifest_state_hash, manifest_browser_nonce_hash, setup_state_hash,
+          setup_browser_nonce_hash, user_id, session_token_hash, previous_app_id,
+          expected_owner_login, expected_owner_type, candidate_app_id,
+          encrypted_candidate, phase,
+          expires_at, created_at, updated_at
+        ) VALUES (
+          @id, @manifest_state_hash, @manifest_browser_nonce_hash, @setup_state_hash,
+          @setup_browser_nonce_hash, @user_id, @session_token_hash, @previous_app_id,
+          @expected_owner_login, @expected_owner_type, @candidate_app_id,
+          @encrypted_candidate, @phase,
+          @expires_at, @created_at, @updated_at
+        )
+      `).run(flow);
+    });
+    create.immediate();
+  }
+
+  claimGithubAppUpgradeManifestFlow(
+    stateHash: string,
+    browserNonceHash: string
+  ): GithubAppUpgradeFlowRow | undefined {
+    const now = new Date().toISOString();
+    return this.sqlite.prepare(`
+      UPDATE github_app_upgrade_flows
+      SET phase = 'converting', updated_at = ?
+      WHERE manifest_state_hash = ?
+        AND manifest_browser_nonce_hash = ?
+        AND phase = 'registering'
+        AND expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM sessions
+          WHERE sessions.token_hash = github_app_upgrade_flows.session_token_hash
+            AND sessions.user_id = github_app_upgrade_flows.user_id
+            AND sessions.expires_at > ?
+        )
+      RETURNING *
+    `).get(now, stateHash, browserNonceHash, now, now) as GithubAppUpgradeFlowRow | undefined;
+  }
+
+  completeGithubAppUpgradeManifestFlow(
+    id: string,
+    candidateAppId: string,
+    encryptedCandidate: string,
+    setupBrowserNonceHash: string,
+    expiresAt: string
+  ): boolean {
+    return this.sqlite.prepare(`
+      UPDATE github_app_upgrade_flows
+      SET candidate_app_id = ?, encrypted_candidate = ?, setup_browser_nonce_hash = ?,
+          phase = 'installing', expires_at = ?, updated_at = ?
+      WHERE id = ? AND phase = 'converting'
+    `).run(
+      candidateAppId,
+      encryptedCandidate,
+      setupBrowserNonceHash,
+      expiresAt,
+      new Date().toISOString(),
+      id
+    ).changes === 1;
+  }
+
+  getGithubAppUpgradeSetupFlow(
+    setupStateHash: string,
+    setupBrowserNonceHash: string
+  ): GithubAppUpgradeFlowRow | undefined {
+    const now = new Date().toISOString();
+    return this.sqlite.prepare(`
+      SELECT * FROM github_app_upgrade_flows
+      WHERE setup_state_hash = ?
+        AND setup_browser_nonce_hash = ?
+        AND phase = 'installing'
+        AND encrypted_candidate IS NOT NULL
+        AND expires_at > ?
+    `).get(setupStateHash, setupBrowserNonceHash, now) as GithubAppUpgradeFlowRow | undefined;
+  }
+
+  getPendingGithubAppUpgradeFlow(): GithubAppUpgradeFlowRow | undefined {
+    const now = new Date().toISOString();
+    return this.sqlite.prepare(`
+      SELECT * FROM github_app_upgrade_flows
+      WHERE phase = 'installing'
+        AND encrypted_candidate IS NOT NULL
+        AND expires_at > ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(now) as GithubAppUpgradeFlowRow | undefined;
+  }
+
+  listExpiredGithubAppUpgradeFlows(): GithubAppUpgradeFlowRow[] {
+    return this.sqlite.prepare(`
+      SELECT * FROM github_app_upgrade_flows
+      WHERE expires_at <= ? AND encrypted_candidate IS NOT NULL
+      ORDER BY created_at ASC
+    `).all(new Date().toISOString()) as GithubAppUpgradeFlowRow[];
+  }
+
+  cancelGithubAppUpgradeManifestFlow(stateHash: string, browserNonceHash: string): boolean {
+    return this.sqlite.prepare(`
+      DELETE FROM github_app_upgrade_flows
+      WHERE manifest_state_hash = ? AND manifest_browser_nonce_hash = ?
+    `).run(stateHash, browserNonceHash).changes === 1;
+  }
+
+  deleteGithubAppUpgradeFlow(id: string): void {
+    this.sqlite.prepare("DELETE FROM github_app_upgrade_flows WHERE id = ?").run(id);
+  }
+
+  deleteGithubAppUpgradeFlows(): void {
+    this.sqlite.prepare("DELETE FROM github_app_upgrade_flows").run();
+  }
+
+  saveGithubRetiredWebhookSource(source: GithubRetiredWebhookSourceRow): void {
+    this.sqlite.prepare(`
+      INSERT INTO github_retired_webhook_sources (
+        app_id, encrypted_webhook_secret, previous_installation_id,
+        successor_installation_id, expires_at, created_at, updated_at
+      ) VALUES (
+        @app_id, @encrypted_webhook_secret, @previous_installation_id,
+        @successor_installation_id, @expires_at, @created_at, @updated_at
+      )
+      ON CONFLICT(app_id) DO UPDATE SET
+        encrypted_webhook_secret = excluded.encrypted_webhook_secret,
+        previous_installation_id = excluded.previous_installation_id,
+        successor_installation_id = excluded.successor_installation_id,
+        expires_at = excluded.expires_at,
+        updated_at = excluded.updated_at
+    `).run(source);
+  }
+
+  retargetGithubRetiredWebhookSources(
+    previousSuccessorInstallationId: string,
+    nextSuccessorInstallationId: string
+  ): number {
+    const now = new Date().toISOString();
+    return this.sqlite.prepare(`
+      UPDATE github_retired_webhook_sources
+      SET successor_installation_id = ?, updated_at = ?
+      WHERE successor_installation_id = ? AND expires_at > ?
+    `).run(
+      nextSuccessorInstallationId,
+      now,
+      previousSuccessorInstallationId,
+      now
+    ).changes;
+  }
+
+  listGithubRetiredWebhookSources(): GithubRetiredWebhookSourceRow[] {
+    const now = new Date().toISOString();
+    this.sqlite.prepare("DELETE FROM github_retired_webhook_sources WHERE expires_at <= ?").run(now);
+    return this.sqlite.prepare(`
+      SELECT * FROM github_retired_webhook_sources
+      WHERE expires_at > ?
+      ORDER BY created_at ASC
+    `).all(now) as GithubRetiredWebhookSourceRow[];
+  }
+
+  getGithubRetiredWebhookSource(appId: string): GithubRetiredWebhookSourceRow | undefined {
+    const now = new Date().toISOString();
+    this.sqlite.prepare("DELETE FROM github_retired_webhook_sources WHERE expires_at <= ?").run(now);
+    return this.sqlite.prepare(`
+      SELECT * FROM github_retired_webhook_sources
+      WHERE app_id = ? AND expires_at > ?
+    `).get(appId, now) as GithubRetiredWebhookSourceRow | undefined;
+  }
+
+  deleteGithubRetiredWebhookSources(): void {
+    this.sqlite.prepare("DELETE FROM github_retired_webhook_sources").run();
+  }
+
+  deleteGithubWebhookDeliveries(): void {
+    this.sqlite.prepare("DELETE FROM github_webhook_deliveries").run();
   }
 
   createCloudflareOAuthFlow(flow: CloudflareOAuthFlowRow): void {
@@ -963,41 +1329,16 @@ export class Database {
     this.sqlite.prepare("DELETE FROM settings WHERE key = ?").run(key);
   }
 
-  beginGithubWebhookDelivery(deliveryId: string, eventName: string): "claimed" | "duplicate" {
-    const begin = this.sqlite.transaction(() => {
-      const existing = this.sqlite.prepare(
-        "SELECT status, received_at FROM github_webhook_deliveries WHERE delivery_id = ?"
-      ).get(deliveryId) as { status: string; received_at: string } | undefined;
-      const now = new Date();
-      if (!existing) {
-        this.sqlite.prepare(`
-          INSERT INTO github_webhook_deliveries (
-            delivery_id, event_name, status, error, received_at, processed_at
-          ) VALUES (?, ?, 'processing', NULL, ?, NULL)
-        `).run(deliveryId, eventName, now.toISOString());
-        return "claimed" as const;
-      }
-      const processingIsStale = existing.status === "processing" &&
-        now.getTime() - new Date(existing.received_at).getTime() > 5 * 60_000;
-      if (existing.status !== "failed" && !processingIsStale) return "duplicate" as const;
-      this.sqlite.prepare(`
-        UPDATE github_webhook_deliveries
-        SET event_name = ?, status = 'processing', error = NULL, received_at = ?, processed_at = NULL
-        WHERE delivery_id = ?
-      `).run(eventName, now.toISOString(), deliveryId);
-      return "claimed" as const;
-    });
-    return begin.immediate();
-  }
-
   claimGithubWebhookDelivery(
+    sourceAppId: string,
     deliveryId: string,
     eventName: string,
     payloadHash: string
   ): "claimed" | "duplicate" | "mismatch" {
     const existing = this.sqlite.prepare(`
-      SELECT event_name, payload_hash FROM github_webhook_deliveries WHERE delivery_id = ?
-    `).get(deliveryId) as { event_name: string; payload_hash: string | null } | undefined;
+      SELECT event_name, payload_hash FROM github_webhook_deliveries
+      WHERE source_app_id = ? AND delivery_id = ?
+    `).get(sourceAppId, deliveryId) as { event_name: string; payload_hash: string | null } | undefined;
     if (existing) {
       if (existing.event_name !== eventName || (existing.payload_hash !== null && existing.payload_hash !== payloadHash)) {
         return "mismatch";
@@ -1006,10 +1347,90 @@ export class Database {
     }
     this.sqlite.prepare(`
       INSERT INTO github_webhook_deliveries (
-        delivery_id, event_name, payload_hash, status, error, received_at, processed_at
-      ) VALUES (?, ?, ?, 'processing', NULL, ?, NULL)
-    `).run(deliveryId, eventName, payloadHash, new Date().toISOString());
+        source_app_id, delivery_id, event_name, payload_hash, raw_body,
+        status, attempts, error, received_at, processed_at
+      ) VALUES (?, ?, ?, ?, NULL, 'processing', 0, NULL, ?, NULL)
+    `).run(sourceAppId, deliveryId, eventName, payloadHash, new Date().toISOString());
     return "claimed";
+  }
+
+  bufferGithubWebhookDelivery(
+    sourceAppId: string,
+    deliveryId: string,
+    eventName: "push" | "pull_request",
+    payloadHash: string,
+    rawBody: Buffer,
+    limits: { maxCount: number; maxBytes: number }
+  ): "buffered" | "duplicate" | "mismatch" | "full" {
+    const existing = this.sqlite.prepare(`
+      SELECT event_name, payload_hash FROM github_webhook_deliveries
+      WHERE source_app_id = ? AND delivery_id = ?
+    `).get(sourceAppId, deliveryId) as { event_name: string; payload_hash: string | null } | undefined;
+    if (existing) {
+      if (existing.event_name !== eventName || (existing.payload_hash !== null && existing.payload_hash !== payloadHash)) {
+        return "mismatch";
+      }
+      return "duplicate";
+    }
+    const usage = this.githubBufferedWebhookUsage(sourceAppId);
+    if (
+      usage.count >= limits.maxCount
+      || usage.bytes + rawBody.byteLength > limits.maxBytes
+    ) {
+      return "full";
+    }
+    this.sqlite.prepare(`
+      INSERT INTO github_webhook_deliveries (
+        source_app_id, delivery_id, event_name, payload_hash, raw_body,
+        status, attempts, error, received_at, processed_at
+      ) VALUES (?, ?, ?, ?, ?, 'buffered', 0, NULL, ?, NULL)
+    `).run(sourceAppId, deliveryId, eventName, payloadHash, rawBody, new Date().toISOString());
+    return "buffered";
+  }
+
+  githubBufferedWebhookUsage(sourceAppId: string): GithubBufferedWebhookUsage {
+    return this.sqlite.prepare(`
+      SELECT COUNT(*) AS count, COALESCE(SUM(length(raw_body)), 0) AS bytes
+      FROM github_webhook_deliveries
+      WHERE source_app_id = ?
+        AND status IN ('buffered', 'processing')
+        AND raw_body IS NOT NULL
+    `).get(sourceAppId) as GithubBufferedWebhookUsage;
+  }
+
+  hasBufferedGithubWebhooks(sourceAppId: string): boolean {
+    return Boolean(this.sqlite.prepare(`
+      SELECT 1 FROM github_webhook_deliveries
+      WHERE source_app_id = ? AND status IN ('buffered', 'processing') AND raw_body IS NOT NULL
+      LIMIT 1
+    `).get(sourceAppId));
+  }
+
+  deleteBufferedGithubWebhooks(sourceAppId: string): number {
+    return this.sqlite.prepare(`
+      DELETE FROM github_webhook_deliveries
+      WHERE source_app_id = ?
+        AND status IN ('buffered', 'processing')
+        AND raw_body IS NOT NULL
+    `).run(sourceAppId).changes;
+  }
+
+  claimNextBufferedGithubWebhook(sourceAppId: string): GithubBufferedWebhookRow | undefined {
+    const row = this.sqlite.prepare(`
+      SELECT source_app_id, delivery_id, event_name, payload_hash, raw_body, received_at
+      FROM github_webhook_deliveries
+      WHERE source_app_id = ? AND status = 'buffered'
+        AND event_name IN ('push', 'pull_request') AND raw_body IS NOT NULL
+      ORDER BY received_at ASC, delivery_id ASC
+      LIMIT 1
+    `).get(sourceAppId) as GithubBufferedWebhookRow | undefined;
+    if (!row) return undefined;
+    const claimed = this.sqlite.prepare(`
+      UPDATE github_webhook_deliveries
+      SET status = 'processing', error = NULL, processed_at = NULL
+      WHERE source_app_id = ? AND delivery_id = ? AND status = 'buffered'
+    `).run(sourceAppId, row.delivery_id);
+    return claimed.changes === 1 ? row : undefined;
   }
 
   enqueueGithubDirtyRef(input: {
@@ -1204,20 +1625,54 @@ export class Database {
     );
   }
 
-  finishGithubWebhookDelivery(deliveryId: string, status: "processed" | "ignored"): void {
+  finishGithubWebhookDelivery(
+    sourceAppId: string,
+    deliveryId: string,
+    status: "processed" | "ignored"
+  ): void {
     this.sqlite.prepare(`
       UPDATE github_webhook_deliveries
-      SET status = ?, error = NULL, processed_at = ?
-      WHERE delivery_id = ? AND status = 'processing'
-    `).run(status, new Date().toISOString(), deliveryId);
+      SET status = ?, raw_body = NULL, error = NULL, processed_at = ?
+      WHERE source_app_id = ? AND delivery_id = ? AND status = 'processing'
+    `).run(status, new Date().toISOString(), sourceAppId, deliveryId);
   }
 
-  failGithubWebhookDelivery(deliveryId: string, error: string): void {
+  failGithubWebhookDelivery(
+    sourceAppId: string,
+    deliveryId: string,
+    error: string,
+    terminal = true
+  ): void {
     this.sqlite.prepare(`
       UPDATE github_webhook_deliveries
-      SET status = 'failed', error = ?, processed_at = ?
-      WHERE delivery_id = ? AND status = 'processing'
-    `).run(error.slice(0, 1_000), new Date().toISOString(), deliveryId);
+      SET status = ?, raw_body = CASE WHEN ? THEN NULL ELSE raw_body END,
+          attempts = attempts + 1, error = ?, processed_at = ?
+      WHERE source_app_id = ? AND delivery_id = ?
+        AND status IN ('buffered', 'processing') AND raw_body IS NOT NULL
+    `).run(
+      terminal ? "failed" : "buffered",
+      terminal ? 1 : 0,
+      error.slice(0, 1_000),
+      new Date().toISOString(),
+      sourceAppId,
+      deliveryId
+    );
+  }
+
+  bufferedGithubWebhookAttempts(sourceAppId: string, deliveryId: string): number {
+    const row = this.sqlite.prepare(`
+      SELECT attempts FROM github_webhook_deliveries
+      WHERE source_app_id = ? AND delivery_id = ?
+    `).get(sourceAppId, deliveryId) as { attempts: number } | undefined;
+    return row?.attempts ?? 0;
+  }
+
+  recoverProcessingGithubWebhooks(): number {
+    return this.sqlite.prepare(`
+      UPDATE github_webhook_deliveries
+      SET status = 'buffered', error = COALESCE(error, 'WORKER_INTERRUPTED'), processed_at = NULL
+      WHERE status = 'processing' AND raw_body IS NOT NULL
+    `).run().changes;
   }
 
   listGithubProjects(installationId: string, repositoryId: string, branch: string): ProjectRow[] {
@@ -1236,21 +1691,172 @@ export class Database {
     `).all(installationId, repositoryId, branch) as ProjectRow[];
   }
 
-  listGithubPreviewProjects(installationId: string, repositoryId: string, baseBranch: string): ProjectRow[] {
+  listGithubProjectBindings(): GithubProjectBindingRow[] {
+    return this.sqlite.prepare(`
+      SELECT id AS project_id, github_installation_id AS installation_id,
+             github_repository_id AS repository_id
+      FROM projects
+      WHERE github_installation_id IS NOT NULL
+        AND github_repository_id IS NOT NULL
+        AND source_type = 'git'
+        AND NOT EXISTS (
+          SELECT 1 FROM project_deletions WHERE project_deletions.project_id = projects.id
+        )
+      ORDER BY id ASC
+    `).all() as GithubProjectBindingRow[];
+  }
+
+  listGithubRepositoryIdsForInstallation(installationId: string): string[] {
+    const rows = this.sqlite.prepare(`
+      SELECT github_repository_id AS repository_id
+      FROM projects
+      WHERE github_installation_id = ? AND github_repository_id IS NOT NULL
+      UNION
+      SELECT repository_id FROM github_pending_pushes WHERE installation_id = ?
+      UNION
+      SELECT repository_id FROM github_dirty_refs WHERE installation_id = ?
+      UNION
+      SELECT repository_id FROM github_status_outbox WHERE installation_id = ?
+      ORDER BY repository_id ASC
+    `).all(
+      installationId,
+      installationId,
+      installationId,
+      installationId
+    ) as Array<{ repository_id: string }>;
+    return rows.map((row) => row.repository_id);
+  }
+
+  currentGithubInstallationIdForRepository(repositoryId: string): string | null {
+    const rows = this.sqlite.prepare(`
+      SELECT DISTINCT github_installation_id AS installation_id
+      FROM projects
+      WHERE github_repository_id = ?
+        AND github_installation_id IS NOT NULL
+        AND source_type = 'git'
+        AND NOT EXISTS (
+          SELECT 1 FROM project_deletions WHERE project_deletions.project_id = projects.id
+        )
+      ORDER BY github_installation_id ASC
+      LIMIT 2
+    `).all(repositoryId) as Array<{ installation_id: string }>;
+    return rows.length === 1 ? rows[0]!.installation_id : null;
+  }
+
+  remapGithubInstallation(
+    previousInstallationId: string | null,
+    nextInstallationId: string,
+    expectedBindings: GithubProjectBindingRow[]
+  ): void {
+    const currentBindings = this.listGithubProjectBindings();
+    if (JSON.stringify(currentBindings) !== JSON.stringify(expectedBindings)) {
+      throw conflict(
+        "Die GitHub-Projektverknüpfungen haben sich während des Upgrades geändert",
+        "GITHUB_UPGRADE_BINDINGS_CHANGED"
+      );
+    }
+    if (!previousInstallationId) {
+      if (currentBindings.length > 0) {
+        throw conflict(
+          "Die vorhandenen GitHub-Projekte konnten keiner Installation zugeordnet werden",
+          "GITHUB_UPGRADE_INSTALLATION_MISMATCH"
+        );
+      }
+      return;
+    }
+    if (previousInstallationId === nextInstallationId) {
+      throw conflict(
+        "Die neue GitHub-Installation entspricht unerwartet der bisherigen Installation",
+        "GITHUB_UPGRADE_INSTALLATION_MISMATCH"
+      );
+    }
+    if (currentBindings.some((binding) => binding.installation_id !== previousInstallationId)) {
+      throw conflict(
+        "Mehrere GitHub-Installationen können nicht automatisch ersetzt werden",
+        "GITHUB_UPGRADE_MULTIPLE_INSTALLATIONS"
+      );
+    }
+    const now = new Date().toISOString();
+    this.sqlite.prepare(`
+      UPDATE projects
+      SET github_installation_id = ?, github_connection_error = NULL, updated_at = ?
+      WHERE github_installation_id = ?
+    `).run(nextInstallationId, now, previousInstallationId);
+    this.sqlite.prepare(`
+      UPDATE github_pending_pushes SET installation_id = ? WHERE installation_id = ?
+    `).run(nextInstallationId, previousInstallationId);
+    this.sqlite.prepare(`
+      UPDATE github_dirty_refs
+      SET installation_id = ?, claim_token = NULL, claimed_generation = NULL,
+          claimed_at = NULL, attempts = 0, next_attempt_at = ?, last_error = NULL,
+          updated_at = ?
+      WHERE installation_id = ?
+    `).run(nextInstallationId, now, now, previousInstallationId);
+    this.sqlite.prepare(`
+      UPDATE github_status_outbox SET installation_id = ? WHERE installation_id = ?
+    `).run(nextInstallationId, previousInstallationId);
+  }
+
+  listGithubPullRequestProjects(installationId: string, repositoryId: string): ProjectRow[] {
     return this.sqlite.prepare(`
       SELECT projects.* FROM projects
       WHERE github_installation_id = ?
         AND github_repository_id = ?
-        AND repository_branch = ?
-        AND preview_deployments_enabled = 1
-        AND preview_domain_suffix IS NOT NULL
-        AND github_connection_error IS NULL
         AND source_type = 'git'
         AND NOT EXISTS (
           SELECT 1 FROM project_deletions WHERE project_deletions.project_id = projects.id
         )
       ORDER BY created_at ASC
-    `).all(installationId, repositoryId, baseBranch) as ProjectRow[];
+    `).all(installationId, repositoryId) as ProjectRow[];
+  }
+
+  claimGithubPullRequestEventWatermark(input: {
+    projectId: string;
+    repositoryId: string;
+    pullRequestNumber: number;
+    githubUpdatedAt: string;
+    action: "opened" | "reopened" | "synchronize" | "closed";
+    deliveryId: string;
+  }): "accepted" | "ignored" {
+    const existing = this.sqlite.prepare(`
+      SELECT github_updated_at, action
+      FROM github_pull_request_event_watermarks
+      WHERE project_id = ? AND repository_id = ? AND pull_request_number = ?
+    `).get(
+      input.projectId,
+      input.repositoryId,
+      input.pullRequestNumber
+    ) as { github_updated_at: string; action: string } | undefined;
+    if (existing) {
+      const incomingTime = Date.parse(input.githubUpdatedAt);
+      const existingTime = Date.parse(existing.github_updated_at);
+      if (incomingTime < existingTime) return "ignored";
+      if (incomingTime === existingTime) {
+        if (existing.action === input.action) return "ignored";
+        // GitHub timestamps can tie at their published precision. Closing is
+        // the only safe winner: every other conflicting tie is ignored so an
+        // already-closed preview can never be reopened by delivery order.
+        if (existing.action === "closed" || input.action !== "closed") return "ignored";
+      }
+    }
+    this.sqlite.prepare(`
+      INSERT INTO github_pull_request_event_watermarks (
+        project_id, repository_id, pull_request_number,
+        github_updated_at, action, delivery_id
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_id, repository_id, pull_request_number) DO UPDATE SET
+        github_updated_at = excluded.github_updated_at,
+        action = excluded.action,
+        delivery_id = excluded.delivery_id
+    `).run(
+      input.projectId,
+      input.repositoryId,
+      input.pullRequestNumber,
+      input.githubUpdatedAt,
+      input.action,
+      input.deliveryId
+    );
+    return "accepted";
   }
 
   queueOrPendGithubPush(projectId: string, push: GithubPushSnapshot):
@@ -2183,9 +2789,24 @@ export class Database {
 
   createDomain(domain: DomainRow): void {
     this.sqlite.prepare(`
-      INSERT INTO domains (id, project_id, hostname, zone_id, dns_record_id, status, error, created_at)
-      VALUES (@id, @project_id, @hostname, @zone_id, @dns_record_id, @status, @error, @created_at)
-    `).run(domain);
+      INSERT INTO domains (
+        id, project_id, hostname, zone_id, dns_record_id, status, error,
+        password_protection_enabled, password_hash, access_session_version,
+        access_session_ttl_hours, seo_indexing, created_at
+      )
+      VALUES (
+        @id, @project_id, @hostname, @zone_id, @dns_record_id, @status, @error,
+        @password_protection_enabled, @password_hash, @access_session_version,
+        @access_session_ttl_hours, @seo_indexing, @created_at
+      )
+    `).run({
+      ...domain,
+      password_protection_enabled: domain.password_protection_enabled ?? 0,
+      password_hash: domain.password_hash ?? null,
+      access_session_version: domain.access_session_version ?? 1,
+      access_session_ttl_hours: domain.access_session_ttl_hours ?? 168,
+      seo_indexing: domain.seo_indexing ?? 1
+    });
   }
 
   createOrRetryPendingDomain(domain: DomainRow):
@@ -2287,6 +2908,43 @@ export class Database {
     this.sqlite.prepare(`
       UPDATE domains SET zone_id = @zone_id, dns_record_id = @dns_record_id, status = @status, error = @error WHERE id = @id
     `).run({ id, ...updates });
+  }
+
+  updateDomainAccess(
+    id: string,
+    projectId: string,
+    updates: Pick<DomainRow,
+      "password_protection_enabled" | "password_hash" | "access_session_ttl_hours" | "seo_indexing"
+    >,
+    revokeSessions: boolean
+  ): DomainRow | undefined {
+    const result = this.sqlite.prepare(`
+      UPDATE domains
+      SET password_protection_enabled = @password_protection_enabled,
+          password_hash = @password_hash,
+          access_session_ttl_hours = @access_session_ttl_hours,
+          seo_indexing = @seo_indexing,
+          access_session_version = access_session_version + @version_increment
+      WHERE id = @id AND project_id = @project_id
+    `).run({
+      id,
+      project_id: projectId,
+      password_protection_enabled: updates.password_protection_enabled ?? 0,
+      password_hash: updates.password_hash ?? null,
+      access_session_ttl_hours: updates.access_session_ttl_hours ?? 168,
+      seo_indexing: updates.seo_indexing ?? 1,
+      version_increment: revokeSessions ? 1 : 0
+    });
+    return result.changes === 1 ? this.getDomain(id) : undefined;
+  }
+
+  revokeDomainAccessSessions(id: string, projectId: string): DomainRow | undefined {
+    const result = this.sqlite.prepare(`
+      UPDATE domains
+      SET access_session_version = access_session_version + 1
+      WHERE id = ? AND project_id = ?
+    `).run(id, projectId);
+    return result.changes === 1 ? this.getDomain(id) : undefined;
   }
 
   deleteDomain(id: string): void {

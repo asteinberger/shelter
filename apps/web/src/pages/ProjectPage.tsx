@@ -32,6 +32,7 @@ import { ProjectGitHubConnection } from '../components/ProjectGitHubConnection';
 import { ProjectPullRequestPreviews } from '../components/ProjectPullRequestPreviews';
 import { ProjectPreviewCard } from '../components/ProjectPreviewCard';
 import { ProjectObservabilityTab } from '../components/ProjectObservabilityTab';
+import { DomainAccessSettings } from '../components/DomainAccessSettings';
 import { StaticBasePathControl } from '../components/StaticBasePathControl';
 import { Button, ErrorState, Field, PageIntro, SelectField, Skeleton, StatusBadge } from '../components/ui';
 import {
@@ -1223,6 +1224,8 @@ export function ProjectPage() {
                 </CardContent>
               </Card>
             )}
+
+            <DomainAccessSettings projectId={project.id} domains={project.domains ?? []} />
 
             {((project.domains?.length ?? 0) === 0 || domainFormOpen) && (
               <Card>

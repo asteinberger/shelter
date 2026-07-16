@@ -139,6 +139,56 @@ describe('deployment api', () => {
   });
 });
 
+describe('domain access api', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('updates protection and visibility without sending an omitted password', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      domain: {
+        id: 'dom/42',
+        hostname: 'preview.example.com',
+        passwordProtectionEnabled: true,
+        passwordConfigured: true,
+        accessSessionTtlHours: 168,
+        seoIndexing: false,
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.updateDomainAccess('prj/42', 'dom/42', {
+      passwordProtectionEnabled: true,
+      accessSessionTtlHours: 168,
+      seoIndexing: false,
+    })).resolves.toMatchObject({
+      id: 'dom/42',
+      passwordProtectionEnabled: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/prj%2F42/domains/dom%2F42/access',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          passwordProtectionEnabled: true,
+          accessSessionTtlHours: 168,
+          seoIndexing: false,
+        }),
+      }),
+    );
+  });
+
+  it('revokes visitor sessions independently from administrator sessions', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.revokeDomainAccessSessions('prj_1', 'dom_1')).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/prj_1/domains/dom_1/access/revoke',
+      expect.objectContaining({ method: 'POST', credentials: 'include' }),
+    );
+  });
+});
+
 describe('cloudflare access protection api', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -213,6 +263,28 @@ describe('github api', () => {
       installations: [{ id: 42 }],
     });
     expect(fetchMock).toHaveBeenCalledWith('/api/settings/github', expect.objectContaining({ credentials: 'include' }));
+  });
+
+  it('starts the explicit preconfigured GitHub App upgrade flow', async () => {
+    const result = {
+      registrationUrl: 'https://github.com/settings/apps/new?state=abcdefghijklmnop',
+      manifest: {
+        default_permissions: { contents: 'read', statuses: 'write', metadata: 'read', pull_requests: 'read' },
+        default_events: ['push', 'pull_request'],
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(result));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.startGitHubUpgradeManifest()).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/settings/github/manifest/upgrade/start',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+      }),
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty('body');
   });
 
   it('creates a project from a GitHub App repository', async () => {
@@ -356,6 +428,10 @@ describe('pull request preview api', () => {
         pullRequestsPermission: true,
         pullRequestEvent: true,
         remediation: 'none',
+        remediationUrl: null,
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null,
       } }))
       .mockResolvedValueOnce(Response.json({
         settings: { enabled: false, domainId: null, domainSuffix: null, ttlHours: 72, maxActive: 3, inheritsProductionEnvironment: false },
@@ -369,13 +445,20 @@ describe('pull request preview api', () => {
           installationPullRequestEvent: true,
           installationSuspended: false,
           remediation: 'none',
+          remediationUrl: null,
+          upgradePending: false,
+          upgradeInstallUrl: null,
+          upgradeExpiresAt: null,
         },
         environmentKeys: [],
         previews: [],
       }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(api.githubPreviewCapability(123)).resolves.toMatchObject({ ready: true });
+    await expect(api.githubPreviewCapability(123)).resolves.toMatchObject({
+      ready: true,
+      remediationUrl: null,
+    });
     await expect(api.projectPullRequestPreviews('prj/42')).resolves.toMatchObject({ previews: [] });
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/settings/github/preview-capability?installationId=123', expect.objectContaining({ credentials: 'include' }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/projects/prj%2F42/previews', expect.objectContaining({ credentials: 'include' }));

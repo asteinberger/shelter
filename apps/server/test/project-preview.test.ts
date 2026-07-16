@@ -42,11 +42,7 @@ function previewCommand(runExitCode = 0) {
     if (args[0] === "run") {
       helperName = optionValue(args, "--name");
       labels = helperLabels(args);
-      return { stdout: "", stderr: "", exitCode: runExitCode };
-    }
-    if (args[0] === "cp" && args[2]) {
-      await fs.promises.writeFile(args[2], PNG);
-      return { stdout: "", stderr: "", exitCode: 0 };
+      return { stdout: runExitCode === 0 ? PNG.toString("base64") : "", stderr: "", exitCode: runExitCode };
     }
     if (args[0] === "inspect") {
       expect(args.at(-1)).toBe(helperName);

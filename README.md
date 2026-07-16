@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="apps/web/public/favicon.svg" width="88" height="88" alt="Shelter frog" />
+  <img src="apps/web/public/brand/shelter-icon-192.png" width="88" height="88" alt="Shelter frog" />
   <h1>Shelter</h1>
   <p><strong>give your code a home</strong></p>
   <p>
@@ -317,13 +317,23 @@ Per project, choose whether push-to-deploy is enabled:
 
 **Deploy current source** always fetches the latest branch HEAD and creates a new deployment. Installation and webhook state are checked server-side. Private clones use short-lived, repository-scoped installation tokens.
 
+#### GitHub App upgrades
+
+Newly registered Shelter GitHub Apps include every permission and webhook event required by the current Shelter version. When an older App is missing a required capability, Shelter can register a replacement through GitHub's App Manifest flow with the new permissions and events preselected. This creates a separate GitHub App; it does not modify the existing registration.
+
+The replacement remains pending while it is registered, installed, and checked. Shelter keeps the current App credentials, project connections, auto-deploys, and production traffic active throughout that process. It switches to the replacement only after the candidate App and installation satisfy the required capability checks. Cancelling the flow or failing a check leaves the existing connection unchanged.
+
+After Shelter reports that the replacement is active, remove the old App and its installation manually in GitHub. Shelter cannot delete a GitHub App registration on the operator's behalf. Do not remove the old App before the switch has completed.
+
+As an alternative, an App owner can update the existing registration manually under **Permissions & events**, then have each affected installation owner approve the added permissions. GitHub does not provide an API for Shelter to change an existing App's requested permissions or event subscriptions automatically.
+
 #### Pull-request preview deployments
 
 GitHub App projects can explicitly opt into pull-request previews and select one active project domain as their Cloudflare zone source. Shelter publishes a successful preview at a single-label zone hostname such as `pr-42--my-app-ab12cd34.example.com`, reports every admitted or limit-blocked build through the `shelter/preview` commit status, and removes the bounded runtime, route, image, and exact owned DNS record when the pull request closes or its 1–168 hour TTL expires. During a rebuild or failed update, the last successful generation stays routed until a healthy replacement switches atomically.
 
 Preview builds are deliberately fail-closed: the PR base branch must equal the project's configured branch, the head repository ID and full name must exactly equal the installed repository, and fork PRs are never built. A project can have at most three active previews. Synchronize events coalesce to the newest SHA and cooperatively cancel a running obsolete build. Preview variables live in a separate encrypted set and production variables are never inherited.
 
-Newly registered Shelter GitHub Apps request `Pull requests: Read-only` and subscribe to the `pull_request` event. Apps registered before this feature must be updated under **GitHub → Settings → Developer settings → GitHub Apps → Shelter → Permissions & events** and their installation must accept the changed permission. The separately cached `/api/settings/github/preview-capability?installationId=...` check distinguishes App configuration from installation approval without coupling local preview lifecycle polling to GitHub availability; Shelter refuses opt-in until both are ready instead of silently assuming that events will arrive.
+Pull-request previews require `Pull requests: Read-only` and the `pull_request` event. The separately cached `/api/settings/github/preview-capability?installationId=...` check distinguishes App configuration from installation approval without coupling local preview lifecycle polling to GitHub availability. Shelter refuses preview opt-in until both are ready instead of silently assuming that events will arrive.
 
 ### HTTPS Git
 
@@ -385,6 +395,13 @@ Before creating a record, Shelter checks:
 - whether Cloudflare already contains a conflicting DNS record.
 
 Each domain is routed through the same Cloudflare Tunnel to Traefik. A domain needs an active deployment before it can serve an application.
+
+The **Access & visibility** section configures each hostname independently:
+
+- Optional site-password protection runs in Traefik before the application, so it works for static sites, Next.js, Astro, and custom containers without a redeploy.
+- Visitors receive a branded, mobile-friendly password page and a host-only access cookie. The shared site password is separate from the Shelter administrator account.
+- Changing the password, protection state, or session duration invalidates existing visitor access. The operator can also sign out all visitors explicitly.
+- Search indexing can be disabled for public sites. Shelter then adds a strict `X-Robots-Tag` response header. Password-protected domains are always `noindex`.
 
 ## Project lifecycle
 

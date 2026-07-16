@@ -1,7 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
-  Check,
   Clock3,
   ExternalLink,
   GitBranch,
@@ -10,10 +9,8 @@ import {
   Layers3,
   LoaderCircle,
   Plus,
-  RefreshCw,
   ShieldCheck,
   Trash2,
-  X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -28,6 +25,7 @@ import type {
   PullRequestPreviewStatus,
 } from '../types';
 import { formatDate, formatRelative } from '../utils/format';
+import { shouldRefetchGitHubPreviewCapability } from '../utils/github';
 import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
 import { Button, ErrorState, Field, SelectField, Skeleton, StatusBadge } from './ui';
@@ -49,6 +47,9 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
+import { GitHubPreviewCapabilityNotice } from './GitHubPreviewCapabilityNotice';
+
+export { GitHubPreviewCapabilityNotice as PreviewCapability } from './GitHubPreviewCapabilityNotice';
 
 const transitionalPreviewStates = new Set<PullRequestPreviewStatus>(['queued', 'building', 'closing']);
 const activePreviewStates = new Set<PullRequestPreviewStatus>(['queued', 'building', 'ready']);
@@ -123,88 +124,6 @@ export function previewEnvironmentValidation(
 function capabilityStatus(capability?: GitHubPreviewCapability) {
   if (!capability) return 'pending';
   return capability.ready ? 'ready' : 'failed';
-}
-
-export function PreviewCapability({
-  capability,
-  refreshing,
-  onRetry,
-}: {
-  capability?: GitHubPreviewCapability;
-  refreshing?: boolean;
-  onRetry: () => void;
-}) {
-  const { t } = useI18n();
-  if (!capability) {
-    return (
-      <Alert variant="destructive">
-        <AlertTriangle aria-hidden="true" />
-        <AlertTitle>{t('GitHub readiness could not be verified', 'GitHub-Bereitschaft konnte nicht verifiziert werden')}</AlertTitle>
-        <AlertDescription>{t('Preview deployments stay disabled until Shelter can verify the required permission and webhook event.', 'Preview-Deployments bleiben deaktiviert, bis Shelter die erforderliche Berechtigung und das Webhook-Event verifizieren kann.')}</AlertDescription>
-        <Button variant="outline" size="sm" className="col-start-2 mt-2 w-fit" onClick={onRetry} loading={refreshing}>{!refreshing && <RefreshCw />} {t('Check again', 'Erneut prüfen')}</Button>
-      </Alert>
-    );
-  }
-  if (capability.ready) {
-    return (
-      <div className="flex flex-col gap-3 rounded-lg border border-success/25 bg-success/5 p-4 sm:flex-row sm:items-center sm:justify-between" role="status">
-        <div className="flex min-w-0 items-start gap-3">
-          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-success/25 bg-background"><ShieldCheck className="size-4 text-success" aria-hidden="true" /></span>
-          <div className="min-w-0">
-            <p className="font-medium">{t('GitHub App ready', 'GitHub App bereit')}</p>
-            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{t('Pull requests can be read and the pull_request webhook is active.', 'Pull Requests können gelesen werden und der pull_request-Webhook ist aktiv.')}</p>
-          </div>
-        </div>
-        <Button variant="ghost" size="sm" onClick={onRetry} loading={refreshing}>{!refreshing && <RefreshCw />} {t('Recheck', 'Neu prüfen')}</Button>
-      </div>
-    );
-  }
-  return (
-    <Alert variant="destructive">
-      <ShieldCheck aria-hidden="true" />
-      <AlertTitle>{capability.remediation === 'approve_installation_update'
-        ? t('GitHub installation approval required', 'Freigabe der GitHub-Installation erforderlich')
-        : capability.configured
-          ? t('GitHub App update required', 'GitHub-App-Update erforderlich')
-          : t('Connect a GitHub App first', 'Verbinde zuerst eine GitHub App')}</AlertTitle>
-      <AlertDescription>
-        {capability.remediation === 'approve_installation_update'
-          ? t('The GitHub App requests the correct access, but this repository installation still needs its owner to approve the update. Shelter stays fail-closed.', 'Die GitHub App fordert den richtigen Zugriff an, aber der Inhaber dieser Repository-Installation muss das Update noch freigeben. Shelter bleibt fail-closed.')
-          : t('Shelter fails closed: no preview build starts until every check below passes.', 'Shelter arbeitet fail-closed: Kein Preview-Build startet, bis alle Prüfungen unten erfolgreich sind.')}
-      </AlertDescription>
-      <ul className="col-start-2 mt-3 grid gap-2 text-sm" aria-label={t('Required GitHub capabilities', 'Erforderliche GitHub-Funktionen')}>
-        <li className="flex items-center gap-2">
-          {capability.pullRequestsPermission ? <Check className="size-4 text-success" aria-hidden="true" /> : <X className="size-4 text-destructive" aria-hidden="true" />}
-          <span>{t('Pull requests permission: Read', 'Pull-Requests-Berechtigung: Lesen')}</span>
-        </li>
-        {capability.installationChecked && (
-          <>
-            <li className="flex items-center gap-2">
-              {capability.installationPullRequestsPermission ? <Check className="size-4 text-success" aria-hidden="true" /> : <X className="size-4 text-destructive" aria-hidden="true" />}
-              <span>{t('Repository installation: Pull requests read access', 'Repository-Installation: Lesezugriff auf Pull Requests')}</span>
-            </li>
-            <li className="flex items-center gap-2">
-              {capability.installationPullRequestEvent ? <Check className="size-4 text-success" aria-hidden="true" /> : <X className="size-4 text-destructive" aria-hidden="true" />}
-              <span>{t('Repository installation: pull_request events', 'Repository-Installation: pull_request-Events')}</span>
-            </li>
-            <li className="flex items-center gap-2">
-              {!capability.installationSuspended ? <Check className="size-4 text-success" aria-hidden="true" /> : <X className="size-4 text-destructive" aria-hidden="true" />}
-              <span>{t('Repository installation active', 'Repository-Installation aktiv')}</span>
-            </li>
-          </>
-        )}
-        <li className="flex items-center gap-2">
-          {capability.pullRequestEvent ? <Check className="size-4 text-success" aria-hidden="true" /> : <X className="size-4 text-destructive" aria-hidden="true" />}
-          <span>{t('Webhook event: pull_request', 'Webhook-Event: pull_request')}</span>
-        </li>
-      </ul>
-      <div className="col-start-2 mt-3 flex flex-wrap gap-2">
-        <Button asChild variant="outline" size="sm"><Link to="/settings/github">{capability.remediation === 'approve_installation_update' ? t('Review installation approval', 'Installationsfreigabe prüfen') : capability.configured ? t('Open GitHub settings', 'GitHub-Einstellungen öffnen') : t('Connect GitHub', 'GitHub verbinden')}</Link></Button>
-        <Button variant="ghost" size="sm" onClick={onRetry} loading={refreshing}>{!refreshing && <RefreshCw />} {t('Check again', 'Erneut prüfen')}</Button>
-      </div>
-      {capability.configured && <p className="col-start-2 mt-2 text-xs text-muted-foreground">{t('GitHub may require the app owner or organization owner to approve newly requested permissions.', 'GitHub kann verlangen, dass der App- oder Organisationsinhaber neu angeforderte Berechtigungen bestätigt.')}</p>}
-    </Alert>
-  );
 }
 
 function SafetyRail({ maxActive }: { maxActive: number }) {
@@ -384,7 +303,12 @@ export function ProjectPullRequestPreviews({
     retry: false,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data) ? 'always' : false
+    ),
+    refetchOnReconnect: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data) ? 'always' : false
+    ),
   });
   const data = previewsQuery.data;
   const capability = capabilityQuery.data;
@@ -562,7 +486,7 @@ export function ProjectPullRequestPreviews({
           </div>
         </CardHeader>
         <CardContent className="grid gap-5">
-          <PreviewCapability capability={capability} refreshing={capabilityQuery.isFetching} onRetry={() => capabilityQuery.refetch()} />
+          <GitHubPreviewCapabilityNotice capability={capability} refreshing={capabilityQuery.isFetching} onRetry={() => capabilityQuery.refetch()} />
 
           {!project.github && (
             <Alert>

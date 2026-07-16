@@ -120,6 +120,12 @@ export interface DomainRow {
   dns_record_id: string | null;
   status: "pending" | "active" | "error";
   error: string | null;
+  /** Optional on input for backwards-compatible fixtures and additive migrations. */
+  password_protection_enabled?: 0 | 1;
+  password_hash?: string | null;
+  access_session_version?: number;
+  access_session_ttl_hours?: number;
+  seo_indexing?: 0 | 1;
   created_at: string;
 }
 
@@ -163,6 +169,41 @@ export interface GithubManifestFlowRow {
   redirect_uri: string;
   expires_at: string;
   created_at: string;
+}
+
+export interface GithubAppUpgradeFlowRow {
+  id: string;
+  manifest_state_hash: string;
+  manifest_browser_nonce_hash: string;
+  setup_state_hash: string;
+  setup_browser_nonce_hash: string | null;
+  user_id: string;
+  session_token_hash: string;
+  previous_app_id: string;
+  expected_owner_login: string;
+  expected_owner_type: "User" | "Organization";
+  candidate_app_id: string | null;
+  encrypted_candidate: string | null;
+  phase: "registering" | "converting" | "installing";
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GithubRetiredWebhookSourceRow {
+  app_id: string;
+  encrypted_webhook_secret: string;
+  previous_installation_id: string | null;
+  successor_installation_id: string;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GithubProjectBindingRow {
+  project_id: string;
+  installation_id: string;
+  repository_id: string;
 }
 
 export interface GithubPendingPushRow {
@@ -397,6 +438,10 @@ export interface PublicProject {
     hostname: string;
     status: DomainRow["status"];
     error: string | null;
+    passwordProtectionEnabled: boolean;
+    passwordConfigured: boolean;
+    accessSessionTtlHours: number;
+    seoIndexing: boolean;
   }>;
   deployments?: PublicDeployment[];
   currentDeployment?: PublicDeployment | null;

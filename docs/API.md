@@ -93,7 +93,7 @@ curl --fail-with-body \
   "$SHELTER_URL/api/projects/git"
 ```
 
-GitHub App repository selection and linking remain interactive, browser-session-only operations. Automation can create a project from a public HTTPS Git source and redeploy an already configured GitHub-backed project.
+GitHub App registration, staged replacement upgrades, repository selection, and project linking remain interactive, browser-session-only operations. Provider credentials and a pending replacement App cannot be managed with an API token. Automation can create a project from a public HTTPS Git source and redeploy an already configured GitHub-backed project.
 
 ### Deploy current source
 
@@ -167,6 +167,24 @@ Use the Shelter CLI for this workflow unless direct HTTP integration is required
 ### Manage domains
 
 List active Cloudflare zones with `GET /api/settings/cloudflare/zones`. Add a hostname with `POST /api/projects/{projectId}/domains` and remove it with `DELETE /api/projects/{projectId}/domains/{domainId}`. Domain mutations require a connected Cloudflare account and the `domains:write` scope.
+
+Configure sharing and search visibility with:
+
+```http
+PUT /api/projects/{projectId}/domains/{domainId}/access
+Content-Type: application/json
+
+{
+  "passwordProtectionEnabled": true,
+  "password": "a separate shared site password",
+  "accessSessionTtlHours": 168,
+  "seoIndexing": false
+}
+```
+
+`password` is required when protection is enabled for the first time and otherwise optional; omitting it preserves the current password. It must contain 8–256 characters. Session duration is 1–720 hours. Enabling protection always forces effective search indexing off. The response exposes only `passwordConfigured`, never the password hash.
+
+`POST /api/projects/{projectId}/domains/{domainId}/access/revoke` invalidates every visitor cookie for that domain without changing the password. Both endpoints require `domains:write`.
 
 ### Inspect project observability in the administrator panel
 

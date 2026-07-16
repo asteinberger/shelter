@@ -268,10 +268,14 @@ function packageManagerFor(
   const managerManifest = manifests.get(managerRoot) ?? manifest;
   const declared = managerManifest.packageManager?.split("@", 1)[0];
   if (declared === "bun" || declared === "pnpm" || declared === "yarn" || declared === "npm") return declared;
-  if (paths.has(joinRoot(managerRoot, "bun.lock")) || paths.has(joinRoot(managerRoot, "bun.lockb"))) return "bun";
+  if (paths.has(joinRoot(managerRoot, "bun.lock"))) return "bun";
   if (paths.has(joinRoot(managerRoot, "pnpm-lock.yaml"))) return "pnpm";
   if (paths.has(joinRoot(managerRoot, "yarn.lock"))) return "yarn";
   if (paths.has(joinRoot(managerRoot, "package-lock.json"))) return "npm";
+  // bun.lockb is Bun's legacy binary lockfile and is frequently left beside
+  // a newer lockfile by generators. Only infer Bun from it when no modern
+  // package-manager signal exists.
+  if (paths.has(joinRoot(managerRoot, "bun.lockb"))) return "bun";
   return "npm";
 }
 

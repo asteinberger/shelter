@@ -78,6 +78,17 @@ export interface Domain {
   error?: string | null;
   url?: string;
   createdAt?: string;
+  passwordProtectionEnabled?: boolean;
+  passwordConfigured?: boolean;
+  accessSessionTtlHours?: number;
+  seoIndexing?: boolean;
+}
+
+export interface DomainAccessInput {
+  passwordProtectionEnabled: boolean;
+  password?: string;
+  accessSessionTtlHours: number;
+  seoIndexing: boolean;
 }
 
 export interface Deployment {
@@ -120,7 +131,7 @@ export interface GitHubInstallation {
   accountAvatarUrl?: string | null;
   repositorySelection?: 'all' | 'selected' | string;
   suspendedAt?: string | null;
-  htmlUrl?: string;
+  htmlUrl?: string | null;
   account?: {
     login?: string;
     type?: string;
@@ -150,6 +161,10 @@ export interface GitHubPreviewCapability {
   installationPullRequestEvent?: boolean;
   installationSuspended?: boolean;
   remediation: 'none' | 'configure_app' | 'update_existing_app' | 'approve_installation_update';
+  remediationUrl?: string | null;
+  upgradePending: boolean;
+  upgradeInstallUrl: string | null;
+  upgradeExpiresAt: string | null;
 }
 
 export interface GitHubRepository {
@@ -620,9 +635,11 @@ export interface UpdateProjectGitHubInput {
   autoDeploy: boolean;
 }
 
+export type GitHubManifestPayload = string | Record<string, unknown>;
+
 export interface GitHubManifestStartResult {
   registrationUrl: string;
-  manifest: string | Record<string, unknown>;
+  manifest: GitHubManifestPayload;
 }
 
 export interface UploadProgress {

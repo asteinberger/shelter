@@ -57,7 +57,7 @@ vi.mock("../src/lib/command.js", async () => {
   };
 });
 
-import { DeploymentWorker } from "../src/services/worker.js";
+import { DeploymentWorker, startWorkerHeartbeat } from "../src/services/worker.js";
 
 const directories: string[] = [];
 const databases: Database[] = [];
@@ -120,6 +120,21 @@ afterEach(() => {
 });
 
 describe("deployment recovery", () => {
+  it("keeps the worker process alive while asynchronous deployment work is pending", () => {
+    vi.useFakeTimers();
+    const setSetting = vi.fn();
+    const heartbeat = startWorkerHeartbeat({ setSetting }, 5_000);
+    try {
+      expect(heartbeat.hasRef()).toBe(true);
+      expect(setSetting).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5_000);
+      expect(setSetting).toHaveBeenCalledTimes(2);
+    } finally {
+      clearInterval(heartbeat);
+      vi.useRealTimers();
+    }
+  });
+
   it("finishes an interrupted switch using runtime_container and only then removes the old runtime", async () => {
     const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "shelter-worker-recovery-"));
     directories.push(dataDirectory);

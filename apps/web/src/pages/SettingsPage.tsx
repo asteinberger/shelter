@@ -41,8 +41,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Separator } from '@/components/ui/separator';
 import { NavigationGuard } from '../components/NavigationGuard';
 import { GitHubIcon } from '../components/GitHubIcon';
+import { GitHubPreviewCapabilityNotice } from '../components/GitHubPreviewCapabilityNotice';
 import { CloudflareAccessProtectionCard } from '../components/CloudflareAccessProtectionCard';
-import { trustedGitHubAppUrl, trustedGitHubManifestRegistrationUrl } from '../utils/github';
+import {
+  githubPreviewCapabilityStatus,
+  shouldRefetchGitHubPreviewCapability,
+  trustedGitHubAppUrl,
+} from '../utils/github';
+import { githubCallbackNotice } from '../utils/github-callback';
+import { submitGitHubManifest } from '../utils/github-manifest';
 import { currentLocale, localize, useI18n } from '@/i18n';
 import type { CloudflareSettings } from '../types';
 
@@ -127,25 +134,6 @@ function formatExpiry(value?: string | null) {
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
-}
-
-function submitGitHubManifest(registrationUrl: string, manifest: string | Record<string, unknown>) {
-  const target = trustedGitHubManifestRegistrationUrl(registrationUrl);
-  if (!target) {
-    throw new Error(localize('GitHub returned an invalid registration URL.', 'GitHub hat eine ungültige Registrierungsadresse zurückgegeben.'));
-  }
-
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = target;
-  form.hidden = true;
-  const input = document.createElement('input');
-  input.type = 'hidden';
-  input.name = 'manifest';
-  input.value = typeof manifest === 'string' ? manifest : JSON.stringify(manifest);
-  form.append(input);
-  document.body.append(form);
-  form.submit();
 }
 
 function SectionHeading({
@@ -241,6 +229,12 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     queryFn: api.github,
     enabled: section === 'github',
     retry: false,
+    refetchOnWindowFocus: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data?.previewCapability) ? 'always' : false
+    ),
+    refetchOnReconnect: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data?.previewCapability) ? 'always' : false
+    ),
   });
   const registerGitHub = useMutation({
     mutationFn: api.startGitHubManifest,
@@ -327,17 +321,11 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     const callbackStatus = params.get('github');
     if (!callbackStatus) return;
 
-    if (callbackStatus === 'connected' || callbackStatus === 'registered' || callbackStatus === 'installed') {
-      toast.success(callbackStatus === 'installed' ? t('GitHub installation connected', 'GitHub-Installation verbunden') : t('GitHub App connected', 'GitHub App verbunden'), {
-        description: t('Repositories can now be selected directly in Shelter.', 'Repositories können jetzt direkt in Shelter ausgewählt werden.'),
-        id: 'github-callback',
-      });
-    } else {
-      toast.error(t('GitHub could not be connected', 'GitHub konnte nicht verbunden werden'), {
-        description: params.get('message') ?? t('Setup was cancelled or rejected by GitHub.', 'Die Einrichtung wurde abgebrochen oder von GitHub abgelehnt.'),
-        id: 'github-callback',
-      });
-    }
+    const callbackNotice = githubCallbackNotice(callbackStatus, params.get('message'), t);
+    const callbackOptions = { description: callbackNotice.description, id: 'github-callback' };
+    if (callbackNotice.tone === 'success') toast.success(callbackNotice.title, callbackOptions);
+    else if (callbackNotice.tone === 'warning') toast.warning(callbackNotice.title, callbackOptions);
+    else toast.error(callbackNotice.title, callbackOptions);
 
     ['github', 'github_error', 'error', 'error_description', 'message', 'reason'].forEach((key) => params.delete(key));
     const remainingQuery = params.toString();
@@ -348,6 +336,8 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     );
     void queryClient.invalidateQueries({ queryKey: ['github-settings'] });
     void queryClient.invalidateQueries({ queryKey: ['github-repositories'] });
+    void queryClient.invalidateQueries({ queryKey: ['github-preview-capability'] });
+    void queryClient.invalidateQueries({ queryKey: ['project-pull-request-previews'] });
   }, [queryClient, section, t]);
 
   useEffect(() => {
@@ -674,6 +664,8 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     const connected = Boolean(github?.connected && installations.length > 0);
     const githubAppUrl = trustedGitHubAppUrl(github?.appUrl);
     const githubInstallUrl = trustedGitHubAppUrl(github?.installUrl);
+    const previewCapabilityStatus = githubPreviewCapabilityStatus(github?.previewCapability);
+    const previewCapabilityNeedsUpdate = previewCapabilityStatus === 'update';
 
     return (
       <div className="flex flex-col gap-8 sm:gap-10">
@@ -764,6 +756,14 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
               </section>
             ) : (
               <div className="grid max-w-4xl gap-5">
+                {previewCapabilityNeedsUpdate && (
+                  <GitHubPreviewCapabilityNotice
+                    capability={github.previewCapability}
+                    refreshing={githubSettings.isFetching}
+                    onRetry={() => githubSettings.refetch()}
+                  />
+                )}
+
                 <Card aria-labelledby="github-app-title">
                   <CardHeader className="gap-4 border-b sm:grid-cols-[1fr_auto]">
                     <div className="min-w-0">
@@ -786,8 +786,19 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                         <dd className="mt-1 text-sm font-medium tabular-nums">{installations.length}</dd>
                       </div>
                       <div>
-                        <dt className="text-sm text-muted-foreground">Auto-Deploy</dt>
-                        <dd className="mt-1 flex items-center gap-1.5 text-sm font-medium"><GitPullRequest className="size-3.5" aria-hidden="true" /> {t('Ready', 'Bereit')}</dd>
+                        <dt className="text-sm text-muted-foreground">{t('PR previews', 'PR-Previews')}</dt>
+                        <dd className="mt-1 flex items-center gap-1.5 text-sm font-medium">
+                          {previewCapabilityNeedsUpdate
+                            ? <AlertTriangle className="size-3.5 text-warning" aria-hidden="true" />
+                            : previewCapabilityStatus === 'unavailable'
+                              ? <CircleDot className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                              : <GitPullRequest className="size-3.5" aria-hidden="true" />}
+                          {previewCapabilityNeedsUpdate
+                            ? t('Update required', 'Aktualisierung nötig')
+                            : previewCapabilityStatus === 'unavailable'
+                              ? t('Check unavailable', 'Prüfung nicht verfügbar')
+                              : t('Ready', 'Bereit')}
+                        </dd>
                       </div>
                     </dl>
                     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">

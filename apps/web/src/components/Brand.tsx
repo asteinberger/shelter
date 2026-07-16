@@ -24,12 +24,12 @@ export function Brand({ compact = false, inverse = false, linkTo = '/', showClai
     >
       <span
         className={cn(
-          'grid size-8 place-items-center rounded-md bg-[var(--brand)] text-[var(--brand-foreground)] shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--brand-foreground)_12%,transparent)] transition-transform group-hover:-translate-y-px',
+          'grid size-8 shrink-0 place-items-center rounded-[0.7rem] transition-transform group-hover:-translate-y-px',
           compact && 'size-7',
         )}
         aria-hidden="true"
       >
-        <ShelterFrog className={compact ? 'size-[1.15rem]' : 'size-[1.35rem]'} />
+        <ShelterFrog className="size-full drop-shadow-sm" />
       </span>
       {!compact && (
         <span className="grid gap-0.5 leading-none">
