@@ -95,6 +95,22 @@ describe("project source analysis", () => {
     ])).toMatchObject({ framework: "vite", outputDirectory: "dist", spaFallback: true });
   });
 
+  it("prefers a modern npm lockfile over an additional legacy Bun lockfile", () => {
+    expect(application([
+      packageFile(".", {
+        scripts: { build: "vite build" },
+        dependencies: { react: "18.3.1" },
+        devDependencies: { vite: "5.4.19" }
+      }),
+      { path: "bun.lockb" },
+      { path: "package-lock.json" }
+    ])).toMatchObject({
+      framework: "react",
+      packageManager: "npm",
+      buildCommand: "npm run build"
+    });
+  });
+
   it("detects Astro static/server, Node, Dockerfile, static HTML and file storage", () => {
     expect(application([
       packageFile(".", { scripts: { build: "astro build" }, dependencies: { astro: "5.12.0" } }),

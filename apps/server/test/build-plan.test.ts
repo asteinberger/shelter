@@ -246,6 +246,38 @@ describe("build plan detection", () => {
     expect(dockerfile).toContain("npm install --global bun@1.2.20 && bun install --frozen-lockfile");
   });
 
+  it("uses npm when package-lock.json is committed beside a legacy bun.lockb", () => {
+    const directory = temporaryProject();
+    fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
+      scripts: { build: "vite build" },
+      dependencies: { react: "18.3.1" },
+      devDependencies: { vite: "5.4.19" }
+    }));
+    fs.writeFileSync(path.join(directory, "bun.lockb"), "legacy");
+    fs.writeFileSync(path.join(directory, "package-lock.json"), "{}");
+    const plan = createBuildPlan(project(), directory, generated(directory));
+    const dockerfile = fs.readFileSync(plan.dockerfilePath, "utf8");
+    expect(dockerfile).toContain("COPY package.json package-lock.json ./");
+    expect(dockerfile).toContain("RUN npm ci");
+    expect(dockerfile).not.toContain("bun install");
+  });
+
+  it("honors an explicitly declared package manager when multiple lockfiles exist", () => {
+    const directory = temporaryProject();
+    fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
+      packageManager: "bun@1.2.20",
+      scripts: { build: "vite build" },
+      devDependencies: { vite: "7.0.0" }
+    }));
+    fs.writeFileSync(path.join(directory, "bun.lockb"), "legacy");
+    fs.writeFileSync(path.join(directory, "package-lock.json"), "{}");
+    const plan = createBuildPlan(project(), directory, generated(directory));
+    const dockerfile = fs.readFileSync(plan.dockerfilePath, "utf8");
+    expect(dockerfile).toContain("COPY package.json bun.lockb ./");
+    expect(dockerfile).toContain("bun install --frozen-lockfile");
+    expect(dockerfile).not.toContain("RUN npm ci");
+  });
+
   it("builds a selected pnpm workspace app from the repository root with analyzer parity", () => {
     const directory = temporaryProject();
     fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
