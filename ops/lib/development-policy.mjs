@@ -1,6 +1,5 @@
-const SEMVER_PATTERN = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$/;
-const CONTRIBUTION_BRANCH_PATTERN = /^(?:agent|fix)\/[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?(?:\/[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)*$/;
-const RELEASE_BRANCH_PATTERN = /^agent\/release-(.+)$/;
+const MAX_RELEASE_VERSION_LENGTH = 127;
+const MAX_CONTRIBUTION_BRANCH_LENGTH = 240;
 
 export class PolicyError extends Error {
   constructor(message) {
@@ -9,24 +8,74 @@ export class PolicyError extends Error {
   }
 }
 
+function isAsciiDigit(character) {
+  return character >= "0" && character <= "9";
+}
+
+function isAsciiLetter(character) {
+  return (character >= "A" && character <= "Z")
+    || (character >= "a" && character <= "z");
+}
+
+function isNumericIdentifier(value) {
+  if (value.length === 0) return false;
+  for (const character of value) {
+    if (!isAsciiDigit(character)) return false;
+  }
+  return true;
+}
+
+function isValidNumericIdentifier(value) {
+  return isNumericIdentifier(value) && (value === "0" || value[0] !== "0");
+}
+
+function isValidPrereleaseIdentifier(value) {
+  if (value.length === 0) return false;
+  let containsLetterOrHyphen = false;
+  for (const character of value) {
+    if (isAsciiDigit(character)) continue;
+    if (isAsciiLetter(character) || character === "-") {
+      containsLetterOrHyphen = true;
+      continue;
+    }
+    return false;
+  }
+  return containsLetterOrHyphen || isValidNumericIdentifier(value);
+}
+
+function invalidVersion(label) {
+  throw new PolicyError(
+    `${label} must use SemVer MAJOR.MINOR.PATCH with an optional prerelease suffix and no build metadata.`
+  );
+}
+
 export function parseShelterVersion(value, label = "version") {
   if (typeof value !== "string") {
     throw new PolicyError(`${label} must be a string.`);
   }
+  if (value.length > MAX_RELEASE_VERSION_LENGTH) {
+    throw new PolicyError(`${label} must not exceed ${MAX_RELEASE_VERSION_LENGTH} characters.`);
+  }
+  if (value.includes("+")) invalidVersion(label);
 
-  const match = SEMVER_PATTERN.exec(value);
-  if (!match) {
-    throw new PolicyError(
-      `${label} must use SemVer MAJOR.MINOR.PATCH with an optional prerelease suffix and no build metadata.`
-    );
+  const prereleaseSeparator = value.indexOf("-");
+  const core = prereleaseSeparator === -1 ? value : value.slice(0, prereleaseSeparator);
+  const prereleaseText = prereleaseSeparator === -1 ? "" : value.slice(prereleaseSeparator + 1);
+  const coreIdentifiers = core.split(".");
+  if (coreIdentifiers.length !== 3 || !coreIdentifiers.every(isValidNumericIdentifier)) {
+    invalidVersion(label);
+  }
+  const prerelease = prereleaseSeparator === -1 ? [] : prereleaseText.split(".");
+  if (prereleaseSeparator !== -1 && !prerelease.every(isValidPrereleaseIdentifier)) {
+    invalidVersion(label);
   }
 
   return {
     raw: value,
-    major: match[1],
-    minor: match[2],
-    patch: match[3],
-    prerelease: match[4] ? match[4].split(".") : []
+    major: coreIdentifiers[0],
+    minor: coreIdentifiers[1],
+    patch: coreIdentifiers[2],
+    prerelease
   };
 }
 
@@ -37,8 +86,8 @@ function compareNumericIdentifier(left, right) {
 }
 
 function comparePrereleaseIdentifier(left, right) {
-  const leftIsNumber = /^[0-9]+$/.test(left);
-  const rightIsNumber = /^[0-9]+$/.test(right);
+  const leftIsNumber = isNumericIdentifier(left);
+  const rightIsNumber = isNumericIdentifier(right);
   if (leftIsNumber && rightIsNumber) return compareNumericIdentifier(left, right);
   if (leftIsNumber) return -1;
   if (rightIsNumber) return 1;
@@ -152,7 +201,24 @@ export function onlyRepositoryVersionChanged({
 }
 
 export function isContributionBranch(branch) {
-  return CONTRIBUTION_BRANCH_PATTERN.test(branch);
+  if (typeof branch !== "string" || branch.length > MAX_CONTRIBUTION_BRANCH_LENGTH) return false;
+  const prefix = branch.startsWith("agent/")
+    ? "agent/"
+    : branch.startsWith("fix/") ? "fix/" : "";
+  if (!prefix) return false;
+  const segments = branch.slice(prefix.length).split("/");
+  if (segments.length === 0) return false;
+  return segments.every((segment) => {
+    if (segment.length === 0 || !isAsciiDigit(segment[0]) && !isAsciiLetter(segment[0])) return false;
+    const last = segment[segment.length - 1];
+    if (!isAsciiDigit(last) && !isAsciiLetter(last)) return false;
+    for (const character of segment) {
+      if (isAsciiDigit(character) || (character >= "a" && character <= "z")) continue;
+      if (character === "." || character === "_" || character === "-") continue;
+      return false;
+    }
+    return true;
+  });
 }
 
 function isDependabotPullRequest({ actor, branch, baseRepository, headRepository }) {
@@ -198,9 +264,11 @@ export function evaluatePullRequestPolicy({
       );
     }
     if (headVersion !== baseVersion) {
-      const releaseMatch = RELEASE_BRANCH_PATTERN.exec(headBranch);
+      const releaseBranchVersion = headBranch.startsWith("agent/release-")
+        ? headBranch.slice("agent/release-".length)
+        : "";
       const allowedReleasePaths = new Set(["package.json", "package-lock.json"]);
-      const releaseBranchIsValid = releaseMatch?.[1] === headVersion
+      const releaseBranchIsValid = releaseBranchVersion === headVersion
         && headRepository === baseRepository;
       const releaseDiffIsFocused = changedPaths.length === allowedReleasePaths.size
         && changedPaths.every((path) => allowedReleasePaths.has(path));

@@ -40,6 +40,10 @@ test("accepts strict release SemVer and orders prereleases", () => {
   assert.throws(() => parseShelterVersion("1.2.3+rebuilt"), /no build metadata/);
   assert.throws(() => parseShelterVersion("01.2.3"), /must use SemVer/);
   assert.throws(() => parseShelterVersion("1.2.3-01"), /must use SemVer/);
+  assert.throws(
+    () => parseShelterVersion(`1.2.3-${"a.".repeat(100_000)}`),
+    /must not exceed 127 characters/
+  );
 });
 
 test("recognizes only the documented contribution branch families", () => {

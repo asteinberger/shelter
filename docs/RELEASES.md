@@ -116,17 +116,17 @@ zero so the maintainer is not deadlocked by self-review rules. Keep review
 threads resolvable and checks mandatory. Raise the approval count to one and
 require Code Owner review as soon as a second trusted reviewer is available.
 
-The exact required check names are:
+Use these stable aggregate/security check names in both branch rulesets:
 
 - `PR policy / Branch and release policy`
-- `CI / Workflow policy`
-- `CI / Application`
-- `CI / Installer`
-- `CI / Compose configuration`
-- `CI / Container image`
 - `CI / Development integration gate`
 - `CodeQL / Analyze JavaScript and TypeScript`
 - `Dependency Review / Dependency Review`
+
+The development integration gate already depends fail-closed on the workflow,
+application, installer, Compose, and container jobs. Requiring the aggregate
+avoids brittle ruleset updates when an internal job is renamed without reducing
+coverage.
 
 Because GitHub evaluates a newly added workflow only after it exists on the
 target branch, the first merge that introduces this policy is a one-time

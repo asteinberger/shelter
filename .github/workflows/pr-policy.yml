@@ -6,6 +6,7 @@ on:
       - dev
       - main
     types:
+      - edited
       - opened
       - reopened
       - synchronize
@@ -63,16 +64,177 @@ jobs:
           BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_REPOSITORY: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.head_ref }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
-          node ops/check-pr-policy.mjs \
-            --actor "$ACTOR" \
-            --base-branch "$BASE_BRANCH" \
-            --base-ref "$BASE_SHA" \
-            --base-repository "$BASE_REPOSITORY" \
-            --expected-head-sha "$EXPECTED_HEAD_SHA" \
-            --head-branch "$HEAD_BRANCH" \
-            --head-ref refs/shelter-policy/head \
-            --head-repository "$HEAD_REPOSITORY"
+          if [[ -f ops/check-pr-policy.mjs ]]; then
+            node ops/check-pr-policy.mjs \
+              --actor "$ACTOR" \
+              --base-branch "$BASE_BRANCH" \
+              --base-ref "$BASE_SHA" \
+              --base-repository "$BASE_REPOSITORY" \
+              --expected-head-sha "$EXPECTED_HEAD_SHA" \
+              --head-branch "$HEAD_BRANCH" \
+              --head-ref refs/shelter-policy/head \
+              --head-repository "$HEAD_REPOSITORY"
+            exit 0
+          fi
+
+          # One fail-closed bootstrap is needed because a pull_request workflow
+          # may be introduced before its trusted policy script exists on dev.
+          # Inspect the fetched Git objects only; never check out or execute the
+          # pull request's scripts during this path.
+          if [[ "$BASE_BRANCH" == "main" ]]; then
+            if [[ "$HEAD_BRANCH" != "dev" \
+              || "$BASE_REPOSITORY" != "$EVENT_REPOSITORY" \
+              || "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]]; then
+              echo "The main policy bootstrap permits only same-repository dev -> main." >&2
+              exit 1
+            fi
+
+            base_package_version=$(git show "${BASE_SHA}:package.json" | jq -er '.version')
+            head_package_version=$(git show 'refs/shelter-policy/head:package.json' | jq -er '.version')
+            base_lock_versions=$(git show "${BASE_SHA}:package-lock.json" | jq -er '[.version, .packages[""].version] | @tsv')
+            head_lock_versions=$(git show 'refs/shelter-policy/head:package-lock.json' | jq -er '[.version, .packages[""].version] | @tsv')
+            if [[ "$base_lock_versions" != "${base_package_version}"$'\t'"${base_package_version}" \
+              || "$head_lock_versions" != "${head_package_version}"$'\t'"${head_package_version}" ]]; then
+              echo "The main policy bootstrap requires consistent package and lockfile versions." >&2
+              exit 1
+            fi
+
+            BASE_VERSION="$base_package_version" HEAD_VERSION="$head_package_version" node <<'EOF_BOOTSTRAP_SEMVER'
+          const maximumLength = 127;
+          const digit = (character) => character >= "0" && character <= "9";
+          const letter = (character) => (character >= "A" && character <= "Z")
+            || (character >= "a" && character <= "z");
+          const numeric = (value) => {
+            if (value.length === 0) return false;
+            for (const character of value) if (!digit(character)) return false;
+            return true;
+          };
+          const validNumeric = (value) => numeric(value) && (value === "0" || value[0] !== "0");
+          const parse = (value) => {
+            if (!value || value.length > maximumLength || value.includes("+")) throw new Error("invalid SemVer");
+            const separator = value.indexOf("-");
+            const core = (separator === -1 ? value : value.slice(0, separator)).split(".");
+            if (core.length !== 3 || !core.every(validNumeric)) throw new Error("invalid SemVer");
+            const prerelease = separator === -1 ? [] : value.slice(separator + 1).split(".");
+            for (const identifier of prerelease) {
+              if (identifier.length === 0) throw new Error("invalid SemVer");
+              let nonNumeric = false;
+              for (const character of identifier) {
+                if (digit(character)) continue;
+                if (!letter(character) && character !== "-") throw new Error("invalid SemVer");
+                nonNumeric = true;
+              }
+              if (!nonNumeric && !validNumeric(identifier)) throw new Error("invalid SemVer");
+            }
+            return { core, prerelease };
+          };
+          const compareNumeric = (left, right) => left.length === right.length
+            ? left === right ? 0 : left < right ? -1 : 1
+            : left.length < right.length ? -1 : 1;
+          const compare = (leftValue, rightValue) => {
+            const left = parse(leftValue);
+            const right = parse(rightValue);
+            for (let index = 0; index < 3; index += 1) {
+              const result = compareNumeric(left.core[index], right.core[index]);
+              if (result !== 0) return result;
+            }
+            if (left.prerelease.length === 0 || right.prerelease.length === 0) {
+              return left.prerelease.length === right.prerelease.length
+                ? 0 : left.prerelease.length === 0 ? 1 : -1;
+            }
+            const length = Math.max(left.prerelease.length, right.prerelease.length);
+            for (let index = 0; index < length; index += 1) {
+              const leftIdentifier = left.prerelease[index];
+              const rightIdentifier = right.prerelease[index];
+              if (leftIdentifier === undefined || rightIdentifier === undefined) {
+                return leftIdentifier === undefined ? -1 : 1;
+              }
+              const leftNumeric = numeric(leftIdentifier);
+              const rightNumeric = numeric(rightIdentifier);
+              let result;
+              if (leftNumeric && rightNumeric) result = compareNumeric(leftIdentifier, rightIdentifier);
+              else if (leftNumeric !== rightNumeric) result = leftNumeric ? -1 : 1;
+              else result = leftIdentifier === rightIdentifier ? 0 : leftIdentifier < rightIdentifier ? -1 : 1;
+              if (result !== 0) return result;
+            }
+            return 0;
+          };
+          try {
+            if (compare(process.env.HEAD_VERSION, process.env.BASE_VERSION) <= 0) {
+              throw new Error("version was not raised");
+            }
+          } catch (error) {
+            console.error(`Main policy bootstrap rejected release versions: ${error.message}.`);
+            process.exit(1);
+          }
+          EOF_BOOTSTRAP_SEMVER
+            echo "One-time main policy bootstrap passed without executing pull request code."
+            exit 0
+          fi
+
+          if [[ "$BASE_BRANCH" != "dev" \
+            || "$HEAD_BRANCH" != "agent/development-workflow" \
+            || "$BASE_REPOSITORY" != "$EVENT_REPOSITORY" \
+            || "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]]; then
+            echo "The policy bootstrap is restricted to same-repository agent/development-workflow -> dev." >&2
+            exit 1
+          fi
+
+          expected_paths=$(mktemp)
+          actual_paths=$(mktemp)
+          trap 'rm -f "$expected_paths" "$actual_paths"' EXIT
+          cat >"$expected_paths" <<'EOF_BOOTSTRAP_PATHS'
+          .github/CODEOWNERS
+          .github/pull_request_template.md
+          .github/workflows/ci.yml
+          .github/workflows/pr-policy.yml
+          AGENTS.md
+          CONTRIBUTING.md
+          docs/RELEASES.md
+          ops/check-pr-policy.mjs
+          ops/lib/development-policy.mjs
+          ops/prepare-release.mjs
+          package.json
+          test/development-policy.test.mjs
+          test/development-workflow.test.sh
+          test/pr-policy-workflow.test.mjs
+          EOF_BOOTSTRAP_PATHS
+          git diff \
+            --name-only \
+            --diff-filter=ACDMRT \
+            "${BASE_SHA}...refs/shelter-policy/head" \
+            | LC_ALL=C sort >"$actual_paths"
+          if ! cmp -s "$expected_paths" "$actual_paths"; then
+            echo "The bootstrap pull request changed files outside its exact reviewed path set." >&2
+            diff -u "$expected_paths" "$actual_paths" || true
+            exit 1
+          fi
+
+          base_package_version=$(git show "${BASE_SHA}:package.json" | jq -er '.version')
+          head_package_version=$(git show 'refs/shelter-policy/head:package.json' | jq -er '.version')
+          base_lock_versions=$(git show "${BASE_SHA}:package-lock.json" | jq -er '[.version, .packages[""].version] | @tsv')
+          head_lock_versions=$(git show 'refs/shelter-policy/head:package-lock.json' | jq -er '[.version, .packages[""].version] | @tsv')
+          if [[ "$head_package_version" != "$base_package_version" \
+            || "$head_lock_versions" != "$base_lock_versions" \
+            || "$head_lock_versions" != "${head_package_version}"$'\t'"${head_package_version}" ]]; then
+            echo "The bootstrap pull request must not change or desynchronize the release version." >&2
+            exit 1
+          fi
+
+          for required_blob in \
+            .github/workflows/pr-policy.yml \
+            ops/check-pr-policy.mjs \
+            ops/lib/development-policy.mjs \
+            ops/prepare-release.mjs; do
+            mode=$(git ls-tree refs/shelter-policy/head -- "$required_blob" | awk '{ print $1 }')
+            if [[ "$mode" != "100644" && "$mode" != "100755" ]]; then
+              echo "Bootstrap policy file is missing or not a regular Git blob: ${required_blob}" >&2
+              exit 1
+            fi
+          done
+          echo "One-time development policy bootstrap passed without executing pull request code."
