@@ -1,0 +1,78 @@
+name: PR policy
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Branch and release policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # The policy implementation must come from the trusted base commit. The
+      # untrusted PR ref is fetched only as Git objects and is never executed.
+      - name: Check out trusted base policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Fetch exact pull request head
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ || ! "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub returned an invalid pull request identity." >&2
+            exit 1
+          fi
+          git fetch \
+            --force \
+            --no-tags \
+            origin \
+            "refs/pull/${PR_NUMBER}/head:refs/shelter-policy/head"
+          actual_head_sha=$(git rev-parse 'refs/shelter-policy/head^{commit}')
+          if [[ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "Fetched pull request head does not match the event payload." >&2
+            exit 1
+          fi
+
+      - name: Enforce development and release flow
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          node ops/check-pr-policy.mjs \
+            --actor "$ACTOR" \
+            --base-branch "$BASE_BRANCH" \
+            --base-ref "$BASE_SHA" \
+            --base-repository "$BASE_REPOSITORY" \
+            --expected-head-sha "$EXPECTED_HEAD_SHA" \
+            --head-branch "$HEAD_BRANCH" \
+            --head-ref refs/shelter-policy/head \
+            --head-repository "$HEAD_REPOSITORY"

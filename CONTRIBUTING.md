@@ -9,6 +9,15 @@ Thank you for helping make Shelter better. The project is still an MVP, so small
 - Never report security vulnerabilities publicly. Follow the process in [SECURITY.md](SECURITY.md).
 - Remove tokens, domains, IP addresses, email addresses, and other sensitive values from logs and screenshots.
 
+Create every contribution from current `dev` and use one of these branch forms:
+
+- `agent/<feature>` for features, refactors, documentation, and maintenance,
+- `fix/<name>` for bug and security fixes.
+
+Open that branch against `dev`, never `main`. Dependabot is the only automated
+exception to the branch-name rule. Direct pushes to `dev` and `main` are not
+part of the contribution flow.
+
 ## Local development
 
 You need Node.js 24 or newer and npm 11 or newer.
@@ -42,11 +51,24 @@ when Dependabot updates a pin.
 ## Releases
 
 Only maintainers publish releases. Do not create `v*` tags from a contribution
-branch or upload release assets manually. The release workflow accepts a
-version-matching commit on `main`, builds the multi-platform image once, emits
-signed provenance and SBOM attestations, and publishes an immutable GitHub
-Release. See [docs/RELEASES.md](docs/RELEASES.md) for the complete process and
-verification model.
+branch or upload release assets manually. After merged changes pass the
+development integration gate on `dev`, a maintainer prepares one explicit
+version commit with:
+
+```sh
+npm run release:prepare -- 0.3.0
+```
+
+The command creates `agent/release-<version>` from exact `origin/dev`; commit
+only the root version fields in the two version files there and open its PR to
+`dev`. After that PR merges and the development integration gate passes, open
+the single release PR from `dev` to `main`. Only after it merges may a
+maintainer create the annotated
+`v*` tag on the exact `main` commit. The release workflow builds the
+multi-platform image once, emits Sigstore-signed provenance, SBOM and asset
+attestations, and publishes an immutable GitHub Release. See
+[docs/RELEASES.md](docs/RELEASES.md) for the complete process and verification
+model.
 
 ## What makes a good change
 
@@ -68,3 +90,8 @@ A pull request should include:
 5. migration, rollback, and operational-risk notes when relevant.
 
 By contributing, you confirm that you created the code or may contribute it under terms compatible with the project license. Contributions are published under [GNU AGPL-3.0-only](LICENSE).
+
+The PR policy fails closed when a contribution targets the wrong base, uses an
+unsupported branch name, changes the release version outside the focused
+same-repository `agent/release-<version>` version-only PR, or when a `main` PR is anything
+other than same-repository `dev` with a higher SemVer.
