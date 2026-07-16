@@ -29,6 +29,8 @@
 
 ## Checklist
 
+- [ ] This targets `dev` from `agent/<feature>` or `fix/<name>`, or is the single release PR from `dev` to `main`.
+- [ ] A normal contribution leaves the root version unchanged; `agent/release-<version>` changes only the three root version fields.
 - [ ] The change is focused and does not include unrelated refactors.
 - [ ] New logic is tested, or missing coverage is explained.
 - [ ] Documentation and example configuration are current.

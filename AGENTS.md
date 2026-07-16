@@ -20,12 +20,22 @@ Shelter is a self-hosted deployment control plane for a single VPS. Changes shou
 
 ## Working method
 
-1. Read the affected files, nearby tests, and relevant documentation before changing behavior.
-2. Keep the patch focused on the requested behavior. Do not mix in unrelated refactors.
-3. Preserve existing APIs, data, volumes, and configuration. Breaking changes require a documented migration.
-4. Add a regression test for a bug fix and suitable positive and negative tests for new logic.
-5. Run focused tests first and, whenever possible, `npm run check` before finishing.
-6. Update the README, example environment files, security model, or UI copy when user-facing or operational behavior changes.
+1. Synchronize `dev`, then create `agent/<feature>` for planned work or
+   `fix/<name>` for a defect. Never develop directly on `dev` or `main`.
+2. Read the affected files, nearby tests, and relevant documentation before changing behavior.
+3. Keep the patch focused on the requested behavior. Do not mix in unrelated refactors.
+4. Preserve existing APIs, data, volumes, and configuration. Breaking changes require a documented migration.
+5. Add a regression test for a bug fix and suitable positive and negative tests for new logic.
+6. Run focused tests first and, whenever possible, `npm run check` before finishing.
+7. Update the README, example environment files, security model, or UI copy when user-facing or operational behavior changes.
+8. Open the contribution PR against `dev`. A normal feature/fix PR must not
+   alter the root release version. Wait for required checks and review before
+   merging, then verify the development integration gate on the resulting
+   `dev` revision.
+
+Do not push, merge, prepare a release, or create a tag unless the task grants
+that exact authority. A request to implement code does not implicitly authorize
+publishing it.
 
 ## Security boundaries
 
@@ -77,6 +87,32 @@ npm run test -w @shelter/web -- <test-file>
 - Preserve a rollback path, back up persistent data, and document new variables in the example files.
 - A release is not ready until API health, worker status, login, at least one deployment, and routing have been verified at the appropriate level.
 - Never claim a successful live test when only mocks or local tests ran. State the actual verification depth clearly.
+
+## Promotion and release flow
+
+- A release contains the reviewed state of `dev`; do not cherry-pick feature
+  branches directly to `main`.
+- Once `dev` is green, a maintainer runs
+  `npm run release:prepare -- <version>`. The script requires a clean,
+  synchronized `dev`, verifies that `main` contains no tree changes missing
+  from `dev`, creates
+  `agent/release-<version>`, writes the one explicit SemVer bump, and restores
+  the version files if the complete check fails.
+- Commit only the root version fields in `package.json` and `package-lock.json`
+  on that release branch and open its PR to `dev`. This is the only PR type
+  allowed to change the root version before promotion; never push the bump
+  directly to `dev`.
+- After the release-preparation PR merges and the development integration gate
+  passes, open the only permitted `main` PR: same-repository `dev` to `main`.
+  The PR policy requires a higher, consistent version in `package.json` and
+  `package-lock.json`.
+- After that PR is reviewed, green, and merged, synchronize local `main` and
+  create an annotated `v<version>` tag on the exact merge commit. The release
+  workflow validates tag, commit, branch, and version identity, then reuses the
+  immutable pipeline with Sigstore-signed provenance, SBOM and release-asset
+  attestations documented in [docs/RELEASES.md](docs/RELEASES.md).
+- A failed publication is never repaired by moving or reusing a tag. Fix the
+  issue on a new feature/fix branch and prepare a new version.
 
 ## Definition of done
 
