@@ -185,10 +185,14 @@ export class ProjectObservabilityCollector {
   }
 
   private async collectWithinDeadline(sampledAt: number, signal: AbortSignal): Promise<void> {
+    this.maintainRetention(sampledAt);
     const targets = this.targets();
     if (targets.length === 0) {
       this.previousNetwork.clear();
       return;
+    }
+    for (const target of targets) {
+      this.database.pruneRuntimeLogsForProject(target.projectId, MAX_LOG_LINES_PER_PROJECT);
     }
 
     const discovered = await this.discoverActiveContainers(targets, signal);
@@ -238,7 +242,6 @@ export class ProjectObservabilityCollector {
 
     for (const key of this.previousNetwork.keys()) if (!activeKeys.has(key)) this.previousNetwork.delete(key);
     await this.collectRuntimeLogs(targets, discovered, signal);
-    this.prune(sampledAt);
   }
 
   private targets(): RuntimeTarget[] {
@@ -418,7 +421,11 @@ export class ProjectObservabilityCollector {
           });
         }
       }
-      this.database.insertRuntimeLogs(rows);
+      rows.sort((left, right) => (
+        left.source_timestamp.localeCompare(right.source_timestamp)
+        || left.stream.localeCompare(right.stream)
+      ));
+      this.database.insertRuntimeLogs(rows.slice(-LOG_TAIL_LINES), MAX_LOG_LINES_PER_PROJECT);
     });
 
     for (let index = 0; index < jobs.length; index += 3) {
@@ -426,11 +433,12 @@ export class ProjectObservabilityCollector {
     }
   }
 
-  private prune(sampledAt: number): void {
-    if (sampledAt - this.lastPruneAt < PRUNE_INTERVAL_MS) return;
+  private maintainRetention(sampledAt: number): void {
     const retentionMs = this.config.METRICS_RETENTION_HOURS * 60 * 60_000;
+    this.database.pruneProjectObservabilityByAge(sampledAt - retentionMs);
+    if (sampledAt - this.lastPruneAt < PRUNE_INTERVAL_MS) return;
     const metricLimit = Math.ceil(retentionMs / (this.config.METRICS_INTERVAL_SECONDS * 1_000)) + 100;
-    this.database.pruneProjectObservability(sampledAt - retentionMs, metricLimit, MAX_LOG_LINES_PER_PROJECT);
+    this.database.pruneProjectObservabilityHardLimits(metricLimit, MAX_LOG_LINES_PER_PROJECT);
     this.lastPruneAt = sampledAt;
   }
 }

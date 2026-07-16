@@ -220,6 +220,80 @@ describe("ProjectObservabilityCollector", () => {
       database.close();
     }
   });
+
+  it("caps a mixed stdout/stderr collection batch at 500 total records", async () => {
+    const { config, database } = testContext();
+    try {
+      activeProject(database);
+      const now = Date.now();
+      const line = (index: number, stream: string) => (
+        `${new Date(now - 1_000 + index).toISOString()} ${stream}-${index}`
+      );
+      const command = async (_command: string, args: string[]): Promise<CommandResult> => {
+        if (args[0] === "ps") return {
+          stdout: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd|shelter-run-observed-app-dep-observe|prj_observe|dep_observe",
+          stderr: "",
+          exitCode: 0
+        };
+        if (args[0] === "inspect") return {
+          stdout: `${JSON.stringify("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd")}|${JSON.stringify("/shelter-run-observed-app-dep-observe")}|${JSON.stringify("running")}|${JSON.stringify(new Date(now - 60_000).toISOString())}|false|0|${JSON.stringify("healthy")}`,
+          stderr: "",
+          exitCode: 0
+        };
+        if (args[0] === "stats") return {
+          stdout: "shelter-run-observed-app-dep-observe|1%|10MiB / 1GiB|0B / 0B|0B / 0B",
+          stderr: "",
+          exitCode: 0
+        };
+        if (args[0] === "logs") return {
+          stdout: Array.from({ length: 400 }, (_, index) => line(index, "stdout")).join("\n"),
+          stderr: Array.from({ length: 400 }, (_, index) => line(index + 400, "stderr")).join("\n"),
+          exitCode: 0
+        };
+        throw new Error(`Unexpected command: ${args.join(" ")}`);
+      };
+      await new ProjectObservabilityCollector(config, database, command).collect(now);
+
+      const count = database.sqlite.prepare("SELECT COUNT(*) AS count FROM runtime_logs").get() as { count: number };
+      const streams = database.sqlite.prepare("SELECT DISTINCT stream FROM runtime_logs ORDER BY stream").all() as Array<{ stream: string }>;
+      expect(count.count).toBe(500);
+      expect(streams.map(({ stream }) => stream)).toEqual(["stderr", "stdout"]);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("prunes expired observability records even when no project has an active runtime", async () => {
+    const { config, database } = testContext();
+    try {
+      const { project, deployment } = activeProject(database);
+      const now = Date.now();
+      const old = now - 49 * 60 * 60_000;
+      database.insertProjectMetricSample(sample(project.id, deployment.id, old));
+      database.insertRuntimeLogs([{
+        project_id: project.id,
+        deployment_id: deployment.id,
+        stream: "stdout",
+        message: "expired output",
+        source_timestamp: new Date(old).toISOString(),
+        collected_at: new Date(old).toISOString()
+      }]);
+      database.updateProject(project.id, { active_deployment_id: null });
+      let commandCalled = false;
+      await new ProjectObservabilityCollector(config, database, async () => {
+        commandCalled = true;
+        throw new Error("Docker must not be called without an active runtime");
+      }).collect(now);
+
+      const metrics = database.sqlite.prepare("SELECT COUNT(*) AS count FROM project_metric_samples").get() as { count: number };
+      const logs = database.sqlite.prepare("SELECT COUNT(*) AS count FROM runtime_logs").get() as { count: number };
+      expect(commandCalled).toBe(false);
+      expect(metrics.count).toBe(0);
+      expect(logs.count).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
 });
 
 describe("project observability persistence and API", () => {
@@ -246,6 +320,33 @@ describe("project observability persistence and API", () => {
       const logCount = database.sqlite.prepare("SELECT COUNT(*) AS count FROM runtime_logs").get() as { count: number };
       expect(metricCount.count).toBe(20);
       expect(logCount.count).toBe(100);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("enforces the 5,000-line project cap inside every runtime-log insertion transaction", () => {
+    const { database } = testContext();
+    try {
+      const { project, deployment } = activeProject(database);
+      const start = Date.now() - 10_000;
+      for (let batch = 0; batch < 11; batch += 1) {
+        database.insertRuntimeLogs(Array.from({ length: 500 }, (_, index) => {
+          const sequence = batch * 500 + index;
+          return {
+            project_id: project.id,
+            deployment_id: deployment.id,
+            stream: "stdout" as const,
+            message: `bounded-line-${sequence}`,
+            source_timestamp: new Date(start + sequence).toISOString(),
+            collected_at: new Date(start + sequence).toISOString()
+          };
+        }));
+      }
+      const count = database.sqlite.prepare("SELECT COUNT(*) AS count FROM runtime_logs").get() as { count: number };
+      const oldest = database.sqlite.prepare("SELECT message FROM runtime_logs ORDER BY id ASC LIMIT 1").get() as { message: string };
+      expect(count.count).toBe(5_000);
+      expect(oldest.message).toBe("bounded-line-500");
     } finally {
       database.close();
     }

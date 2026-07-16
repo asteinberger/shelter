@@ -187,6 +187,8 @@ CREATE TABLE IF NOT EXISTS project_metric_samples (
 );
 CREATE INDEX IF NOT EXISTS project_metric_samples_history_idx
   ON project_metric_samples(project_id, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS project_metric_samples_retention_idx
+  ON project_metric_samples(sampled_at);
 
 CREATE TABLE IF NOT EXISTS runtime_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,6 +202,7 @@ CREATE TABLE IF NOT EXISTS runtime_logs (
 );
 CREATE INDEX IF NOT EXISTS runtime_logs_project_cursor_idx ON runtime_logs(project_id, id);
 CREATE INDEX IF NOT EXISTS runtime_logs_project_time_idx ON runtime_logs(project_id, source_timestamp DESC);
+CREATE INDEX IF NOT EXISTS runtime_logs_retention_idx ON runtime_logs(source_timestamp);
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
@@ -2603,8 +2606,10 @@ export class Database {
     }) as ProjectMetricHistoryRow[];
   }
 
-  insertRuntimeLogs(rows: Array<Omit<RuntimeLogRow, "id">>): number {
+  insertRuntimeLogs(rows: Array<Omit<RuntimeLogRow, "id">>, maxLinesPerProject = 5_000): number {
     if (rows.length === 0) return 0;
+    const boundedRows = rows.slice(0, 500);
+    const boundedLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLinesPerProject)));
     const insert = this.sqlite.prepare(`
       INSERT OR IGNORE INTO runtime_logs (
         project_id, deployment_id, stream, message, source_timestamp, collected_at
@@ -2612,12 +2617,43 @@ export class Database {
         @project_id, @deployment_id, @stream, @message, @source_timestamp, @collected_at
       )
     `);
+    const enforceLimit = this.sqlite.prepare(`
+      DELETE FROM runtime_logs
+      WHERE project_id = @project_id
+        AND id < COALESCE((
+          SELECT id FROM runtime_logs
+          WHERE project_id = @project_id
+          ORDER BY id DESC
+          LIMIT 1 OFFSET @last_retained_offset
+        ), -1)
+    `);
     const persist = this.sqlite.transaction((entries: Array<Omit<RuntimeLogRow, "id">>) => {
       let inserted = 0;
-      for (const row of entries.slice(0, 1_000)) inserted += insert.run(row).changes;
+      const projectIds = new Set<string>();
+      for (const row of entries) {
+        inserted += insert.run(row).changes;
+        projectIds.add(row.project_id);
+      }
+      for (const projectId of projectIds) {
+        enforceLimit.run({ project_id: projectId, last_retained_offset: boundedLimit - 1 });
+      }
       return inserted;
     });
-    return persist.immediate(rows);
+    return persist.immediate(boundedRows);
+  }
+
+  pruneRuntimeLogsForProject(projectId: string, maxLines = 5_000): void {
+    const boundedLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLines)));
+    this.sqlite.prepare(`
+      DELETE FROM runtime_logs
+      WHERE project_id = @project_id
+        AND id < COALESCE((
+          SELECT id FROM runtime_logs
+          WHERE project_id = @project_id
+          ORDER BY id DESC
+          LIMIT 1 OFFSET @last_retained_offset
+        ), -1)
+    `).run({ project_id: projectId, last_retained_offset: boundedLimit - 1 });
   }
 
   latestRuntimeLogTimestamp(deploymentId: string): string | undefined {
@@ -2650,11 +2686,18 @@ export class Database {
     `).all(projectId, deploymentId, boundedLimit) as RuntimeLogRow[];
   }
 
-  pruneProjectObservability(cutoff: number, maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
+  pruneProjectObservabilityByAge(cutoff: number): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare("DELETE FROM project_metric_samples WHERE sampled_at < ?").run(Math.trunc(cutoff));
+      this.sqlite.prepare("DELETE FROM runtime_logs WHERE source_timestamp < ?")
+        .run(new Date(Math.trunc(cutoff)).toISOString());
+    })();
+  }
+
+  pruneProjectObservabilityHardLimits(maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
     const metricLimit = Math.max(1, Math.min(500_000, Math.trunc(maxMetricSamplesPerProject)));
     const logLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLogLinesPerProject)));
     this.sqlite.transaction(() => {
-      this.sqlite.prepare("DELETE FROM project_metric_samples WHERE sampled_at < ?").run(Math.trunc(cutoff));
       this.sqlite.prepare(`
         DELETE FROM project_metric_samples
         WHERE rowid IN (
@@ -2666,10 +2709,6 @@ export class Database {
       `).run(metricLimit);
       this.sqlite.prepare(`
         DELETE FROM runtime_logs
-        WHERE source_timestamp < ?
-      `).run(new Date(Math.trunc(cutoff)).toISOString());
-      this.sqlite.prepare(`
-        DELETE FROM runtime_logs
         WHERE id IN (
           SELECT id FROM (
             SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY id DESC) AS position
@@ -2678,6 +2717,11 @@ export class Database {
         )
       `).run(logLimit);
     })();
+  }
+
+  pruneProjectObservability(cutoff: number, maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
+    this.pruneProjectObservabilityByAge(cutoff);
+    this.pruneProjectObservabilityHardLimits(maxMetricSamplesPerProject, maxLogLinesPerProject);
   }
 
   serverActivityCounts(now = Date.now()): ServerActivityCounts {
