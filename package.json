@@ -12,9 +12,11 @@
     "dev": "concurrently -n api,web -c blue,green \"npm run dev -w @shelter/server\" \"npm run dev -w @shelter/web\"",
     "start": "npm run start -w @shelter/server",
     "test": "npm run test:install && npm run test -w @shelter/server && npm run test -w @shelter/web",
-    "test:install": "bash test/install.test.sh && bash test/release-bundle.test.sh",
+    "test:install": "bash test/install.test.sh && bash test/release-bundle.test.sh && npm run test:policy",
+    "test:policy": "node --test test/development-policy.test.mjs test/pr-policy-workflow.test.mjs && bash test/development-workflow.test.sh",
     "typecheck": "npm run typecheck -w @shelter/server && npm run typecheck -w @shelter/web",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "release:prepare": "node ops/prepare-release.mjs"
   },
   "engines": {
     "node": ">=24.0.0",
