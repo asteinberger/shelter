@@ -101,6 +101,12 @@ function parseRuntimeHealth(value: string): ProjectRuntimeHealth {
     : "unknown";
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
 export function parseRuntimeLogLine(line: string): { sourceTimestamp: string; message: string } | null {
   const separator = line.indexOf(" ");
   if (separator <= 0) return null;
@@ -286,7 +292,11 @@ export class ProjectObservabilityCollector {
   private async inspectContainers(containers: DiscoveredContainer[], signal: AbortSignal): Promise<Map<string, InspectedContainer>> {
     const inspected = new Map<string, InspectedContainer>();
     if (containers.length === 0) return inspected;
-    const format = '{{json .Id}}|{{json .Name}}|{{json .State.Status}}|{{json .State.StartedAt}}|{{json .State.OOMKilled}}|{{json .RestartCount}}|{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}';
+    // Docker omits State.Health entirely for containers without a HEALTHCHECK.
+    // Accessing that missing map key directly in a Go template makes the whole
+    // multi-container inspect command fail. Serialize State as JSON instead and
+    // treat an absent Health object as the valid Docker health value "none".
+    const format = '{{json .Id}}\t{{json .Name}}\t{{json .State}}\t{{json .RestartCount}}';
     try {
       const result = await this.command("docker", ["inspect", "--format", format, ...containers.map(({ id }) => id)], {
         allowFailure: true,
@@ -295,22 +305,23 @@ export class ProjectObservabilityCollector {
       });
       if (result.exitCode !== 0) return inspected;
       for (const line of result.stdout.split("\n").filter(Boolean)) {
-        const values = line.split("|");
-        if (values.length !== 7) continue;
+        const values = line.split("\t");
+        if (values.length !== 4) continue;
         try {
           const id = JSON.parse(values[0] ?? "null") as unknown;
           const rawName = JSON.parse(values[1] ?? "null") as unknown;
-          const status = JSON.parse(values[2] ?? "null") as unknown;
-          const startedAt = JSON.parse(values[3] ?? "null") as unknown;
-          const oomKilled = JSON.parse(values[4] ?? "false") as unknown;
-          const restartCount = JSON.parse(values[5] ?? "0") as unknown;
-          const health = JSON.parse(values[6] ?? '"unknown"') as unknown;
+          const state = recordValue(JSON.parse(values[2] ?? "null") as unknown);
+          const restartCount = JSON.parse(values[3] ?? "0") as unknown;
           if (typeof id !== "string" || !containerIdPattern.test(id)) continue;
+          const health = recordValue(state?.Health)?.Status;
+          const status = state?.Status;
+          const startedAt = state?.StartedAt;
+          const oomKilled = state?.OOMKilled;
           inspected.set(id, {
             id,
             name: typeof rawName === "string" ? rawName.replace(/^\//, "") : "",
             status: parseRuntimeStatus(typeof status === "string" ? status : "unknown"),
-            health: parseRuntimeHealth(typeof health === "string" ? health : "unknown"),
+            health: parseRuntimeHealth(typeof health === "string" ? health : "none"),
             startedAt: typeof startedAt === "string" && Number.isFinite(Date.parse(startedAt)) ? startedAt : null,
             restartCount: typeof restartCount === "number" && restartCount >= 0 ? Math.trunc(restartCount) : 0,
             oomKilled: oomKilled === true

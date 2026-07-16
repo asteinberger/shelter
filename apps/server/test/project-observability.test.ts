@@ -177,7 +177,17 @@ describe("ProjectObservabilityCollector", () => {
           exitCode: 0
         };
         if (args[0] === "inspect") return {
-          stdout: `${JSON.stringify("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd")}|${JSON.stringify("/shelter-run-observed-app-dep-observe")}|${JSON.stringify("running")}|${JSON.stringify(new Date(now - 60_000).toISOString())}|false|2|${JSON.stringify("healthy")}`,
+          stdout: [
+            JSON.stringify("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            JSON.stringify("/shelter-run-observed-app-dep-observe"),
+            JSON.stringify({
+              Status: "running",
+              StartedAt: new Date(now - 60_000).toISOString(),
+              OOMKilled: false,
+              Health: { Status: "healthy" }
+            }),
+            JSON.stringify(2)
+          ].join("\t"),
           stderr: "",
           exitCode: 0
         };
@@ -224,7 +234,7 @@ describe("ProjectObservabilityCollector", () => {
   it("caps a mixed stdout/stderr collection batch at 500 total records", async () => {
     const { config, database } = testContext();
     try {
-      activeProject(database);
+      const { project } = activeProject(database);
       const now = Date.now();
       const line = (index: number, stream: string) => (
         `${new Date(now - 1_000 + index).toISOString()} ${stream}-${index}`
@@ -236,7 +246,16 @@ describe("ProjectObservabilityCollector", () => {
           exitCode: 0
         };
         if (args[0] === "inspect") return {
-          stdout: `${JSON.stringify("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd")}|${JSON.stringify("/shelter-run-observed-app-dep-observe")}|${JSON.stringify("running")}|${JSON.stringify(new Date(now - 60_000).toISOString())}|false|0|${JSON.stringify("healthy")}`,
+          stdout: [
+            JSON.stringify("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            JSON.stringify("/shelter-run-observed-app-dep-observe"),
+            JSON.stringify({
+              Status: "running",
+              StartedAt: new Date(now - 60_000).toISOString(),
+              OOMKilled: false
+            }),
+            JSON.stringify(0)
+          ].join("\t"),
           stderr: "",
           exitCode: 0
         };
@@ -254,6 +273,12 @@ describe("ProjectObservabilityCollector", () => {
       };
       await new ProjectObservabilityCollector(config, database, command).collect(now);
 
+      expect(database.latestProjectMetricSample(project.id)).toMatchObject({
+        runtime_status: "running",
+        health_status: "none",
+        cpu_usage_percent: 1,
+        memory_used_bytes: 10 * 1_048_576
+      });
       const count = database.sqlite.prepare("SELECT COUNT(*) AS count FROM runtime_logs").get() as { count: number };
       const streams = database.sqlite.prepare("SELECT DISTINCT stream FROM runtime_logs ORDER BY stream").all() as Array<{ stream: string }>;
       expect(count.count).toBe(500);
