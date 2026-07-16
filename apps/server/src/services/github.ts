@@ -19,6 +19,7 @@ import {
   type ProjectFileFact
 } from "./project-analysis.js";
 import { pullRequestPreviewHostname } from "./pull-request-previews.js";
+import { reconcileRouting } from "./routing.js";
 
 export const GITHUB_MANIFEST_CALLBACK_PATH = "/api/settings/github/manifest/callback";
 export const GITHUB_SETUP_CALLBACK_PATH = "/api/settings/github/setup/callback";
@@ -70,7 +71,9 @@ const InstallationSchema = z.object({
     avatar_url: z.url().nullable().optional()
   }),
   repository_selection: z.enum(["all", "selected"]).optional().default("selected"),
-  suspended_at: z.string().nullable().optional()
+  suspended_at: z.string().nullable().optional(),
+  permissions: z.record(z.string(), z.string()).optional().default({}),
+  events: z.array(z.string()).optional().default([])
 }).passthrough();
 
 const RepositorySchema = z.object({
@@ -240,7 +243,11 @@ export interface GitHubPreviewCapability {
   configured: boolean;
   pullRequestsPermission: boolean;
   pullRequestEvent: boolean;
-  remediation: "none" | "configure_app" | "update_existing_app";
+  installationChecked: boolean;
+  installationPullRequestsPermission: boolean | null;
+  installationPullRequestEvent: boolean | null;
+  installationSuspended: boolean | null;
+  remediation: "none" | "configure_app" | "update_existing_app" | "approve_installation_update";
 }
 
 interface GithubFetchOptions {
@@ -291,13 +298,17 @@ export class GitHubService {
     };
   }
 
-  async previewCapability(): Promise<GitHubPreviewCapability> {
+  async previewCapability(installationId?: string): Promise<GitHubPreviewCapability> {
     if (!this.state().configured) {
       return {
         ready: false,
         configured: false,
         pullRequestsPermission: false,
         pullRequestEvent: false,
+        installationChecked: Boolean(installationId),
+        installationPullRequestsPermission: installationId ? false : null,
+        installationPullRequestEvent: installationId ? false : null,
+        installationSuspended: null,
         remediation: "configure_app"
       };
     }
@@ -307,11 +318,40 @@ export class GitHubService {
     );
     const pullRequestsPermission = app.permissions.pull_requests === "read" || app.permissions.pull_requests === "write";
     const pullRequestEvent = app.events.includes("pull_request");
+    if (installationId) {
+      const installation = this.parseUpstream(InstallationSchema, await this.githubRequest<unknown>(
+        `/app/installations/${this.installationId(installationId)}`,
+        { appAuthentication: true }
+      ));
+      const installationPullRequestsPermission = installation.permissions.pull_requests === "read"
+        || installation.permissions.pull_requests === "write";
+      const installationPullRequestEvent = installation.events.includes("pull_request");
+      const installationSuspended = Boolean(installation.suspended_at);
+      const appReady = pullRequestsPermission && pullRequestEvent;
+      const installationReady = installationPullRequestsPermission
+        && installationPullRequestEvent
+        && !installationSuspended;
+      return {
+        ready: appReady && installationReady,
+        configured: true,
+        pullRequestsPermission,
+        pullRequestEvent,
+        installationChecked: true,
+        installationPullRequestsPermission,
+        installationPullRequestEvent,
+        installationSuspended,
+        remediation: !appReady ? "update_existing_app" : installationReady ? "none" : "approve_installation_update"
+      };
+    }
     return {
       ready: pullRequestsPermission && pullRequestEvent,
       configured: true,
       pullRequestsPermission,
       pullRequestEvent,
+      installationChecked: false,
+      installationPullRequestsPermission: null,
+      installationPullRequestEvent: null,
+      installationSuspended: null,
       remediation: pullRequestsPermission && pullRequestEvent ? "none" : "update_existing_app"
     };
   }
@@ -393,6 +433,7 @@ export class GitHubService {
       this.database.setSetting(SETUP_STATE_HASH_KEY, hashToken(setupState));
       this.database.deleteGithubManifestFlows();
     })();
+    reconcileRouting(this.config, this.database);
     this.invalidateAllInstallationTokens();
     return { installUrl: `${appUrl}/installations/new` };
   }
@@ -420,6 +461,7 @@ export class GitHubService {
       this.database.deleteGithubManifestFlows();
       this.database.disconnectGithubProjects();
     })();
+    reconcileRouting(this.config, this.database);
     this.invalidateAllInstallationTokens();
     return this.state();
   }
@@ -659,7 +701,14 @@ export class GitHubService {
       this.database.finishGithubWebhookDelivery(deliveryId, status);
       return { duplicate: false, ...result };
     });
-    return accept.immediate();
+    const result = accept.immediate();
+    // A close or GitHub-App/repository revocation must unpublish the route even
+    // when the worker is offline. Reconcile duplicates as well: if the atomic
+    // file replacement failed, GitHub's retry gets another safe attempt.
+    if (["pull_request", "installation", "installation_repositories"].includes(eventName)) {
+      reconcileRouting(this.config, this.database);
+    }
+    return result;
   }
 
   async processNextWebhookJob(): Promise<boolean> {

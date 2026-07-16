@@ -52,8 +52,8 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
   }
 
   for (const preview of previews) {
-    if (!preview.deployment_id) continue;
-    const deployment = database.getDeployment(preview.deployment_id);
+    if (!preview.active_deployment_id) continue;
+    const deployment = database.getDeployment(preview.active_deployment_id);
     if (!deployment?.runtime_container || !deployment.internal_port) continue;
     const name = routeName(preview.id);
     lines.push(
@@ -103,8 +103,8 @@ export function reconcileRouting(config: AppConfig, database: Database): void {
   }
 
   for (const preview of previews) {
-    if (!preview.deployment_id) continue;
-    const deployment = database.getDeployment(preview.deployment_id);
+    if (!preview.active_deployment_id) continue;
+    const deployment = database.getDeployment(preview.active_deployment_id);
     if (!deployment?.runtime_container || !deployment.internal_port) continue;
     hasAppService = true;
     const name = routeName(preview.id);

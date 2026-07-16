@@ -435,6 +435,87 @@ export interface ServerMetricsResponse {
   history: ServerMetricsHistoryPoint[];
 }
 
+export type ProjectObservabilityRange = '15m' | '1h' | '6h' | '24h' | '48h';
+export type ProjectObservabilityStatus = 'collecting' | 'healthy' | 'warning' | 'critical' | 'stale';
+export type ProjectRuntimeStatus = 'created' | 'running' | 'paused' | 'restarting' | 'removing' | 'exited' | 'dead' | 'missing' | 'unknown';
+export type ProjectRuntimeHealth = 'healthy' | 'unhealthy' | 'starting' | 'none' | 'unknown';
+
+export interface ProjectObservabilityCurrent {
+  deploymentId: string;
+  runtime: {
+    status: ProjectRuntimeStatus;
+    health: ProjectRuntimeHealth;
+    startedAt: string | null;
+    uptimeSeconds: number;
+    restartCount: number;
+    oomKilled: boolean;
+  };
+  cpu: {
+    usagePercent: number;
+    limitCores: number;
+    limitUsagePercent: number;
+  };
+  memory: {
+    usedBytes: number;
+    limitBytes: number;
+    usagePercent: number;
+  };
+  network: {
+    receivedBytes: number;
+    transmittedBytes: number;
+    receiveBytesPerSecond: number;
+    transmitBytesPerSecond: number;
+  };
+  blockIo: {
+    readBytes: number;
+    writeBytes: number;
+  };
+}
+
+export interface ProjectObservabilityHistoryPoint {
+  sampledAt: string;
+  cpuUsagePercent: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryUsagePercent: number;
+  networkReceiveBytesPerSecond: number;
+  networkTransmitBytesPerSecond: number;
+  blockReadBytes: number;
+  blockWriteBytes: number;
+}
+
+export interface ProjectObservabilityWarning {
+  id: 'runtime' | 'health' | 'oom' | 'restarts' | 'cpu' | 'memory';
+  severity: 'warning' | 'critical';
+  value?: number;
+}
+
+export interface ProjectObservabilityResponse {
+  status: ProjectObservabilityStatus;
+  sampledAt: string | null;
+  intervalSeconds: number;
+  retentionHours: number;
+  range: ProjectObservabilityRange;
+  activeDeploymentId: string | null;
+  current: ProjectObservabilityCurrent | null;
+  warnings: ProjectObservabilityWarning[];
+  history: ProjectObservabilityHistoryPoint[];
+}
+
+export interface RuntimeLog {
+  id: number;
+  deploymentId: string;
+  stream: 'stdout' | 'stderr';
+  message: string;
+  timestamp: string;
+  collectedAt: string;
+}
+
+export interface RuntimeLogsResponse {
+  activeDeploymentId: string | null;
+  logs: RuntimeLog[];
+}
+
 export interface CloudflareAccount {
   id: string;
   name: string;

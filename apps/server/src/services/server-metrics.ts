@@ -5,6 +5,7 @@ import { runCommand } from "../lib/command.js";
 import type { Database } from "../lib/database.js";
 import type { ServerMetricSampleRow, ServerServiceStatus } from "../types/models.js";
 import { COMPOSE_PROJECT_NAMES } from "./runtime-identity.js";
+import { ProjectObservabilityCollector } from "./project-observability.js";
 
 const DOCKER_TIMEOUT_MS = 5_000;
 const DOCKER_INFO_CACHE_MS = 5 * 60_000;
@@ -171,11 +172,14 @@ export class ServerMetricsCollector {
     transmitted: number;
   } | null = null;
   private lastPruneAt = 0;
+  private readonly projects: ProjectObservabilityCollector;
 
   constructor(
     private readonly config: AppConfig,
     private readonly database: Database
-  ) {}
+  ) {
+    this.projects = new ProjectObservabilityCollector(config, database);
+  }
 
   start(): void {
     if (!this.stopped) return;
@@ -185,6 +189,7 @@ export class ServerMetricsCollector {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.projects.stop();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.inFlight) await this.inFlight;
@@ -287,6 +292,11 @@ export class ServerMetricsCollector {
     };
     if (this.stopped) return;
     this.database.insertServerMetricSample(sample);
+    try {
+      await this.projects.collect(sampledAt);
+    } catch {
+      // Project diagnostics are independent from host metrics and deployments.
+    }
 
     if (sampledAt - this.lastPruneAt >= PRUNE_INTERVAL_MS) {
       const retentionMs = this.config.METRICS_RETENTION_HOURS * 60 * 60_000;

@@ -172,7 +172,10 @@ describe("project deletion API", () => {
     const row = project("prj_running", "Running App");
     database.createProject(row);
     database.createDeployment(deployment("dep_running", row.id, "building"));
-    const cloudflare = { deleteDnsRecord: vi.fn(async () => undefined) };
+    const cloudflare = {
+      deleteDnsRecord: vi.fn(async () => undefined),
+      deletePreviewDnsRecord: vi.fn(async () => undefined)
+    };
     const service = new ProjectDeletionService(config, database, cloudflare);
 
     await expect(service.request(row.id, row.name)).rejects.toMatchObject({
@@ -182,6 +185,60 @@ describe("project deletion API", () => {
     expect(database.getProjectDeletion(row.id)).toBeUndefined();
     expect(database.getProject(row.id)).toMatchObject(row);
     expect(cloudflare.deleteDnsRecord).not.toHaveBeenCalled();
+  });
+
+  it("uses strict preview-record ownership checks during whole-project deletion", async () => {
+    const { config, database } = context();
+    const row = project("prj_preview_delete", "Preview Delete", {
+      github_installation_id: "123",
+      github_repository_id: "99",
+      github_repository_full_name: "example/example",
+      preview_deployments_enabled: 1,
+      preview_domain_id: "dom_source",
+      preview_domain_suffix: "example.com",
+      preview_ttl_hours: 24
+    });
+    database.createProject(row);
+    const queued = database.queuePullRequestPreview({
+      projectId: row.id,
+      pullRequestNumber: 42,
+      headSha: "a".repeat(40),
+      headRef: "feature/preview",
+      baseRef: "main",
+      repositoryId: "99",
+      repositoryFullName: "example/example",
+      deliveryId: "preview-delete",
+      hostname: "pr-42--preview-delete.example.com",
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      commitMessage: "Preview delete",
+      commitAuthor: "Ada",
+      commitUrl: null
+    });
+    database.updatePullRequestPreviewDns(
+      queued.preview.id,
+      queued.preview.deployment_id!,
+      "zone-preview",
+      "record-preview"
+    );
+    database.updateDeployment(queued.preview.deployment_id!, {
+      status: "failed",
+      failure_kind: "build",
+      finished_at: new Date().toISOString()
+    });
+    const deleteDnsRecord = vi.fn(async () => undefined);
+    const deletePreviewDnsRecord = vi.fn(async () => undefined);
+    const service = new ProjectDeletionService(config, database, {
+      deleteDnsRecord,
+      deletePreviewDnsRecord
+    });
+
+    await expect(service.request(row.id, row.name)).resolves.toEqual({ status: "queued" });
+    expect(deletePreviewDnsRecord).toHaveBeenCalledWith(
+      "zone-preview",
+      "record-preview",
+      queued.preview.hostname
+    );
+    expect(deleteDnsRecord).not.toHaveBeenCalled();
   });
 
   it("keeps a failed DNS cleanup visible and retries it safely", async () => {
@@ -207,7 +264,10 @@ describe("project deletion API", () => {
     const deleteDnsRecord = vi.fn()
       .mockRejectedValueOnce(conflict("DNS record drifted", "DNS_RECORD_DRIFT"))
       .mockResolvedValueOnce(undefined);
-    const service = new ProjectDeletionService(config, database, { deleteDnsRecord });
+    const service = new ProjectDeletionService(config, database, {
+      deleteDnsRecord,
+      deletePreviewDnsRecord: deleteDnsRecord
+    });
 
     await expect(service.request(row.id, row.name)).rejects.toMatchObject({ code: "DNS_RECORD_DRIFT" });
     expect(database.getProjectDeletion(row.id)).toMatchObject({ status: "failed" });

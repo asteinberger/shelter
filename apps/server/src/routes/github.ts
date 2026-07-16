@@ -58,6 +58,10 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
           configured: false,
           pullRequestsPermission: false,
           pullRequestEvent: false,
+          installationChecked: false,
+          installationPullRequestsPermission: null,
+          installationPullRequestEvent: null,
+          installationSuspended: null,
           remediation: "configure_app"
         },
         error: null
@@ -90,12 +94,13 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
     }
   });
 
-  app.get("/api/settings/github/preview-capability", {
+  app.get<{ Querystring: { installationId?: string } }>("/api/settings/github/preview-capability", {
     preHandler: requireSessionAuth,
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } }
-  }, async (_request, reply) => {
+  }, async (request, reply) => {
     reply.header("cache-control", "no-store");
-    return { previewCapability: await github.previewCapability() };
+    const query = z.object({ installationId: NumericId.optional() }).strict().parse(request.query);
+    return { previewCapability: await github.previewCapability(query.installationId) };
   });
 
   app.post("/api/settings/github/manifest/start", {

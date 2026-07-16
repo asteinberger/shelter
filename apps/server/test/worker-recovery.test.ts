@@ -230,4 +230,101 @@ describe("deployment recovery", () => {
     expect(docker.removed).toContain(docker.candidateName);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("restores the last-good preview when the routing file cannot be switched", async () => {
+    const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "shelter-preview-routing-rollback-"));
+    directories.push(dataDirectory);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      DATA_DIR: dataDirectory,
+      WEB_DIST: path.join(dataDirectory, "missing-web"),
+      ADMIN_EMAIL: "admin@example.com",
+      ADMIN_PASSWORD: "correct horse battery staple",
+      APP_SECRET: "r".repeat(64),
+      LOG_LEVEL: "silent"
+    });
+    const database = new Database(config);
+    databases.push(database);
+    const row: ProjectRow = {
+      ...project("preview-rollback"),
+      active_deployment_id: null,
+      github_installation_id: "123",
+      github_repository_id: "99",
+      github_repository_full_name: "example/recovery",
+      preview_deployments_enabled: 1,
+      preview_domain_id: "dom_preview",
+      preview_domain_suffix: "example.com",
+      preview_ttl_hours: 24
+    };
+    database.createProject(row);
+    const queue = (sha: string, deliveryId: string) => database.queuePullRequestPreview({
+      projectId: row.id,
+      pullRequestNumber: 42,
+      headSha: sha,
+      headRef: "feature/preview",
+      baseRef: "main",
+      repositoryId: "99",
+      repositoryFullName: "example/recovery",
+      deliveryId,
+      hostname: "pr-42--preview-rollback.example.com",
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      commitMessage: "Preview rollback",
+      commitAuthor: "Ada",
+      commitUrl: null
+    });
+
+    const first = queue("a".repeat(40), "preview-rollback-1").preview;
+    const firstId = first.deployment_id!;
+    database.updatePullRequestPreviewDns(first.id, firstId, "zone", "record");
+    database.beginPullRequestPreviewBuild(first.id, firstId);
+    database.updateDeployment(firstId, {
+      status: "checking",
+      image_tag: "shelter/preview:first",
+      runtime_container: "shelter-preview-first",
+      internal_port: 3000
+    });
+    expect(database.completePullRequestPreview(first.id, firstId)).toBe(true);
+
+    const second = queue("b".repeat(40), "preview-rollback-2").preview;
+    const secondId = second.deployment_id!;
+    database.beginPullRequestPreviewBuild(second.id, secondId);
+    database.updateDeployment(secondId, {
+      status: "checking",
+      image_tag: "shelter/preview:second",
+      runtime_container: "shelter-preview-second",
+      internal_port: 3000
+    });
+
+    const routingDirectory = path.dirname(config.traefikConfigPath);
+    fs.rmSync(routingDirectory, { recursive: true, force: true });
+    fs.writeFileSync(routingDirectory, "block atomic routing writes");
+    const worker = new DeploymentWorker(config, database);
+    await expect((worker as unknown as {
+      activatePullRequestPreview(
+        project: ProjectRow,
+        deploymentId: string,
+        runtimeName: string,
+        imageTag: string,
+        internalPort: number,
+        previousDeployment?: DeploymentRow
+      ): Promise<void>;
+    }).activatePullRequestPreview(
+      row,
+      secondId,
+      "shelter-preview-second",
+      "shelter/preview:second",
+      3000,
+      database.getDeployment(firstId)
+    )).rejects.toThrow();
+
+    expect(database.getPullRequestPreview(second.id)).toMatchObject({
+      deployment_id: secondId,
+      active_deployment_id: firstId,
+      status: "failed"
+    });
+    expect(database.getDeployment(firstId)).toMatchObject({ status: "ready", failure_kind: null });
+    expect(database.getDeployment(secondId)).toMatchObject({ status: "failed", failure_kind: "activation" });
+    expect(docker.removed).toContain("shelter-preview-second");
+    expect(docker.removed).not.toContain("shelter-preview-first");
+  });
 });

@@ -15,8 +15,11 @@ import type {
   ApiTokenMetadataRow,
   GithubManifestFlowRow,
   GithubPendingPushRow,
+  ProjectMetricHistoryRow,
+  ProjectMetricSampleRow,
   ProjectDeletionRow,
   ProjectRow,
+  RuntimeLogRow,
   ServerActivityCounts,
   ServerMetricHistoryRow,
   ServerMetricSampleRow,
@@ -162,6 +165,48 @@ CREATE TABLE IF NOT EXISTS server_metric_samples (
   tunnel_configured INTEGER NOT NULL CHECK(tunnel_configured IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS project_metric_samples (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+  sampled_at INTEGER NOT NULL,
+  runtime_status TEXT NOT NULL CHECK(runtime_status IN ('created','running','paused','restarting','removing','exited','dead','missing','unknown')),
+  health_status TEXT NOT NULL CHECK(health_status IN ('healthy','unhealthy','starting','none','unknown')),
+  started_at TEXT,
+  uptime_seconds INTEGER NOT NULL CHECK(uptime_seconds >= 0),
+  restart_count INTEGER NOT NULL CHECK(restart_count >= 0),
+  oom_killed INTEGER NOT NULL CHECK(oom_killed IN (0, 1)),
+  cpu_usage_percent REAL NOT NULL CHECK(cpu_usage_percent >= 0),
+  cpu_limit_cores REAL NOT NULL CHECK(cpu_limit_cores > 0),
+  memory_used_bytes INTEGER NOT NULL CHECK(memory_used_bytes >= 0),
+  memory_limit_bytes INTEGER NOT NULL CHECK(memory_limit_bytes >= 0),
+  memory_usage_percent REAL NOT NULL CHECK(memory_usage_percent BETWEEN 0 AND 100),
+  network_received_bytes INTEGER NOT NULL CHECK(network_received_bytes >= 0),
+  network_transmitted_bytes INTEGER NOT NULL CHECK(network_transmitted_bytes >= 0),
+  network_receive_bytes_per_second REAL NOT NULL CHECK(network_receive_bytes_per_second >= 0),
+  network_transmit_bytes_per_second REAL NOT NULL CHECK(network_transmit_bytes_per_second >= 0),
+  block_read_bytes INTEGER NOT NULL CHECK(block_read_bytes >= 0),
+  block_write_bytes INTEGER NOT NULL CHECK(block_write_bytes >= 0),
+  PRIMARY KEY(project_id, sampled_at)
+);
+CREATE INDEX IF NOT EXISTS project_metric_samples_history_idx
+  ON project_metric_samples(project_id, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS project_metric_samples_retention_idx
+  ON project_metric_samples(sampled_at);
+
+CREATE TABLE IF NOT EXISTS runtime_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+  stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+  message TEXT NOT NULL CHECK(length(message) BETWEEN 1 AND 4096),
+  source_timestamp TEXT NOT NULL,
+  collected_at TEXT NOT NULL,
+  UNIQUE(deployment_id, stream, source_timestamp, message)
+);
+CREATE INDEX IF NOT EXISTS runtime_logs_project_cursor_idx ON runtime_logs(project_id, id);
+CREATE INDEX IF NOT EXISTS runtime_logs_project_time_idx ON runtime_logs(project_id, source_timestamp DESC);
+CREATE INDEX IF NOT EXISTS runtime_logs_retention_idx ON runtime_logs(source_timestamp);
+
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -269,6 +314,8 @@ CREATE TABLE IF NOT EXISTS pull_request_previews (
   generation INTEGER NOT NULL DEFAULT 1 CHECK(generation >= 1),
   latest_delivery_id TEXT NOT NULL,
   deployment_id TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+  active_deployment_id TEXT REFERENCES deployments(id) ON DELETE SET NULL,
+  worker_retry_generation INTEGER CHECK(worker_retry_generation IS NULL OR worker_retry_generation >= 1),
   hostname TEXT NOT NULL UNIQUE COLLATE NOCASE,
   zone_id TEXT,
   dns_record_id TEXT,
@@ -560,6 +607,39 @@ export class Database {
     if (!deploymentColumns.some((column) => column.name === "preview_id")) {
       this.sqlite.exec("ALTER TABLE deployments ADD COLUMN preview_id TEXT");
     }
+    const pullRequestPreviewColumns = this.sqlite.pragma(
+      "table_info(pull_request_previews)"
+    ) as Array<{ name: string }>;
+    if (!pullRequestPreviewColumns.some((column) => column.name === "active_deployment_id")) {
+      this.sqlite.exec(`
+        ALTER TABLE pull_request_previews
+        ADD COLUMN active_deployment_id TEXT REFERENCES deployments(id) ON DELETE SET NULL
+      `);
+    }
+    if (!pullRequestPreviewColumns.some((column) => column.name === "worker_retry_generation")) {
+      this.sqlite.exec(`
+        ALTER TABLE pull_request_previews
+        ADD COLUMN worker_retry_generation INTEGER
+        CHECK(worker_retry_generation IS NULL OR worker_retry_generation >= 1)
+      `);
+    }
+    // Pre-pointer preview rows used deployment_id for both the requested and
+    // currently routed build. Preserve an already-ready runtime during the
+    // migration; queued and failed candidates must never become routable.
+    this.sqlite.exec(`
+      UPDATE pull_request_previews
+      SET active_deployment_id = deployment_id
+      WHERE active_deployment_id IS NULL
+        AND deployment_id IS NOT NULL
+        AND status = 'ready'
+        AND EXISTS (
+          SELECT 1 FROM deployments
+          WHERE deployments.id = pull_request_previews.deployment_id
+            AND deployments.preview_id = pull_request_previews.id
+            AND deployments.deployment_scope = 'preview'
+            AND deployments.status = 'ready'
+        )
+    `);
     this.sqlite.exec("DROP INDEX IF EXISTS deployments_one_active_project_idx");
     this.sqlite.prepare(`
       WITH ranked AS (
@@ -593,8 +673,10 @@ export class Database {
       CREATE INDEX IF NOT EXISTS deployments_source_snapshot_idx
         ON deployments(project_id, source_ref, static_base_path, created_at DESC)
       ;
-      CREATE UNIQUE INDEX IF NOT EXISTS deployments_github_delivery_idx
-        ON deployments(project_id, github_delivery_id) WHERE github_delivery_id IS NOT NULL
+      DROP INDEX IF EXISTS deployments_github_delivery_idx;
+      CREATE UNIQUE INDEX deployments_github_delivery_idx
+        ON deployments(project_id, github_delivery_id)
+        WHERE github_delivery_id IS NOT NULL AND deployment_scope = 'production'
     `);
     const githubDeliveryColumns = this.sqlite.pragma("table_info(github_webhook_deliveries)") as Array<{ name: string }>;
     if (!githubDeliveryColumns.some((column) => column.name === "payload_hash")) {
@@ -1460,17 +1542,34 @@ export class Database {
 
   disableGithubInstallation(installationId: string, error: string): number {
     const disable = this.sqlite.transaction(() => {
+      const now = new Date().toISOString();
       const result = this.sqlite.prepare(`
         UPDATE projects
         SET github_connection_error = ?, updated_at = ?
         WHERE github_installation_id = ?
-      `).run(error.slice(0, 1_000), new Date().toISOString(), installationId);
+      `).run(error.slice(0, 1_000), now, installationId);
       this.sqlite.prepare(`
         DELETE FROM github_pending_pushes
         WHERE project_id IN (SELECT id FROM projects WHERE github_installation_id = ?)
       `).run(installationId);
       this.sqlite.prepare("DELETE FROM github_dirty_refs WHERE installation_id = ?").run(installationId);
       this.sqlite.prepare("DELETE FROM github_status_outbox WHERE installation_id = ?").run(installationId);
+      this.sqlite.prepare(`
+        UPDATE deployments SET
+          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
+          failure_kind='cancelled', cancel_requested_at=?,
+          error='GitHub installation access was revoked',
+          finished_at=CASE WHEN status='queued' THEN ? ELSE finished_at END
+        WHERE deployment_scope='preview'
+          AND project_id IN (SELECT id FROM projects WHERE github_installation_id = ?)
+          AND status IN ('queued','preparing','building','checking','switching')
+      `).run(now, now, installationId);
+      this.sqlite.prepare(`
+        UPDATE pull_request_previews
+        SET status='closing', expires_at=?, updated_at=?, error=NULL
+        WHERE project_id IN (SELECT id FROM projects WHERE github_installation_id = ?)
+          AND status <> 'closed'
+      `).run(now, now, installationId);
       return result.changes;
     });
     return disable.immediate();
@@ -1480,7 +1579,8 @@ export class Database {
     if (repositoryIds.length === 0) return 0;
     const placeholders = repositoryIds.map(() => "?").join(", ");
     const disable = this.sqlite.transaction(() => {
-      const params = [error.slice(0, 1_000), new Date().toISOString(), installationId, ...repositoryIds];
+      const now = new Date().toISOString();
+      const params = [error.slice(0, 1_000), now, installationId, ...repositoryIds];
       const result = this.sqlite.prepare(`
         UPDATE projects
         SET github_connection_error = ?, updated_at = ?
@@ -1501,6 +1601,28 @@ export class Database {
         DELETE FROM github_status_outbox
         WHERE installation_id = ? AND repository_id IN (${placeholders})
       `).run(installationId, ...repositoryIds);
+      this.sqlite.prepare(`
+        UPDATE deployments SET
+          status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,
+          failure_kind='cancelled', cancel_requested_at=?,
+          error='GitHub repository access was revoked',
+          finished_at=CASE WHEN status='queued' THEN ? ELSE finished_at END
+        WHERE deployment_scope='preview'
+          AND project_id IN (
+            SELECT id FROM projects
+            WHERE github_installation_id = ? AND github_repository_id IN (${placeholders})
+          )
+          AND status IN ('queued','preparing','building','checking','switching')
+      `).run(now, now, installationId, ...repositoryIds);
+      this.sqlite.prepare(`
+        UPDATE pull_request_previews
+        SET status='closing', expires_at=?, updated_at=?, error=NULL
+        WHERE project_id IN (
+          SELECT id FROM projects
+          WHERE github_installation_id = ? AND github_repository_id IN (${placeholders})
+        )
+          AND status <> 'closed'
+      `).run(now, now, installationId, ...repositoryIds);
       return result.changes;
     });
     return disable.immediate();
@@ -2540,9 +2662,12 @@ export class Database {
   listRoutablePullRequestPreviews(): PullRequestPreviewRow[] {
     return this.sqlite.prepare(`
       SELECT previews.* FROM pull_request_previews AS previews
-      JOIN deployments ON deployments.id = previews.deployment_id
-      WHERE previews.status = 'ready'
+      JOIN deployments ON deployments.id = previews.active_deployment_id
+      WHERE previews.active_deployment_id IS NOT NULL
+        AND previews.status NOT IN ('closing','closed','blocked')
         AND deployments.status = 'ready'
+        AND deployments.deployment_scope = 'preview'
+        AND deployments.preview_id = previews.id
         AND deployments.runtime_container IS NOT NULL
         AND deployments.internal_port IS NOT NULL
       ORDER BY previews.created_at ASC
@@ -2555,15 +2680,22 @@ export class Database {
   }
 
   getPullRequestPreviewByDeployment(deploymentId: string): PullRequestPreviewRow | undefined {
-    return this.sqlite.prepare("SELECT * FROM pull_request_previews WHERE deployment_id = ?")
-      .get(deploymentId) as PullRequestPreviewRow | undefined;
+    return this.sqlite.prepare(`
+      SELECT * FROM pull_request_previews
+      WHERE deployment_id = ? OR active_deployment_id = ?
+      LIMIT 1
+    `).get(deploymentId, deploymentId) as PullRequestPreviewRow | undefined;
   }
 
   latestReadyPreviewDeployment(previewId: string, excludeDeploymentId: string): DeploymentRow | undefined {
     return this.sqlite.prepare(`
-      SELECT * FROM deployments
-      WHERE preview_id = ? AND deployment_scope = 'preview' AND status = 'ready' AND id <> ?
-      ORDER BY created_at DESC LIMIT 1
+      SELECT deployments.* FROM pull_request_previews AS previews
+      JOIN deployments ON deployments.id = previews.active_deployment_id
+      WHERE previews.id = ? AND previews.active_deployment_id <> ?
+        AND deployments.preview_id = previews.id
+        AND deployments.deployment_scope = 'preview'
+        AND deployments.status = 'ready'
+      LIMIT 1
     `).get(previewId, excludeDeploymentId) as DeploymentRow | undefined;
   }
 
@@ -2607,19 +2739,63 @@ export class Database {
         throw conflict("Preview-Deployments sind für dieses Projekt nicht aktiviert", "PREVIEW_NOT_ENABLED");
       }
       const existing = this.findPullRequestPreview(input.projectId, input.pullRequestNumber);
+      // A closing preview owns its hostname/DNS record until cleanup has
+      // removed both. Never revive or retarget it from a late webhook.
+      if (existing?.status === "closing") {
+        return { kind: "deduplicated", preview: existing } as const;
+      }
       if (
         existing?.head_sha === input.headSha &&
         existing.status !== "closed" && existing.status !== "failed" && existing.status !== "blocked"
       ) return { kind: "deduplicated", preview: existing } as const;
+      const previewHostname = existing && existing.status !== "closed"
+        ? existing.hostname
+        : input.hostname;
 
       const activeCount = (this.sqlite.prepare(`
         SELECT COUNT(*) AS count FROM pull_request_previews
-        WHERE project_id = ? AND status IN ('queued','building','ready')
+        WHERE project_id = ?
+          AND (status IN ('queued','building','ready') OR active_deployment_id IS NOT NULL)
           AND pull_request_number <> ?
       `).get(input.projectId, input.pullRequestNumber) as { count: number }).count;
       const now = new Date().toISOString();
-      if (activeCount >= 3) {
+      if (activeCount >= 3 && !existing?.active_deployment_id) {
         const id = existing?.id ?? `prv_${randomUUID().replaceAll("-", "")}`;
+        const error = "Maximal drei aktive Preview-Deployments pro Projekt sind erlaubt";
+        const blockedDeployment: DeploymentRow = {
+          id: `dep_${randomUUID().replaceAll("-", "")}`,
+          project_id: input.projectId,
+          status: "failed",
+          source_ref: input.headRef,
+          image_tag: null,
+          previous_image_tag: null,
+          internal_port: null,
+          static_base_path: project.static_base_path,
+          runtime_kind: null,
+          runtime_description: null,
+          runtime_container: null,
+          commit_sha: input.headSha,
+          commit_message: input.commitMessage,
+          commit_author: input.commitAuthor,
+          commit_url: input.commitUrl,
+          trigger: "github_push",
+          github_delivery_id: input.deliveryId,
+          deployment_scope: "preview",
+          preview_id: id,
+          failure_kind: "activation",
+          error,
+          started_at: now,
+          finished_at: now,
+          created_at: now
+        };
+        this.createDeployment(blockedDeployment);
+        this.addLog(blockedDeployment.id, "system", error);
+        this.queueGithubStatus(blockedDeployment.id, "failure", "Preview-Limit erreicht", {
+          installationId: project.github_installation_id!,
+          repositoryId: input.repositoryId,
+          repositoryFullName: input.repositoryFullName,
+          commitSha: input.headSha
+        });
         this.sqlite.prepare(`
           INSERT INTO pull_request_previews (
             id, project_id, pull_request_number, head_sha, head_ref, base_ref,
@@ -2629,13 +2805,13 @@ export class Database {
           ) VALUES (
             @id, @project_id, @pull_request_number, @head_sha, @head_ref, @base_ref,
             @repository_id, @repository_full_name, 1, @latest_delivery_id,
-            NULL, @hostname, NULL, NULL, 0, @updated_at, 'blocked', @error,
+            @deployment_id, @hostname, NULL, NULL, 0, @updated_at, 'blocked', @error,
             @expires_at, @created_at, @updated_at, NULL
           )
           ON CONFLICT(project_id, pull_request_number) DO UPDATE SET
             head_sha=excluded.head_sha, head_ref=excluded.head_ref, base_ref=excluded.base_ref,
             generation=pull_request_previews.generation + 1,
-            latest_delivery_id=excluded.latest_delivery_id, deployment_id=NULL,
+            latest_delivery_id=excluded.latest_delivery_id, deployment_id=excluded.deployment_id,
             hostname=excluded.hostname, status='blocked', error=excluded.error,
             expires_at=excluded.expires_at, updated_at=excluded.updated_at, closed_at=NULL
         `).run({
@@ -2648,8 +2824,9 @@ export class Database {
           repository_id: input.repositoryId,
           repository_full_name: input.repositoryFullName,
           latest_delivery_id: input.deliveryId,
-          hostname: input.hostname,
-          error: "Maximal drei aktive Preview-Deployments pro Projekt sind erlaubt",
+          deployment_id: blockedDeployment.id,
+          hostname: previewHostname,
+          error,
           expires_at: input.expiresAt,
           created_at: existing?.created_at ?? now,
           updated_at: now
@@ -2674,7 +2851,7 @@ export class Database {
             WHERE id=?
           `).run(
             input.headSha, input.headRef, input.baseRef, input.repositoryId, input.repositoryFullName,
-            input.deliveryId, input.hostname, input.expiresAt, now, existing.id
+            input.deliveryId, previewHostname, input.expiresAt, now, existing.id
           );
           return { kind: "coalesced", preview: this.getPullRequestPreview(existing.id)! } as const;
         }
@@ -2716,6 +2893,12 @@ export class Database {
       };
       this.createDeployment(deployment);
       this.addLog(deployment.id, "system", `Pull Request #${input.pullRequestNumber} wurde als Preview eingereiht.`);
+      this.queueGithubStatus(deployment.id, "pending", "Preview wird von Shelter vorbereitet", {
+        installationId: project.github_installation_id!,
+        repositoryId: input.repositoryId,
+        repositoryFullName: input.repositoryFullName,
+        commitSha: input.headSha
+      });
       this.sqlite.prepare(`
         INSERT INTO pull_request_previews (
           id, project_id, pull_request_number, head_sha, head_ref, base_ref,
@@ -2747,7 +2930,7 @@ export class Database {
         repository_full_name: input.repositoryFullName,
         latest_delivery_id: input.deliveryId,
         deployment_id: deployment.id,
-        hostname: input.hostname,
+        hostname: previewHostname,
         expires_at: input.expiresAt,
         created_at: existing?.created_at ?? now,
         updated_at: now
@@ -2760,15 +2943,31 @@ export class Database {
     return queue.immediate();
   }
 
-  materializePullRequestPreview(previewId: string): DeploymentRow | undefined {
+  materializePullRequestPreview(
+    previewId: string,
+    options: { allowWorkerRetry?: boolean } = {}
+  ): DeploymentRow | undefined {
     const materialize = this.sqlite.transaction(() => {
       const preview = this.getPullRequestPreview(previewId);
       if (!preview || ["closing", "closed", "blocked"].includes(preview.status)) return undefined;
       const current = preview.deployment_id ? this.getDeployment(preview.deployment_id) : undefined;
       if (current && ["queued", "preparing", "building", "checking", "switching"].includes(current.status)) return undefined;
-      if (current?.commit_sha === preview.head_sha) return undefined;
+      const retryableWorkerFailure = current?.status === "failed" && current.failure_kind === "worker";
+      const sameSha = current?.commit_sha === preview.head_sha;
+      const currentGenerationWorkerFailure = retryableWorkerFailure
+        && current.github_delivery_id === preview.latest_delivery_id;
+      if (sameSha && !currentGenerationWorkerFailure) return undefined;
       const project = this.getMutableProject(preview.project_id);
       if (!project || project.preview_deployments_enabled !== 1) return undefined;
+      if (currentGenerationWorkerFailure) {
+        if (!options.allowWorkerRetry || preview.worker_retry_generation === preview.generation) return undefined;
+        const claimed = this.sqlite.prepare(`
+          UPDATE pull_request_previews SET worker_retry_generation=?
+          WHERE id=? AND generation=?
+            AND (worker_retry_generation IS NULL OR worker_retry_generation <> generation)
+        `).run(preview.generation, preview.id, preview.generation);
+        if (claimed.changes !== 1) return undefined;
+      }
       const now = new Date().toISOString();
       const deployment: DeploymentRow = {
         id: `dep_${randomUUID().replaceAll("-", "")}`,
@@ -2797,6 +2996,7 @@ export class Database {
       };
       this.createDeployment(deployment);
       this.addLog(deployment.id, "system", `Aktuellster Stand von Pull Request #${preview.pull_request_number} wurde eingereiht.`);
+      this.queueGithubStatus(deployment.id, "pending", "Preview wird von Shelter vorbereitet");
       this.sqlite.prepare(`
         UPDATE pull_request_previews SET deployment_id=?, status='queued', error=NULL, updated_at=? WHERE id=?
       `).run(deployment.id, now, preview.id);
@@ -2898,6 +3098,7 @@ export class Database {
           UPDATE deployments SET status='failed', failure_kind='activation', error=?, finished_at=?
           WHERE id=? AND status='queued'
         `).run(error.slice(0, 4096), now.toISOString(), current.deployment_id);
+        this.queueGithubStatus(current.deployment_id, "failure", "Preview-DNS konnte nicht bereitgestellt werden");
       }
     })();
   }
@@ -2918,6 +3119,13 @@ export class Database {
   completePullRequestPreview(previewId: string, deploymentId: string): boolean {
     const complete = this.sqlite.transaction(() => {
       const now = new Date().toISOString();
+      const current = this.getPullRequestPreview(previewId);
+      if (
+        !current
+        || current.deployment_id !== deploymentId
+        || !["queued", "building"].includes(current.status)
+      ) return false;
+      const previousActiveDeploymentId = current.active_deployment_id;
       const deployment = this.sqlite.prepare(`
         UPDATE deployments SET status='ready', error=NULL, failure_kind=NULL, finished_at=?
         WHERE id=? AND preview_id=? AND deployment_scope='preview' AND status='checking'
@@ -2925,13 +3133,66 @@ export class Database {
       `).run(now, deploymentId, previewId);
       if (deployment.changes !== 1) return false;
       const preview = this.sqlite.prepare(`
-        UPDATE pull_request_previews SET status='ready', error=NULL, updated_at=?
+        UPDATE pull_request_previews
+        SET active_deployment_id=?, status='ready', error=NULL, updated_at=?
         WHERE id=? AND deployment_id=? AND status IN ('queued','building')
-      `).run(now, previewId, deploymentId);
+          AND active_deployment_id IS ?
+      `).run(deploymentId, now, previewId, deploymentId, previousActiveDeploymentId);
       if (preview.changes !== 1) throw new Error("Preview state changed while completing deployment");
+      if (previousActiveDeploymentId && previousActiveDeploymentId !== deploymentId) {
+        const retired = this.sqlite.prepare(`
+          UPDATE deployments
+          SET status='cancelled', failure_kind='superseded',
+              error='Preview was replaced by a newer pull-request commit'
+          WHERE id=? AND preview_id=? AND deployment_scope='preview' AND status='ready'
+        `).run(previousActiveDeploymentId, previewId);
+        if (retired.changes !== 1) {
+          throw new Error("Previous active preview deployment could not be retired");
+        }
+      }
       return true;
     });
     return complete.immediate();
+  }
+
+  restorePullRequestPreviewActive(
+    previewId: string,
+    failedDeploymentId: string,
+    previousActiveDeploymentId: string | null
+  ): boolean {
+    const restore = this.sqlite.transaction(() => {
+      const preview = this.getPullRequestPreview(previewId);
+      if (!preview || preview.active_deployment_id !== failedDeploymentId) return false;
+      if (previousActiveDeploymentId) {
+        const previous = this.getDeployment(previousActiveDeploymentId);
+        if (
+          !previous
+          || previous.preview_id !== previewId
+          || previous.deployment_scope !== "preview"
+          || previous.status !== "cancelled"
+          || previous.failure_kind !== "superseded"
+        ) return false;
+      }
+      const now = new Date().toISOString();
+      const pointer = this.sqlite.prepare(`
+        UPDATE pull_request_previews SET active_deployment_id=?, updated_at=?
+        WHERE id=? AND active_deployment_id=?
+      `).run(previousActiveDeploymentId, now, previewId, failedDeploymentId);
+      if (pointer.changes !== 1) return false;
+      if (previousActiveDeploymentId) {
+        const deployment = this.sqlite.prepare(`
+          UPDATE deployments
+          SET status='ready', failure_kind=NULL, error=NULL, cancel_requested_at=NULL
+          WHERE id=? AND preview_id=? AND deployment_scope='preview'
+            AND status='cancelled' AND failure_kind='superseded'
+        `).run(previousActiveDeploymentId, previewId);
+        if (deployment.changes !== 1) {
+          throw new Error("Previous preview deployment could not be restored");
+        }
+      }
+      return true;
+    });
+    return restore.immediate();
   }
 
   failPullRequestPreview(previewId: string, deploymentId: string, error: string): void {
@@ -2945,7 +3206,8 @@ export class Database {
     const now = new Date().toISOString();
     this.sqlite.prepare(`
       UPDATE pull_request_previews
-      SET status='closed', deployment_id=NULL, zone_id=NULL, dns_record_id=NULL,
+      SET status='closed', deployment_id=NULL, active_deployment_id=NULL,
+          zone_id=NULL, dns_record_id=NULL,
           error=?, updated_at=?, closed_at=? WHERE id=?
     `).run(error, now, now, previewId);
   }
@@ -3086,6 +3348,202 @@ export class Database {
         )
       `).run(boundedLimit);
     })();
+  }
+
+  insertProjectMetricSample(sample: ProjectMetricSampleRow): void {
+    this.sqlite.prepare(`
+      INSERT OR REPLACE INTO project_metric_samples (
+        project_id, deployment_id, sampled_at, runtime_status, health_status,
+        started_at, uptime_seconds, restart_count, oom_killed,
+        cpu_usage_percent, cpu_limit_cores,
+        memory_used_bytes, memory_limit_bytes, memory_usage_percent,
+        network_received_bytes, network_transmitted_bytes,
+        network_receive_bytes_per_second, network_transmit_bytes_per_second,
+        block_read_bytes, block_write_bytes
+      ) VALUES (
+        @project_id, @deployment_id, @sampled_at, @runtime_status, @health_status,
+        @started_at, @uptime_seconds, @restart_count, @oom_killed,
+        @cpu_usage_percent, @cpu_limit_cores,
+        @memory_used_bytes, @memory_limit_bytes, @memory_usage_percent,
+        @network_received_bytes, @network_transmitted_bytes,
+        @network_receive_bytes_per_second, @network_transmit_bytes_per_second,
+        @block_read_bytes, @block_write_bytes
+      )
+    `).run(sample);
+  }
+
+  latestProjectMetricSample(projectId: string): ProjectMetricSampleRow | undefined {
+    return this.sqlite.prepare(`
+      SELECT * FROM project_metric_samples WHERE project_id = ? ORDER BY sampled_at DESC LIMIT 1
+    `).get(projectId) as ProjectMetricSampleRow | undefined;
+  }
+
+  listProjectMetricHistory(
+    projectId: string,
+    from: number,
+    to: number,
+    maxPoints = 180
+  ): ProjectMetricHistoryRow[] {
+    const boundedPoints = Math.max(1, Math.min(180, Math.trunc(maxPoints)));
+    const span = Math.max(1, Math.trunc(to) - Math.trunc(from));
+    const bucketSize = Math.max(1, Math.ceil(span / boundedPoints));
+    const bucketOrigin = Math.trunc(from) + 1;
+    return this.sqlite.prepare(`
+      WITH bucketed AS (
+        SELECT
+          CAST((sampled_at - @bucket_origin) / @bucket_size AS INTEGER) AS bucket,
+          sampled_at,
+          cpu_usage_percent,
+          memory_used_bytes,
+          memory_limit_bytes,
+          memory_usage_percent,
+          network_receive_bytes_per_second,
+          network_transmit_bytes_per_second,
+          block_read_bytes,
+          block_write_bytes
+        FROM project_metric_samples
+        WHERE project_id = @project_id AND sampled_at > @from AND sampled_at <= @to
+      )
+      SELECT
+        MAX(sampled_at) AS sampled_at,
+        AVG(cpu_usage_percent) AS cpu_usage_percent,
+        AVG(memory_used_bytes) AS memory_used_bytes,
+        AVG(memory_limit_bytes) AS memory_limit_bytes,
+        AVG(memory_usage_percent) AS memory_usage_percent,
+        AVG(network_receive_bytes_per_second) AS network_receive_bytes_per_second,
+        AVG(network_transmit_bytes_per_second) AS network_transmit_bytes_per_second,
+        MAX(block_read_bytes) AS block_read_bytes,
+        MAX(block_write_bytes) AS block_write_bytes
+      FROM bucketed
+      GROUP BY bucket
+      ORDER BY bucket ASC
+      LIMIT @max_points
+    `).all({
+      project_id: projectId,
+      bucket_origin: bucketOrigin,
+      bucket_size: bucketSize,
+      from: Math.trunc(from),
+      to: Math.trunc(to),
+      max_points: boundedPoints
+    }) as ProjectMetricHistoryRow[];
+  }
+
+  insertRuntimeLogs(rows: Array<Omit<RuntimeLogRow, "id">>, maxLinesPerProject = 5_000): number {
+    if (rows.length === 0) return 0;
+    const boundedRows = rows.slice(0, 500);
+    const boundedLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLinesPerProject)));
+    const insert = this.sqlite.prepare(`
+      INSERT OR IGNORE INTO runtime_logs (
+        project_id, deployment_id, stream, message, source_timestamp, collected_at
+      ) VALUES (
+        @project_id, @deployment_id, @stream, @message, @source_timestamp, @collected_at
+      )
+    `);
+    const enforceLimit = this.sqlite.prepare(`
+      DELETE FROM runtime_logs
+      WHERE project_id = @project_id
+        AND id < COALESCE((
+          SELECT id FROM runtime_logs
+          WHERE project_id = @project_id
+          ORDER BY id DESC
+          LIMIT 1 OFFSET @last_retained_offset
+        ), -1)
+    `);
+    const persist = this.sqlite.transaction((entries: Array<Omit<RuntimeLogRow, "id">>) => {
+      let inserted = 0;
+      const projectIds = new Set<string>();
+      for (const row of entries) {
+        inserted += insert.run(row).changes;
+        projectIds.add(row.project_id);
+      }
+      for (const projectId of projectIds) {
+        enforceLimit.run({ project_id: projectId, last_retained_offset: boundedLimit - 1 });
+      }
+      return inserted;
+    });
+    return persist.immediate(boundedRows);
+  }
+
+  pruneRuntimeLogsForProject(projectId: string, maxLines = 5_000): void {
+    const boundedLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLines)));
+    this.sqlite.prepare(`
+      DELETE FROM runtime_logs
+      WHERE project_id = @project_id
+        AND id < COALESCE((
+          SELECT id FROM runtime_logs
+          WHERE project_id = @project_id
+          ORDER BY id DESC
+          LIMIT 1 OFFSET @last_retained_offset
+        ), -1)
+    `).run({ project_id: projectId, last_retained_offset: boundedLimit - 1 });
+  }
+
+  latestRuntimeLogTimestamp(deploymentId: string): string | undefined {
+    const row = this.sqlite.prepare(`
+      SELECT source_timestamp FROM runtime_logs
+      WHERE deployment_id = ?
+      ORDER BY source_timestamp DESC, id DESC LIMIT 1
+    `).get(deploymentId) as { source_timestamp: string } | undefined;
+    return row?.source_timestamp;
+  }
+
+  listRuntimeLogs(projectId: string, deploymentId: string, after = 0, limit = 500): RuntimeLogRow[] {
+    const boundedAfter = Math.max(0, Math.trunc(after));
+    const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.sqlite.prepare(`
+      SELECT * FROM runtime_logs
+      WHERE project_id = ? AND deployment_id = ? AND id > ?
+      ORDER BY id ASC LIMIT ?
+    `).all(projectId, deploymentId, boundedAfter, boundedLimit) as RuntimeLogRow[];
+  }
+
+  latestRuntimeLogs(projectId: string, deploymentId: string, limit = 500): RuntimeLogRow[] {
+    const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    return this.sqlite.prepare(`
+      SELECT * FROM (
+        SELECT * FROM runtime_logs
+        WHERE project_id = ? AND deployment_id = ?
+        ORDER BY id DESC LIMIT ?
+      ) ORDER BY id ASC
+    `).all(projectId, deploymentId, boundedLimit) as RuntimeLogRow[];
+  }
+
+  pruneProjectObservabilityByAge(cutoff: number): void {
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare("DELETE FROM project_metric_samples WHERE sampled_at < ?").run(Math.trunc(cutoff));
+      this.sqlite.prepare("DELETE FROM runtime_logs WHERE source_timestamp < ?")
+        .run(new Date(Math.trunc(cutoff)).toISOString());
+    })();
+  }
+
+  pruneProjectObservabilityHardLimits(maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
+    const metricLimit = Math.max(1, Math.min(500_000, Math.trunc(maxMetricSamplesPerProject)));
+    const logLimit = Math.max(100, Math.min(50_000, Math.trunc(maxLogLinesPerProject)));
+    this.sqlite.transaction(() => {
+      this.sqlite.prepare(`
+        DELETE FROM project_metric_samples
+        WHERE rowid IN (
+          SELECT rowid FROM (
+            SELECT rowid, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY sampled_at DESC) AS position
+            FROM project_metric_samples
+          ) WHERE position > ?
+        )
+      `).run(metricLimit);
+      this.sqlite.prepare(`
+        DELETE FROM runtime_logs
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY id DESC) AS position
+            FROM runtime_logs
+          ) WHERE position > ?
+        )
+      `).run(logLimit);
+    })();
+  }
+
+  pruneProjectObservability(cutoff: number, maxMetricSamplesPerProject: number, maxLogLinesPerProject = 5_000): void {
+    this.pruneProjectObservabilityByAge(cutoff);
+    this.pruneProjectObservabilityHardLimits(maxMetricSamplesPerProject, maxLogLinesPerProject);
   }
 
   serverActivityCounts(now = Date.now()): ServerActivityCounts {

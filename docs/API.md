@@ -45,7 +45,7 @@ curl --fail-with-body \
 
 Use HTTPS for every remote Shelter installation. Never put a token in a URL, command argument, repository, image, build log, or issue. Store CI tokens in the CI provider's encrypted secret store and prefer one token per automation.
 
-API-token requests do not use the browser's CSRF header. Browser sessions still require CSRF protection for mutations. Cloudflare and GitHub connection setup, access-token management, password changes, and sign-out remain browser-session-only.
+API-token requests do not use the browser's CSRF header. Browser sessions still require CSRF protection for mutations. Cloudflare and GitHub connection setup, access-token management, password changes, sign-out, server metrics, and project observability/runtime logs remain browser-session-only.
 
 ## Core workflows
 
@@ -167,6 +167,16 @@ Use the Shelter CLI for this workflow unless direct HTTP integration is required
 ### Manage domains
 
 List active Cloudflare zones with `GET /api/settings/cloudflare/zones`. Add a hostname with `POST /api/projects/{projectId}/domains` and remove it with `DELETE /api/projects/{projectId}/domains/{domainId}`. Domain mutations require a connected Cloudflare account and the `domains:write` scope.
+
+### Inspect project observability in the administrator panel
+
+The following read-only endpoints intentionally require the administrator's browser session and reject personal access tokens because application output can contain sensitive data:
+
+- `GET /api/projects/{projectId}/observability?range=1h` returns the active production container's CPU, memory and configured limits, network rates, block I/O, uptime, restart count, OOM/health/status, concrete warning states, and at most 180 downsampled history points. Ranges are `15m`, `1h`, `6h`, `24h`, and `48h`.
+- `GET /api/projects/{projectId}/runtime-logs?after=0&limit=500` returns bounded structured output for the active deployment only.
+- `GET /api/projects/{projectId}/runtime-logs/stream?after=0` forwards newly persisted records over SSE. The worker collects Docker output at `METRICS_INTERVAL_SECONDS`, so this is near-live rather than instantaneous streaming. Connections are rate-limited and rotate after ten minutes.
+
+Runtime output is separate from immutable build/deployment logs. Shelter keeps at most 5,000 lines per project within `METRICS_RETENTION_HOURS` and returns at most 500 at once. The worker redacts exact values of configured project environment variables before persistence. Applications can still print derived, encoded, split, or reformatted secrets, so review runtime logs as sensitive administrator data before sharing them. The API process never receives the Docker socket; only the worker performs the label-validated collection.
 
 ## Errors and rate limits
 

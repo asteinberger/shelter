@@ -35,6 +35,7 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
       tags: [
         { name: "System" },
         { name: "Projects" },
+        { name: "Observability" },
         { name: "Deployments" },
         { name: "Previews" },
         { name: "Uploads" },
@@ -81,6 +82,46 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
         "/api/projects/{projectId}/deploy": {
           parameters: [{ $ref: "#/components/parameters/ProjectId" }],
           post: { tags: ["Deployments"], summary: "Deploy the current project source", security: bearerSecurity, requestBody: { content: { "application/json": { schema: { type: "object", properties: { staticBasePath: { type: ["string", "null"] } } } } } }, responses: { "202": { description: "Queued deployment" }, "409": errorResponse } }
+        },
+        "/api/projects/{projectId}/observability": {
+          parameters: [
+            { $ref: "#/components/parameters/ProjectId" },
+            { name: "range", in: "query", schema: { type: "string", enum: ["15m", "1h", "6h", "24h", "48h"], default: "1h" } }
+          ],
+          get: {
+            tags: ["Observability"],
+            summary: "Read bounded active-runtime metrics for one project",
+            description: "Administrator session only. Returns current container state, actionable warnings, and at most 180 downsampled history points. Docker access remains isolated in the worker.",
+            security: sessionSecurity,
+            responses: { "200": { description: "Current project runtime metrics and history" }, "401": errorResponse, "403": errorResponse, "404": errorResponse }
+          }
+        },
+        "/api/projects/{projectId}/runtime-logs": {
+          parameters: [
+            { $ref: "#/components/parameters/ProjectId" },
+            { name: "after", in: "query", schema: { type: "integer", minimum: 0, default: 0 } },
+            { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 500, default: 500 } }
+          ],
+          get: {
+            tags: ["Observability"],
+            summary: "Read bounded application output from the active deployment",
+            description: "Administrator session only. Runtime output is separate from deployment logs. Shelter stores at most 5,000 lines per project for the configured metrics retention window and returns at most 500 lines. Exact configured environment values are redacted, but applications can still emit other sensitive data.",
+            security: sessionSecurity,
+            responses: { "200": { description: "Active deployment runtime-log records" }, "401": errorResponse, "403": errorResponse, "404": errorResponse }
+          }
+        },
+        "/api/projects/{projectId}/runtime-logs/stream": {
+          parameters: [
+            { $ref: "#/components/parameters/ProjectId" },
+            { name: "after", in: "query", schema: { type: "integer", minimum: 0, default: 0 } }
+          ],
+          get: {
+            tags: ["Observability"],
+            summary: "Follow worker-collected active-runtime output over SSE",
+            description: "Administrator session only. The worker polls Docker at the configured metrics interval; this stream forwards persisted records and is near-live rather than instantaneous. Connections rotate after ten minutes and are rate-limited.",
+            security: sessionSecurity,
+            responses: { "200": { description: "text/event-stream with log, deployment, reconnect, and complete events" }, "401": errorResponse, "403": errorResponse, "404": errorResponse }
+          }
         },
         "/api/projects/{projectId}/rollback": {
           parameters: [{ $ref: "#/components/parameters/ProjectId" }],
@@ -175,7 +216,13 @@ export function registerOpenApiRoutes(app: FastifyInstance): void {
           get: { tags: ["Projects"], summary: "Analyze a GitHub repository at a branch SHA", security: sessionSecurity, responses: { "200": { description: "Detected applications cached by immutable branch SHA" }, "400": errorResponse, "401": errorResponse, "502": errorResponse } }
         },
         "/api/settings/github/preview-capability": {
-          get: { tags: ["Previews"], summary: "Check whether the installed GitHub App can deliver pull-request previews", security: sessionSecurity, responses: { "200": { description: "Permission and event readiness" }, "401": errorResponse, "502": errorResponse } }
+          get: {
+            tags: ["Previews"],
+            summary: "Check whether the GitHub App and an optional installation can deliver pull-request previews",
+            parameters: [{ name: "installationId", in: "query", schema: { type: "string", pattern: "^[0-9]+$" } }],
+            security: sessionSecurity,
+            responses: { "200": { description: "App and installation permission/event readiness" }, "401": errorResponse, "502": errorResponse }
+          }
         }
       },
       components: {

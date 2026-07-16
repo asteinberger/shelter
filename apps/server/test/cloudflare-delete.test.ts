@@ -132,3 +132,135 @@ describe("Cloudflare DNS deletion ownership", () => {
     expect(providerFetch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("Cloudflare preview DNS ownership", () => {
+  it.each([
+    ["current", "Managed by Shelter", false],
+    ["legacy", "Managed by Portsmith", true]
+  ])("adopts a same-tunnel record carrying the %s Shelter marker", async (_label, comment, expectsMigration) => {
+    const providerFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname === "/client/v4/zones") {
+        return success([{ id: "zone-id", name: "example.com", status: "active" }]);
+      }
+      if (init?.method === "GET" && url.pathname.endsWith("/dns_records")) {
+        return success([{
+          id: "preview-record",
+          name: "preview.example.com",
+          type: "CNAME",
+          content: "owned-tunnel.cfargotunnel.com",
+          proxied: true,
+          comment
+        }]);
+      }
+      if (init?.method === "PATCH" && url.pathname.endsWith("/preview-record")) {
+        expect(JSON.parse(String(init.body))).toEqual({
+          proxied: true,
+          comment: "Managed by Shelter"
+        });
+        return success({ id: "preview-record" });
+      }
+      throw new Error(`Unexpected Cloudflare request: ${init?.method} ${url.pathname}`);
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    await expect(service().ensurePreviewDnsRecord("preview.example.com", "zone-id")).resolves.toEqual({
+      zoneId: "zone-id",
+      recordId: "preview-record"
+    });
+    expect(providerFetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(
+      expectsMigration ? 1 : 0
+    );
+  });
+
+  it.each([
+    ["without a comment", undefined],
+    ["with a foreign comment", "Managed manually"]
+  ])("refuses to adopt a same-tunnel record %s", async (_label, comment) => {
+    const providerFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname === "/client/v4/zones") {
+        return success([{ id: "zone-id", name: "example.com", status: "active" }]);
+      }
+      if (init?.method === "GET" && url.pathname.endsWith("/dns_records")) {
+        return success([{
+          id: "manual-record",
+          name: "preview.example.com",
+          type: "CNAME",
+          content: "owned-tunnel.cfargotunnel.com",
+          proxied: true,
+          comment
+        }]);
+      }
+      throw new Error("An unowned preview record must not be mutated");
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    await expect(service().ensurePreviewDnsRecord("preview.example.com", "zone-id")).rejects.toMatchObject({
+      statusCode: 409,
+      code: "DNS_RECORD_EXISTS"
+    });
+    expect(providerFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["current", "Managed by Shelter"],
+    ["legacy", "Managed by Portsmith"]
+  ])("recovers and deletes a hostname-only preview record carrying the %s marker", async (_label, comment) => {
+    const providerFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET" && url.pathname.endsWith("/dns_records")) {
+        return success([{
+          id: "recovered-preview-record",
+          name: "preview.example.com",
+          type: "CNAME",
+          content: "owned-tunnel.cfargotunnel.com",
+          proxied: true,
+          comment
+        }]);
+      }
+      if (init?.method === "DELETE" && url.pathname.endsWith("/recovered-preview-record")) return success({});
+      throw new Error(`Unexpected Cloudflare request: ${init?.method} ${url.pathname}`);
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    await expect(service().deletePreviewDnsRecord("zone-id", null, "preview.example.com")).resolves.toBeUndefined();
+    expect(providerFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["stored id without a comment", "record-id", undefined],
+    ["hostname recovery with a foreign comment", null, "Managed manually"]
+  ])("refuses to delete an unowned preview record during %s", async (_label, recordId, comment) => {
+    const providerFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === "GET") {
+        return success(recordId
+          ? {
+              id: "record-id",
+              name: "preview.example.com",
+              type: "CNAME",
+              content: "owned-tunnel.cfargotunnel.com",
+              proxied: true,
+              comment
+            }
+          : [{
+              id: "manual-record",
+              name: "preview.example.com",
+              type: "CNAME",
+              content: "owned-tunnel.cfargotunnel.com",
+              proxied: true,
+              comment
+            }]);
+      }
+      throw new Error("An unowned preview record must not be deleted");
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    await expect(service().deletePreviewDnsRecord("zone-id", recordId, "preview.example.com")).rejects.toMatchObject({
+      statusCode: 409,
+      code: "DNS_RECORD_DRIFT"
+    });
+    expect(providerFetch).toHaveBeenCalledTimes(1);
+  });
+});
