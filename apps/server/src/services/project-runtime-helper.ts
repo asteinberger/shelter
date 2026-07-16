@@ -7,6 +7,7 @@ import { isDockerDnsLabel } from "./runtime-identity.js";
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const MAX_PREVIEW_BYTES = 10 * 1024 * 1024;
+const MAX_PREVIEW_BASE64_CHARS = Math.ceil(MAX_PREVIEW_BYTES / 3) * 4;
 
 const HEALTH_PROBE_SCRIPT = String.raw`
 const target = process.argv[1];
@@ -40,6 +41,7 @@ try {
 }
 const args = [
   "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+  "--disable-crash-reporter", "--disable-breakpad",
   "--hide-scrollbars", "--mute-audio", "--disable-extensions", "--disable-background-networking",
   "--user-data-dir=/tmp/chromium", "--window-size=1440,900", "--force-device-scale-factor=1",
   "--virtual-time-budget=4000", "--screenshot=/tmp/preview.png", target
@@ -53,6 +55,7 @@ if (exitCode !== 0) process.exit(42);
 const image = await fs.readFile("/tmp/preview.png");
 const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 if (image.length < signature.length || !image.subarray(0, signature.length).equals(signature)) process.exit(43);
+process.stdout.write(image.toString("base64"));
 `;
 
 export type ProjectRuntimeHelperCommandRunner = (
@@ -227,6 +230,9 @@ export async function captureProjectContainerPreview(
   try {
     const result = await command("docker", [
       ...commonHelperArgs(input, helper),
+      "--env", "HOME=/tmp",
+      "--env", "XDG_CONFIG_HOME=/tmp",
+      "--env", "XDG_CACHE_HOME=/tmp",
       "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
       "--memory", "512m",
       "--memory-swap", "512m",
@@ -237,25 +243,24 @@ export async function captureProjectContainerPreview(
     ], {
       allowFailure: true,
       timeoutMs: 30_000,
+      maxOutputChars: MAX_PREVIEW_BASE64_CHARS,
       ...(input.signal ? { signal: input.signal } : {})
     });
     if (result.exitCode === 40) return "not_html";
     if (result.exitCode !== 0) return "capture_failed";
-    const copied = await command("docker", ["cp", `${helper.name}:/tmp/preview.png`, input.outputPath], {
-      allowFailure: true,
-      ...(input.signal ? { signal: input.signal } : {})
-    });
-    if (copied.exitCode !== 0) return "capture_failed";
-    const stat = await fs.promises.stat(input.outputPath).catch(() => null);
-    if (!stat?.isFile() || stat.size < PNG_SIGNATURE.length || stat.size > MAX_PREVIEW_BYTES) return "capture_failed";
-    const file = await fs.promises.open(input.outputPath, "r");
-    try {
-      const signature = Buffer.alloc(PNG_SIGNATURE.length);
-      const { bytesRead } = await file.read(signature, 0, signature.length, 0);
-      if (bytesRead !== PNG_SIGNATURE.length || !signature.equals(PNG_SIGNATURE)) return "capture_failed";
-    } finally {
-      await file.close();
-    }
+    const encoded = result.stdout;
+    if (
+      encoded.length < PNG_SIGNATURE.length
+      || encoded.length > MAX_PREVIEW_BASE64_CHARS
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)
+    ) return "capture_failed";
+    const image = Buffer.from(encoded, "base64");
+    if (
+      image.length < PNG_SIGNATURE.length
+      || image.length > MAX_PREVIEW_BYTES
+      || !image.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+    ) return "capture_failed";
+    await fs.promises.writeFile(input.outputPath, image, { mode: 0o600 });
     return "ready";
   } finally {
     await removeOwnedHelper(input, helper, command);

@@ -33,4 +33,13 @@ describe("runCommand cancellation and timeouts", () => {
       signal: controller.signal
     })).rejects.toBeInstanceOf(CommandCancelledError);
   });
+
+  it("supports a larger bounded output window for binary transport encodings", async () => {
+    const result = await runCommand(
+      process.execPath,
+      ["-e", "process.stdout.write('a'.repeat(1_100_000))"],
+      { maxOutputChars: 1_200_000 }
+    );
+    expect(result.stdout).toHaveLength(1_100_000);
+  });
 });
