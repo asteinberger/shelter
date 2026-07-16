@@ -41,6 +41,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Separator } from '@/components/ui/separator';
 import { NavigationGuard } from '../components/NavigationGuard';
 import { GitHubIcon } from '../components/GitHubIcon';
+import { GitHubPreviewCapabilityNotice } from '../components/GitHubPreviewCapabilityNotice';
 import { CloudflareAccessProtectionCard } from '../components/CloudflareAccessProtectionCard';
 import { trustedGitHubAppUrl, trustedGitHubManifestRegistrationUrl } from '../utils/github';
 import { currentLocale, localize, useI18n } from '@/i18n';
@@ -241,6 +242,8 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     queryFn: api.github,
     enabled: section === 'github',
     retry: false,
+    refetchOnWindowFocus: (query) => query.state.data?.previewCapability?.ready === false ? 'always' : false,
+    refetchOnReconnect: (query) => query.state.data?.previewCapability?.ready === false ? 'always' : false,
   });
   const registerGitHub = useMutation({
     mutationFn: api.startGitHubManifest,
@@ -348,6 +351,8 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     );
     void queryClient.invalidateQueries({ queryKey: ['github-settings'] });
     void queryClient.invalidateQueries({ queryKey: ['github-repositories'] });
+    void queryClient.invalidateQueries({ queryKey: ['github-preview-capability'] });
+    void queryClient.invalidateQueries({ queryKey: ['project-pull-request-previews'] });
   }, [queryClient, section, t]);
 
   useEffect(() => {
@@ -674,6 +679,12 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     const connected = Boolean(github?.connected && installations.length > 0);
     const githubAppUrl = trustedGitHubAppUrl(github?.appUrl);
     const githubInstallUrl = trustedGitHubAppUrl(github?.installUrl);
+    const previewCapabilityStatus = github?.previewCapability?.ready === true
+      ? 'ready'
+      : github?.previewCapability?.ready === false
+        ? 'update'
+        : 'unavailable';
+    const previewCapabilityNeedsUpdate = previewCapabilityStatus === 'update';
 
     return (
       <div className="flex flex-col gap-8 sm:gap-10">
@@ -764,6 +775,14 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
               </section>
             ) : (
               <div className="grid max-w-4xl gap-5">
+                {previewCapabilityNeedsUpdate && (
+                  <GitHubPreviewCapabilityNotice
+                    capability={github.previewCapability}
+                    refreshing={githubSettings.isFetching}
+                    onRetry={() => githubSettings.refetch()}
+                  />
+                )}
+
                 <Card aria-labelledby="github-app-title">
                   <CardHeader className="gap-4 border-b sm:grid-cols-[1fr_auto]">
                     <div className="min-w-0">
@@ -786,8 +805,19 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
                         <dd className="mt-1 text-sm font-medium tabular-nums">{installations.length}</dd>
                       </div>
                       <div>
-                        <dt className="text-sm text-muted-foreground">Auto-Deploy</dt>
-                        <dd className="mt-1 flex items-center gap-1.5 text-sm font-medium"><GitPullRequest className="size-3.5" aria-hidden="true" /> {t('Ready', 'Bereit')}</dd>
+                        <dt className="text-sm text-muted-foreground">{t('PR previews', 'PR-Previews')}</dt>
+                        <dd className="mt-1 flex items-center gap-1.5 text-sm font-medium">
+                          {previewCapabilityNeedsUpdate
+                            ? <AlertTriangle className="size-3.5 text-warning" aria-hidden="true" />
+                            : previewCapabilityStatus === 'unavailable'
+                              ? <CircleDot className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                              : <GitPullRequest className="size-3.5" aria-hidden="true" />}
+                          {previewCapabilityNeedsUpdate
+                            ? t('Update required', 'Aktualisierung nötig')
+                            : previewCapabilityStatus === 'unavailable'
+                              ? t('Check unavailable', 'Prüfung nicht verfügbar')
+                              : t('Ready', 'Bereit')}
+                        </dd>
                       </div>
                     </dl>
                     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">

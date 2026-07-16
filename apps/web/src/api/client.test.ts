@@ -356,6 +356,7 @@ describe('pull request preview api', () => {
         pullRequestsPermission: true,
         pullRequestEvent: true,
         remediation: 'none',
+        remediationUrl: null,
       } }))
       .mockResolvedValueOnce(Response.json({
         settings: { enabled: false, domainId: null, domainSuffix: null, ttlHours: 72, maxActive: 3, inheritsProductionEnvironment: false },
@@ -369,13 +370,17 @@ describe('pull request preview api', () => {
           installationPullRequestEvent: true,
           installationSuspended: false,
           remediation: 'none',
+          remediationUrl: null,
         },
         environmentKeys: [],
         previews: [],
       }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(api.githubPreviewCapability(123)).resolves.toMatchObject({ ready: true });
+    await expect(api.githubPreviewCapability(123)).resolves.toMatchObject({
+      ready: true,
+      remediationUrl: null,
+    });
     await expect(api.projectPullRequestPreviews('prj/42')).resolves.toMatchObject({ previews: [] });
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/settings/github/preview-capability?installationId=123', expect.objectContaining({ credentials: 'include' }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/projects/prj%2F42/previews', expect.objectContaining({ credentials: 'include' }));

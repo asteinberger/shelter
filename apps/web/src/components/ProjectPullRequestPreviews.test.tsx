@@ -144,7 +144,27 @@ describe('PullRequestPreviewList', () => {
 describe('PreviewCapability', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('fails closed and identifies a pending repository installation approval', () => {
+  it('guides the app owner through the first reauthorization step', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: false,
+        configured: true,
+        pullRequestsPermission: false,
+        pullRequestEvent: false,
+        remediation: 'update_existing_app',
+        remediationUrl: 'https://github.com/organizations/shelter/settings/apps/shelter-host/permissions',
+      }}
+      onRetry={() => undefined}
+    />);
+    expect(html).toContain('Step 1 of 2');
+    expect(html).toContain('GitHub access needs an update');
+    expect(html).toContain('Update GitHub App');
+    expect(html).toContain('href="https://github.com/organizations/shelter/settings/apps/shelter-host/permissions"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('Missing:');
+  });
+
+  it('guides the installation owner through the second reauthorization step', () => {
     const html = render(<PreviewCapability
       capability={{
         ready: false,
@@ -156,13 +176,32 @@ describe('PreviewCapability', () => {
         installationPullRequestEvent: false,
         installationSuspended: false,
         remediation: 'approve_installation_update',
+        remediationUrl: 'https://github.com/organizations/shelter/settings/installations/123',
       }}
       onRetry={() => undefined}
     />);
-    expect(html).toContain('GitHub installation approval required');
-    expect(html).toContain('Shelter stays fail-closed');
+    expect(html).toContain('Step 2 of 2');
+    expect(html).toContain('Approve the updated GitHub access');
     expect(html).toContain('Repository installation: Pull requests read access');
-    expect(html).toContain('Review installation approval');
+    expect(html).toContain('Approve on GitHub');
+    expect(html).toContain('href="https://github.com/organizations/shelter/settings/installations/123"');
+    expect(html).toContain('Available:');
+    expect(html).toContain('Missing:');
+  });
+
+  it('falls back to internal GitHub settings when the remediation URL is not trusted', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: false,
+        configured: true,
+        pullRequestsPermission: false,
+        pullRequestEvent: false,
+        remediation: 'update_existing_app',
+        remediationUrl: 'https://github.example.com/settings/apps/shelter/permissions',
+      }}
+      onRetry={() => undefined}
+    />);
     expect(html).toContain('href="/settings/github"');
+    expect(html).not.toContain('github.example.com');
   });
 });

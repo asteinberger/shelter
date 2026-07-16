@@ -120,7 +120,7 @@ export interface GitHubInstallation {
   accountAvatarUrl?: string | null;
   repositorySelection?: 'all' | 'selected' | string;
   suspendedAt?: string | null;
-  htmlUrl?: string;
+  htmlUrl?: string | null;
   account?: {
     login?: string;
     type?: string;
@@ -150,6 +150,7 @@ export interface GitHubPreviewCapability {
   installationPullRequestEvent?: boolean;
   installationSuspended?: boolean;
   remediation: 'none' | 'configure_app' | 'update_existing_app' | 'approve_installation_update';
+  remediationUrl?: string | null;
 }
 
 export interface GitHubRepository {
