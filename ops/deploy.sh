@@ -33,12 +33,18 @@ USAGE
 }
 
 cleanup() {
+  local cleanup_status=$?
+  trap - EXIT HUP INT TERM
   if ((remote_operation_lock_acquired)) && [[ -n "$ssh_target" && -n "$remote_operation_lock_q" && -n "$remote_operation_lock_token" ]]; then
     "${ssh_args[@]}" "$ssh_target" "if [ -f $remote_operation_lock_q/owner ] && [ \"\$(cat $remote_operation_lock_q/owner)\" = '$remote_operation_lock_token' ]; then rm -f $remote_operation_lock_q/pid $remote_operation_lock_q/owner $remote_operation_lock_q/kind; rmdir $remote_operation_lock_q; fi" </dev/null >/dev/null 2>&1 || true
   fi
   shelter_server_connection_cleanup
+  exit "$cleanup_status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() {
   printf 'Error: %s\n' "$1" >&2
@@ -99,7 +105,7 @@ rsync_args=(
   --exclude='*.log'
   --exclude=.shelter-install.lock/
   --exclude=backups/
-  --exclude=releases/
+  --exclude=/releases/
   --exclude=node_modules/
   --exclude=dist/
   --exclude=coverage/

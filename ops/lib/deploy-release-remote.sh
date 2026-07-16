@@ -79,12 +79,38 @@ lock_owner_matches() {
   [ "$lock_owner" = "$token" ]
 }
 
+release_owned_operation() {
+  operation_entry=
+  lock_owner_matches || fail "the shared Shelter operation lock is no longer owned by this process"
+  if path_is_directory "$stage"; then
+    rm -rf "$stage"
+  elif [ -e "$stage" ] || [ -L "$stage" ]; then
+    fail "refusing to remove an unsafe incoming release stage"
+  fi
+  for operation_entry in \
+    "$operation_lock"/* \
+    "$operation_lock"/.[!.]* \
+    "$operation_lock"/..?*
+  do
+    [ -e "$operation_entry" ] || [ -L "$operation_entry" ] || continue
+    case "$operation_entry" in
+      "$operation_lock/owner"|"$operation_lock/pid"|"$operation_lock/kind") ;;
+      *) fail "the shared Shelter operation lock contains an unexpected entry" ;;
+    esac
+  done
+  rm -f "$operation_lock/pid" "$operation_lock/owner" "$operation_lock/kind" ||
+    fail "the shared Shelter operation lock files could not be removed"
+  rmdir "$operation_lock" ||
+    fail "the shared Shelter operation lock directory could not be removed"
+}
+
 validate_inputs
 require_root
 
+install_lock=$installation/.shelter-install.lock
 releases=$installation/releases
 incoming=$releases/.incoming
-operation_lock=$releases/.deploy-release.lock
+operation_lock=$install_lock
 stage=$incoming/${tag}-${token}
 final=$releases/$tag
 
@@ -103,17 +129,17 @@ case "$action" in
     chown root:root "$releases" "$incoming"
     chmod 700 "$releases" "$incoming"
     if [ -L "$operation_lock" ] || { [ -e "$operation_lock" ] && [ ! -d "$operation_lock" ]; }; then
-      fail "the verified-release operation lock is unsafe"
+      fail "the shared Shelter operation lock is unsafe"
     fi
     if ! mkdir "$operation_lock" 2>/dev/null; then
-      fail "another verified-release deployment is active"
+      fail "another Shelter install, source deploy, release deploy, or rollback is active"
     fi
     if ! printf '%s\n' "$token" > "$operation_lock/owner" ||
        ! printf '%s\n' "$$" > "$operation_lock/pid" ||
        ! printf '%s\n' release-deploy > "$operation_lock/kind"; then
       rm -f "$operation_lock/owner" "$operation_lock/pid" "$operation_lock/kind"
       rmdir "$operation_lock" 2>/dev/null || true
-      fail "the verified-release operation lock could not be initialized"
+      fail "the shared Shelter operation lock could not be initialized"
     fi
     if [ -e "$stage" ] || [ -L "$stage" ]; then
       rm -f "$operation_lock/owner" "$operation_lock/pid" "$operation_lock/kind"
@@ -127,7 +153,7 @@ case "$action" in
 
   activate)
     path_is_directory "$incoming" || fail "the incoming release directory is missing or unsafe"
-    lock_owner_matches || fail "the verified-release operation lock is not owned by this process"
+    lock_owner_matches || fail "the shared Shelter operation lock is not owned by this process"
     path_is_directory "$stage" || fail "the incoming release bundle is missing or unsafe"
     [ -x "$stage/ops/verify-release-bundle.sh" ] || fail "the incoming release verifier is missing"
     [ -x "$stage/ops/install-release-bundle.sh" ] || fail "the incoming release installer is missing"
@@ -151,6 +177,7 @@ case "$action" in
       -- --non-interactive
 
     if [ "$dry_run" -eq 1 ]; then
+      release_owned_operation
       printf 'Remote release verification and installer dry run completed.\n'
       exit 0
     fi
@@ -180,22 +207,18 @@ case "$action" in
       printf 'Published immutable release directory %s.\n' "$final"
     fi
 
-    "$final/ops/install-release-bundle.sh" \
+    SHELTER_RELEASE_INSTALL_LOCK_TOKEN=$token \
+      "$final/ops/install-release-bundle.sh" \
       --bundle "$final" \
       --installation "$installation" \
       -- --non-interactive
     "$installation/install.sh" doctor
+    release_owned_operation
     ;;
 
   cleanup)
     if lock_owner_matches; then
-      if path_is_directory "$stage"; then
-        rm -rf "$stage"
-      elif [ -e "$stage" ] || [ -L "$stage" ]; then
-        fail "refusing to remove an unsafe incoming release stage"
-      fi
-      rm -f "$operation_lock/owner" "$operation_lock/pid" "$operation_lock/kind"
-      rmdir "$operation_lock" 2>/dev/null || true
+      release_owned_operation
     fi
     ;;
 

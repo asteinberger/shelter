@@ -132,6 +132,17 @@ set -eu
     printf 'ASKPASS mode=%s require=%s\n' "$askpass_mode" "${SSH_ASKPASS_REQUIRE:-missing}"
   fi
 } >> "$MOCK_SSH_LOG"
+if [ -n "${MOCK_SSH_BLOCK_STATE:-}" ] && [ ! -e "$MOCK_SSH_BLOCK_STATE" ]; then
+  : > "$MOCK_SSH_BLOCK_STATE"
+  printf '%s\n' "$$" > "$MOCK_SSH_BLOCK_CHILD"
+  : > "$MOCK_SSH_BLOCK_READY"
+  trap 'exit 129' 1
+  trap 'exit 130' 2
+  trap 'exit 143' 15
+  while :; do
+    sleep 1
+  done
+fi
 exit "${MOCK_SSH_STATUS:-0}"
 EOF
 
@@ -189,7 +200,7 @@ test_operator_dry_run_verifies_and_stages_safely() {
   assert_contains "$MOCK_SSH_LOG" '<sh -s -- activate /opt/shelter v1.2.3'
   assert_contains "$MOCK_SSH_LOG" "${TEST_TAG}"
   assert_contains "$MOCK_SSH_LOG" ' 1>'
-  assert_contains "$MOCK_SSH_LOG" '<sh -s -- cleanup /opt/shelter v1.2.3'
+  assert_not_contains "$MOCK_SSH_LOG" '<sh -s -- cleanup /opt/shelter v1.2.3'
   assert_contains "$MOCK_SSH_LOG" 'ASKPASS mode=700 require=force'
   assert_contains "$COMMAND_OUTPUT" 'no release was published or installed'
   assert_not_contains "$COMMAND_OUTPUT" "$TEST_PASSWORD"
@@ -242,6 +253,84 @@ test_operator_failure_cleans_remote_stage() {
   assert_not_contains "$MOCK_SSH_LOG" '<sh -s -- activate /opt/shelter v1.2.3'
 }
 
+assert_deployer_signal_statuses() {
+  local deployer=$1
+  local signal expected parent child attempt signal_output python
+  python=$(command -v python3) || fail_test 'python3 is required for portable signal-disposition tests'
+  shift
+  while [[ $# -gt 0 ]]; do
+    signal=$1
+    expected=$2
+    shift 2
+    block_state=$TEST_TMP/block-${deployer}-${signal}.state
+    block_ready=$TEST_TMP/block-${deployer}-${signal}.ready
+    block_child=$TEST_TMP/block-${deployer}-${signal}.child
+    signal_output=$TEST_TMP/block-${deployer}-${signal}.output
+    rm -f "$block_state" "$block_ready" "$block_child"
+
+    set +e
+    if [[ "$deployer" == release ]]; then
+      PATH="$MOCK_BIN:$PATH" \
+      MOCK_SSH_BLOCK_STATE="$block_state" \
+      MOCK_SSH_BLOCK_READY="$block_ready" \
+      MOCK_SSH_BLOCK_CHILD="$block_child" \
+        "$python" -c \
+          'import os, signal, sys; [signal.signal(item, signal.SIG_DFL) for item in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)]; os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' \
+        "$REPO_ROOT/ops/deploy-release.sh" \
+          --server-env "$SERVER_ENV" \
+          --repo example/shelter \
+          --tag "$TEST_TAG" \
+          --dry-run > "$signal_output" 2>&1 &
+    else
+      PATH="$MOCK_BIN:$PATH" \
+      SHELTER_SERVER_ENV_FILE="$SERVER_ENV" \
+      MOCK_SSH_BLOCK_STATE="$block_state" \
+      MOCK_SSH_BLOCK_READY="$block_ready" \
+      MOCK_SSH_BLOCK_CHILD="$block_child" \
+        "$python" -c \
+          'import os, signal, sys; [signal.signal(item, signal.SIG_DFL) for item in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)]; os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' \
+        "$REPO_ROOT/ops/deploy.sh" --dry-run > "$signal_output" 2>&1 &
+    fi
+    parent=$!
+    set -e
+
+    for attempt in {1..200}; do
+      [[ -f "$block_ready" && -f "$block_child" ]] && break
+      sleep 0.01
+    done
+    [[ -f "$block_ready" && -f "$block_child" ]] || {
+      kill -TERM "$parent" 2>/dev/null || true
+      wait "$parent" 2>/dev/null || true
+      fail_test "$deployer did not reach the blocking SSH mock"
+    }
+    child=$(cat "$block_child")
+    kill -s "$signal" "$parent" 2>/dev/null ||
+      fail_test "could not send $signal to $deployer"
+    kill -s "$signal" "$child" 2>/dev/null || true
+    for attempt in {1..300}; do
+      kill -0 "$parent" 2>/dev/null || break
+      sleep 0.01
+    done
+    if kill -0 "$parent" 2>/dev/null; then
+      kill -KILL "$child" "$parent" 2>/dev/null || true
+      wait "$parent" 2>/dev/null || true
+      fail_test "$deployer did not terminate after $signal"
+    fi
+    set +e
+    wait "$parent"
+    COMMAND_STATUS=$?
+    set -e
+    [[ "$COMMAND_STATUS" -eq "$expected" ]] ||
+      fail_test "$deployer swallowed $signal: expected ${expected}, got ${COMMAND_STATUS}; output: $(tr '\n' ' ' < "$signal_output")"
+    assert_not_contains "$signal_output" "$TEST_PASSWORD"
+  done
+}
+
+test_deployer_signals_preserve_exit_status() {
+  assert_deployer_signal_statuses release HUP 129 INT 130 TERM 143
+  assert_deployer_signal_statuses source HUP 129 INT 130 TERM 143
+}
+
 test_operator_rejects_unsafe_inputs_before_network() {
   chmod 644 "$SERVER_ENV"
   run_deployer --dry-run
@@ -263,7 +352,7 @@ test_source_deployer_excludes_worktree_git_pointer() {
     "$REPO_ROOT/ops/deploy.sh" --dry-run
   assert_status 0
   assert_contains "$MOCK_RSYNC_LOG" '<--exclude=.git>'
-  assert_contains "$MOCK_RSYNC_LOG" '<--exclude=releases/>'
+  assert_contains "$MOCK_RSYNC_LOG" '<--exclude=/releases/>'
   assert_not_contains "$MOCK_RSYNC_LOG" '<--exclude=.git/>'
   assert_not_contains "$COMMAND_OUTPUT" "$TEST_PASSWORD"
   assert_not_contains "$MOCK_RSYNC_LOG" "$TEST_PASSWORD"
@@ -272,20 +361,20 @@ test_source_deployer_excludes_worktree_git_pointer() {
   destination_tree=$TEST_TMP/worktree-destination
   mkdir -p "$source_tree" \
     "$destination_tree/releases/.incoming/v1.2.3-token" \
-    "$destination_tree/releases/.deploy-release.lock" \
-    "$destination_tree/releases/v1.2.3"
+    "$destination_tree/releases/v1.2.3" \
+    "$source_tree/nested/releases"
   printf 'gitdir: /Users/operator/private/worktree/.git/worktrees/release\n' > "$source_tree/.git"
   printf 'public payload\n' > "$source_tree/README.md"
+  printf 'nested application release data\n' > "$source_tree/nested/releases/application.txt"
   printf 'keep immutable release\n' > "$destination_tree/releases/v1.2.3/release.manifest"
   printf 'keep incoming stage\n' > "$destination_tree/releases/.incoming/v1.2.3-token/release.manifest"
-  printf 'keep lock\n' > "$destination_tree/releases/.deploy-release.lock/owner"
-  "$SYSTEM_RSYNC" -rlpt --delete --exclude=.git --exclude=releases/ \
+  "$SYSTEM_RSYNC" -rlpt --delete --exclude=.git --exclude=/releases/ \
     "$source_tree/" "$destination_tree/"
   assert_absent "$destination_tree/.git"
   assert_contains "$destination_tree/README.md" 'public payload'
   assert_contains "$destination_tree/releases/v1.2.3/release.manifest" 'keep immutable release'
   assert_contains "$destination_tree/releases/.incoming/v1.2.3-token/release.manifest" 'keep incoming stage'
-  assert_contains "$destination_tree/releases/.deploy-release.lock/owner" 'keep lock'
+  assert_contains "$destination_tree/nested/releases/application.txt" 'nested application release data'
   if grep -R -Fq -- '/Users/operator/private/worktree' "$destination_tree"; then
     fail_test 'a local worktree path reached the synchronized destination'
   fi
@@ -318,6 +407,26 @@ EOF
 #!/bin/sh
 set -eu
 printf 'install %s\n' "$*" >> "$REMOTE_LOG"
+installation=
+dry_run=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --installation) installation=$2; shift ;;
+    --dry-run) dry_run=1 ;;
+  esac
+  shift
+done
+[ -n "$installation" ]
+[ -d "$installation/.shelter-install.lock" ]
+[ "$(cat "$installation/.shelter-install.lock/owner")" = "$EXPECTED_RELEASE_TOKEN" ]
+[ "${SHELTER_RELEASE_INSTALL_LOCK_TOKEN:-}" = "$EXPECTED_RELEASE_TOKEN" ] || [ "$dry_run" -eq 1 ]
+if mkdir "$installation/.shelter-install.lock" 2>/dev/null; then
+  printf 'source deploy acquired the shared lock during release install\n' >&2
+  exit 91
+fi
+if [ "$dry_run" -eq 0 ]; then
+  printf 'release:%s\n' "$EXPECTED_RELEASE_VERSION" > "$installation/current-revision"
+fi
 EOF
   cat > "$stage/ops/lib/release-bundle.sh" <<EOF
 shelter_release_load() {
@@ -339,6 +448,7 @@ shelter_release_load() {
 EOF
     cat "$REPO_ROOT/ops/lib/deploy-release-remote.sh"
   } | PATH="$MOCK_BIN:$PATH" REMOTE_LOG="$REMOTE_LOG" \
+    EXPECTED_RELEASE_TOKEN="$TEST_TOKEN" EXPECTED_RELEASE_VERSION="$TEST_VERSION" \
     "$TEST_SHELL" -s -- "$@" > "$COMMAND_OUTPUT" 2>&1
   COMMAND_STATUS=$?
   set -e
@@ -352,6 +462,18 @@ test_remote_helper_publishes_atomically_and_repeats_idempotently() {
   cat > "$installation/install.sh" <<'EOF'
 #!/bin/sh
 set -eu
+root=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)
+[ "$1" = doctor ]
+[ -d "$root/.shelter-install.lock" ]
+[ "$(cat "$root/.shelter-install.lock/owner")" = "0123456789abcdef0123456789abcdef" ]
+[ "$(cat "$root/current-revision")" = "release:1.2.3" ]
+if mkdir "$root/.shelter-install.lock" 2>/dev/null; then
+  printf 'source deploy acquired the shared lock during doctor\n' >&2
+  exit 92
+fi
+if [ "${MOCK_DOCTOR_LEAVE_LOCK_BLOCKER:-0}" -eq 1 ]; then
+  : > "$root/.shelter-install.lock/blocker"
+fi
 printf 'doctor %s\n' "$*" >> "$REMOTE_LOG"
 EOF
   chmod 755 "$installation/install.sh"
@@ -370,9 +492,8 @@ EOF
   assert_contains "$REMOTE_LOG" 'install --bundle'
   assert_contains "$REMOTE_LOG" '--dry-run -- --non-interactive'
   assert_contains "$REMOTE_LOG" 'doctor doctor'
-  run_remote_helper cleanup "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
-  assert_status 0
-  assert_absent "$installation/releases/.deploy-release.lock"
+  assert_contains "$installation/current-revision" 'release:1.2.3'
+  assert_absent "$installation/.shelter-install.lock"
 
   : > "$REMOTE_LOG"
   run_remote_helper prepare "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
@@ -382,8 +503,39 @@ EOF
   assert_status 0
   assert_contains "$COMMAND_OUTPUT" 'Reusing existing verified immutable release'
   assert_contains "$REMOTE_LOG" 'doctor doctor'
+  assert_absent "$installation/.shelter-install.lock"
+}
+
+test_remote_helper_surfaces_shared_lock_cleanup_failure() {
+  mock_remote_commands
+  installation=$TEST_TMP/installation
+  mkdir "$installation"
+  printf 'APP_SECRET=preserved\n' > "$installation/.env"
+  cat > "$installation/install.sh" <<'EOF'
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)
+[ "$1" = doctor ]
+[ -d "$root/.shelter-install.lock" ]
+[ "$(cat "$root/current-revision")" = "release:1.2.3" ]
+: > "$root/.shelter-install.lock/blocker"
+printf 'doctor %s\n' "$*" >> "$REMOTE_LOG"
+EOF
+  chmod 755 "$installation/install.sh"
+
+  run_remote_helper prepare "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
+  assert_status 0
+  populate_remote_stage "$installation" "$TEST_TOKEN"
+  run_remote_helper activate "$installation" "$TEST_TAG" "$TEST_TOKEN" "$TEST_MANIFEST_SHA" 0
+  assert_status 1
+  assert_contains "$COMMAND_OUTPUT" 'lock contains an unexpected entry'
+  assert_contains "$REMOTE_LOG" 'doctor doctor'
+  [[ -d "$installation/.shelter-install.lock" ]] ||
+    fail_test 'cleanup failure was not left fail-closed'
+  rm -f "$installation/.shelter-install.lock/blocker"
   run_remote_helper cleanup "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
   assert_status 0
+  assert_absent "$installation/.shelter-install.lock"
 }
 
 test_remote_helper_dry_run_does_not_publish() {
@@ -402,8 +554,7 @@ test_remote_helper_dry_run_does_not_publish() {
   assert_absent "$installation/releases/$TEST_TAG"
   assert_contains "$REMOTE_LOG" '--dry-run -- --non-interactive'
   assert_not_contains "$REMOTE_LOG" 'doctor'
-  run_remote_helper cleanup "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
-  assert_status 0
+  assert_absent "$installation/.shelter-install.lock"
   assert_absent "$installation/releases/.incoming/${TEST_TAG}-${TEST_TOKEN}"
 }
 
@@ -451,10 +602,12 @@ run_test 'dry run authenticates, stages with -rlpt, and redacts secrets' test_op
 run_test 'password ControlMaster socket stays short with a long TMPDIR' test_password_control_socket_ignores_long_tmpdir
 run_test 'real workflow requests remote activation and doctor' test_operator_real_run_requests_install_and_doctor
 run_test 'transport failure cleans its owned remote stage' test_operator_failure_cleans_remote_stage
+run_test 'blocking SSH preserves HUP, INT, and TERM exit status' test_deployer_signals_preserve_exit_status
 run_test 'unsafe tags and server configuration fail before network' test_operator_rejects_unsafe_inputs_before_network
 run_test 'source deploy excludes clone and worktree .git metadata' test_source_deployer_excludes_worktree_git_pointer
 run_test 'remote helper atomically publishes and repeats idempotently' test_remote_helper_publishes_atomically_and_repeats_idempotently
 run_test 'remote helper dry run verifies without publishing' test_remote_helper_dry_run_does_not_publish
+run_test 'successful doctor still surfaces shared-lock cleanup failure' test_remote_helper_surfaces_shared_lock_cleanup_failure
 run_test 'manifest mismatch cannot execute uploaded release code' test_remote_helper_rejects_manifest_before_uploaded_code
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"

@@ -119,9 +119,12 @@ The workflow is fail closed and performs these steps in order:
    temporary `SSH_ASKPASS` helper plus a protected ControlMaster socket. No
    credential is put in argv or deployment logs.
 3. The root SSH account creates `/opt/shelter/releases/.incoming` as root-owned
-   mode `0700` and serializes release deployers with an ownership-token lock.
-   `rsync -rlpt` transfers no owner/group metadata and never transfers the
-   operator environment file.
+   mode `0700` and acquires the shared ownership-token lock at
+   `/opt/shelter/.shelter-install.lock`. The same lock serializes source
+   deploys, release deploys, standalone installs, and rollback. A release holds
+   it through the final `doctor` result and releases it in that same remote
+   transaction. `rsync -rlpt` transfers no owner/group metadata and never
+   transfers the operator environment file.
 4. The VPS verifies the complete bundle and the exact locally authenticated
    manifest again, then runs `install-release-bundle.sh --dry-run` before any
    immutable release directory is published.

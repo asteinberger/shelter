@@ -79,7 +79,10 @@ cleanup() {
   shelter_server_connection_cleanup
   exit "$cleanup_status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 while (($#)); do
   case "$1" in
@@ -162,6 +165,7 @@ rsync "${rsync_args[@]}" "$local_bundle/" "$rsync_target"
 
 printf 'Re-verifying the release bundle and installer plan on the VPS…\n'
 run_remote_action activate "$local_manifest_sha" "$dry_run"
+remote_lock_acquired=0
 
 if ((dry_run)); then
   printf 'Verified-release dry run completed; no release was published or installed.\n'
