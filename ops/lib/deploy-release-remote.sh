@@ -79,6 +79,30 @@ lock_owner_matches() {
   [ "$lock_owner" = "$token" ]
 }
 
+record_active_operation_pid() {
+  [ -f "$operation_lock/pid" ] && [ ! -L "$operation_lock/pid" ] ||
+    fail "the shared Shelter operation lock has an unsafe pid file"
+  operation_pid_temporary=$operation_lock/.pid.$$
+  [ ! -e "$operation_pid_temporary" ] && [ ! -L "$operation_pid_temporary" ] ||
+    fail "the shared Shelter operation pid staging path is unsafe"
+  if ! printf '%s\n' "$$" > "$operation_pid_temporary" ||
+     ! mv "$operation_pid_temporary" "$operation_lock/pid"; then
+    rm -f "$operation_pid_temporary"
+    fail "the active release operation pid could not be recorded"
+  fi
+}
+
+lock_process_is_alive() {
+  [ -f "$operation_lock/pid" ] && [ ! -L "$operation_lock/pid" ] ||
+    fail "the shared Shelter operation lock has an unsafe pid file"
+  lock_pid=
+  IFS= read -r lock_pid < "$operation_lock/pid" || true
+  case "$lock_pid" in
+    ''|*[!0-9]*) fail "the shared Shelter operation lock has an invalid pid" ;;
+  esac
+  kill -0 "$lock_pid" 2>/dev/null
+}
+
 release_owned_operation() {
   operation_entry=
   lock_owner_matches || fail "the shared Shelter operation lock is no longer owned by this process"
@@ -154,6 +178,7 @@ case "$action" in
   activate)
     path_is_directory "$incoming" || fail "the incoming release directory is missing or unsafe"
     lock_owner_matches || fail "the shared Shelter operation lock is not owned by this process"
+    record_active_operation_pid
     path_is_directory "$stage" || fail "the incoming release bundle is missing or unsafe"
     [ -x "$stage/ops/verify-release-bundle.sh" ] || fail "the incoming release verifier is missing"
     [ -x "$stage/ops/install-release-bundle.sh" ] || fail "the incoming release installer is missing"
@@ -218,6 +243,9 @@ case "$action" in
 
   cleanup)
     if lock_owner_matches; then
+      if lock_process_is_alive; then
+        fail "the verified release operation is still active; refusing to remove its shared lock"
+      fi
       release_owned_operation
     fi
     ;;

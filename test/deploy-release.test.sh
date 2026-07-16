@@ -454,6 +454,23 @@ EOF
   set -e
 }
 
+start_remote_helper() {
+  local background_output=$1
+  shift
+  {
+    cat <<EOF
+shelter_release_load() {
+  SHELTER_RELEASE_VERSION=$TEST_VERSION
+  SHELTER_RELEASE_MANIFEST_SHA256=$TEST_MANIFEST_SHA
+}
+EOF
+    cat "$REPO_ROOT/ops/lib/deploy-release-remote.sh"
+  } | PATH="$MOCK_BIN:$PATH" REMOTE_LOG="$REMOTE_LOG" \
+    EXPECTED_RELEASE_TOKEN="$TEST_TOKEN" EXPECTED_RELEASE_VERSION="$TEST_VERSION" \
+    "$TEST_SHELL" -s -- "$@" > "$background_output" 2>&1 &
+  REMOTE_HELPER_PID=$!
+}
+
 test_remote_helper_publishes_atomically_and_repeats_idempotently() {
   mock_remote_commands
   installation=$TEST_TMP/installation
@@ -558,6 +575,65 @@ test_remote_helper_dry_run_does_not_publish() {
   assert_absent "$installation/releases/.incoming/${TEST_TAG}-${TEST_TOKEN}"
 }
 
+test_remote_cleanup_refuses_live_activation() {
+  mock_remote_commands
+  installation=$TEST_TMP/installation
+  activation_ready=$TEST_TMP/activation.ready
+  activation_release=$TEST_TMP/activation.release
+  activation_output=$TEST_TMP/activation.output
+  mkdir "$installation"
+  printf 'APP_SECRET=preserved\n' > "$installation/.env"
+  printf '#!/bin/sh\nexit 99\n' > "$installation/install.sh"
+  chmod 755 "$installation/install.sh"
+
+  run_remote_helper prepare "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
+  assert_status 0
+  populate_remote_stage "$installation" "$TEST_TOKEN"
+  cat > "$installation/releases/.incoming/${TEST_TAG}-${TEST_TOKEN}/ops/install-release-bundle.sh" <<EOF
+#!/bin/sh
+set -eu
+: > "$activation_ready"
+trap 'exit 77' 1 2 15
+while [ ! -e "$activation_release" ]; do
+  sleep 0.02
+done
+exit 77
+EOF
+  chmod 755 "$installation/releases/.incoming/${TEST_TAG}-${TEST_TOKEN}/ops/install-release-bundle.sh"
+
+  start_remote_helper "$activation_output" \
+    activate "$installation" "$TEST_TAG" "$TEST_TOKEN" "$TEST_MANIFEST_SHA" 0
+  for attempt in {1..250}; do
+    [[ -f "$activation_ready" ]] && break
+    sleep 0.02
+  done
+  if [[ ! -f "$activation_ready" ]]; then
+    kill -TERM "$REMOTE_HELPER_PID" 2>/dev/null || true
+    wait "$REMOTE_HELPER_PID" 2>/dev/null || true
+    fail_test 'activation did not reach the blocking installer'
+  fi
+
+  run_remote_helper cleanup "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
+  assert_status 1
+  assert_contains "$COMMAND_OUTPUT" 'still active'
+  [[ -d "$installation/.shelter-install.lock" ]] ||
+    fail_test 'cleanup removed the shared lock while activation was alive'
+
+  : > "$activation_release"
+  set +e
+  wait "$REMOTE_HELPER_PID"
+  activation_status=$?
+  set -e
+  [[ "$activation_status" -ne 0 ]] || fail_test 'the blocked activation unexpectedly succeeded'
+  [[ -d "$installation/.shelter-install.lock" ]] ||
+    fail_test 'failed activation did not leave the shared lock fail-closed'
+
+  run_remote_helper cleanup "$installation" "$TEST_TAG" "$TEST_TOKEN" '' 0
+  assert_status 0
+  assert_absent "$installation/.shelter-install.lock"
+  assert_absent "$installation/releases/.incoming/${TEST_TAG}-${TEST_TOKEN}"
+}
+
 test_remote_helper_rejects_manifest_before_uploaded_code() {
   mock_remote_commands
   installation=$TEST_TMP/installation
@@ -607,6 +683,7 @@ run_test 'unsafe tags and server configuration fail before network' test_operato
 run_test 'source deploy excludes clone and worktree .git metadata' test_source_deployer_excludes_worktree_git_pointer
 run_test 'remote helper atomically publishes and repeats idempotently' test_remote_helper_publishes_atomically_and_repeats_idempotently
 run_test 'remote helper dry run verifies without publishing' test_remote_helper_dry_run_does_not_publish
+run_test 'cleanup cannot unlock a live remote activation' test_remote_cleanup_refuses_live_activation
 run_test 'successful doctor still surfaces shared-lock cleanup failure' test_remote_helper_surfaces_shared_lock_cleanup_failure
 run_test 'manifest mismatch cannot execute uploaded release code' test_remote_helper_rejects_manifest_before_uploaded_code
 
