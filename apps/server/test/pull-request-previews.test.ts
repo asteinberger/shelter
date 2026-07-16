@@ -70,8 +70,11 @@ function context() {
   return { config, database, github: new GitHubService(config, database, vi.fn() as unknown as typeof fetch), project };
 }
 
+let payloadSequence = 0;
+
 function payload(number: number, overrides: Record<string, unknown> = {}) {
   const sha = number.toString(16).padStart(40, "a").slice(-40);
+  payloadSequence += 1;
   return {
     action: "opened",
     installation: { id: 123 },
@@ -81,6 +84,7 @@ function payload(number: number, overrides: Record<string, unknown> = {}) {
       number,
       title: `PR ${number}`,
       html_url: `https://github.com/example/app/pull/${number}`,
+      updated_at: new Date(1_700_000_000_000 + payloadSequence * 1_000).toISOString(),
       head: { sha, ref: `feature-${number}`, repo: { id: 99, full_name: "example/app" } },
       base: { ref: "main", repo: { id: 99, full_name: "example/app" } }
     },

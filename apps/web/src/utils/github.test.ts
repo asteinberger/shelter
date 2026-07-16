@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   gitHubRepositoryUrlFromFullName,
+  githubPreviewCapabilityStatus,
   hasGitHubProjectDraftChanges,
+  shouldRefetchGitHubPreviewCapability,
   shouldSynchronizeGitHubProjectDraft,
+  trustedGitHubAppInstallationUrl,
   trustedGitHubAppUrl,
   trustedGitHubManifestRegistrationUrl,
   trustedGitHubRemediationUrl,
@@ -40,11 +43,30 @@ describe('GitHub project draft synchronization', () => {
   });
 });
 
+describe('GitHub preview capability UI state', () => {
+  it('prioritizes a resumable replacement over the active App readiness', () => {
+    const pending = { ready: true, upgradePending: true };
+    expect(githubPreviewCapabilityStatus(pending)).toBe('update');
+    expect(shouldRefetchGitHubPreviewCapability(pending)).toBe(true);
+  });
+
+  it('keeps incomplete capabilities fresh and leaves stable ready capabilities alone', () => {
+    expect(githubPreviewCapabilityStatus({ ready: false, upgradePending: false })).toBe('update');
+    expect(shouldRefetchGitHubPreviewCapability({ ready: false, upgradePending: false })).toBe(true);
+    expect(githubPreviewCapabilityStatus({ ready: true, upgradePending: false })).toBe('ready');
+    expect(shouldRefetchGitHubPreviewCapability({ ready: true, upgradePending: false })).toBe(false);
+    expect(githubPreviewCapabilityStatus(undefined)).toBe('unavailable');
+  });
+});
+
 describe('GitHub URL allowlists', () => {
-  it('accepts only the exact GitHub App manifest endpoint with one state parameter', () => {
+  it('accepts only personal or organization GitHub App manifest endpoints with one state parameter', () => {
     expect(trustedGitHubManifestRegistrationUrl(
       'https://github.com/settings/apps/new?state=abcdefghijklmnop',
     )).toBe('https://github.com/settings/apps/new?state=abcdefghijklmnop');
+    expect(trustedGitHubManifestRegistrationUrl(
+      'https://github.com/organizations/shelter-host/settings/apps/new?state=abcdefghijklmnop',
+    )).toBe('https://github.com/organizations/shelter-host/settings/apps/new?state=abcdefghijklmnop');
 
     for (const value of [
       'https://github.com.evil.test/settings/apps/new?state=abcdefghijklmnop',
@@ -55,6 +77,10 @@ describe('GitHub URL allowlists', () => {
       'https://github.com/settings/apps/new?state=abcdefghijklmnop&state=qrstuvwxyzabcdef',
       'https://github.com/settings/apps/new?state=short',
       'https://github.com/apps/new?state=abcdefghijklmnop',
+      'https://github.com/organizations/shelter_host/settings/apps/new?state=abcdefghijklmnop',
+      'https://github.com/organizations/shelter/settings/apps/new/?state=abcdefghijklmnop',
+      'https://github.com/enterprises/shelter/settings/apps/new?state=abcdefghijklmnop',
+      'https://github.com/organizations/shelter/settings/apps/new?state=abcdefghijklmnop&owner=other',
     ]) expect(trustedGitHubManifestRegistrationUrl(value)).toBeUndefined();
   });
 
@@ -68,6 +94,23 @@ describe('GitHub URL allowlists', () => {
     expect(trustedGitHubAppUrl('https://user@github.com/apps/shelter-raum')).toBeUndefined();
     expect(trustedGitHubAppUrl('https://github.com:444/apps/shelter-raum')).toBeUndefined();
     expect(trustedGitHubAppUrl('https://github.com/apps/shelter-raum#settings')).toBeUndefined();
+  });
+
+  it('allows only the exact candidate GitHub App installation path', () => {
+    expect(trustedGitHubAppInstallationUrl(
+      'https://github.com/apps/shelter-raum/installations/new',
+    )).toBe('https://github.com/apps/shelter-raum/installations/new');
+
+    for (const value of [
+      'https://github.com/apps/shelter-raum',
+      'https://github.com/apps/shelter-raum/installations/new/',
+      'https://github.com/apps/shelter-raum/installations/new?target=organization',
+      'https://github.com/apps/Shelter-Raum/installations/new',
+      'https://github.com.evil.test/apps/shelter-raum/installations/new',
+      'https://user@github.com/apps/shelter-raum/installations/new',
+      'https://github.com:444/apps/shelter-raum/installations/new',
+      'https://github.com/apps/shelter-raum/installations/new#organization',
+    ]) expect(trustedGitHubAppInstallationUrl(value)).toBeUndefined();
   });
 
   it('allows only exact GitHub App update and installation approval destinations', () => {

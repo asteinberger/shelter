@@ -7,9 +7,14 @@ import {
 } from "node:crypto";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
-import type { Database, GithubStatusOutboxRow } from "../lib/database.js";
+import type {
+  Database,
+  GithubBufferedWebhookRow,
+  GithubStatusOutboxRow
+} from "../lib/database.js";
 import { badRequest, conflict, HttpError, upstreamError } from "../lib/errors.js";
 import { decryptString, encryptString, hashToken, randomToken } from "../lib/security.js";
+import type { GithubAppUpgradeFlowRow } from "../types/models.js";
 import {
   analyzeProjectFiles,
   MAX_ANALYSIS_CONTENT_BYTES,
@@ -25,11 +30,16 @@ export const GITHUB_MANIFEST_CALLBACK_PATH = "/api/settings/github/manifest/call
 export const GITHUB_SETUP_CALLBACK_PATH = "/api/settings/github/setup/callback";
 export const GITHUB_MANIFEST_COOKIE = "shelter_github_manifest";
 export const LEGACY_GITHUB_MANIFEST_COOKIE = "portsmith_github_manifest";
+export const GITHUB_UPGRADE_SETUP_COOKIE = "shelter_github_upgrade_setup";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_REGISTRATION_URL = "https://github.com/settings/apps/new";
 const API_VERSION = "2026-03-10";
 const MANIFEST_TTL_MS = 10 * 60_000;
+const UPGRADE_SETUP_TTL_MS = 60 * 60_000;
+const RETIRED_WEBHOOK_TTL_MS = 10 * 60_000;
+const PENDING_WEBHOOK_MAX_COUNT = 100;
+const PENDING_WEBHOOK_MAX_BYTES = 5 * 1024 * 1024;
 const MAX_PAGES = 20;
 const PAGE_SIZE = 100;
 const ANALYSIS_CACHE_TTL_MS = 10 * 60_000;
@@ -52,6 +62,23 @@ const AppMetadataSchema = z.object({
 }).strict();
 
 type AppMetadata = z.infer<typeof AppMetadataSchema>;
+
+const AppUpgradeCandidateSchema = z.object({
+  version: z.literal(1),
+  metadata: AppMetadataSchema,
+  privateKey: z.string().min(100).max(64 * 1024),
+  webhookSecret: z.string().min(16).max(1024)
+}).strict();
+
+type AppUpgradeCandidate = z.infer<typeof AppUpgradeCandidateSchema>;
+
+interface RetiredWebhookSource {
+  appId: string;
+  webhookSecret: string;
+  previousInstallationId: string | null;
+  successorInstallationId: string;
+  expiresAt: string;
+}
 
 const ManifestConversionSchema = z.object({
   id: z.union([z.number().int().positive(), z.string().regex(/^\d+$/)]),
@@ -158,6 +185,7 @@ const PullRequestEventSchema = z.object({
     number: z.number().int().positive().max(2_147_483_647),
     title: z.string().max(4096),
     html_url: z.url(),
+    updated_at: z.iso.datetime(),
     head: z.object({
       sha: z.string().regex(/^[a-f0-9]{40,64}$/i),
       ref: z.string().min(1).max(255),
@@ -257,12 +285,30 @@ export interface GitHubPreviewCapability {
   installationSuspended: boolean | null;
   remediation: "none" | "configure_app" | "update_existing_app" | "approve_installation_update";
   remediationUrl: string | null;
+  upgradePending: boolean;
+  upgradeInstallUrl: string | null;
+  upgradeExpiresAt: string | null;
+}
+
+export interface GitHubWebhookSource {
+  kind: "active" | "pending" | "retired";
+  appId: string;
+  previousInstallationId?: string | null;
+  successorInstallationId?: string;
+}
+
+interface GitHubWebhookResult {
+  duplicate: boolean;
+  queued: number;
+  pending: number;
+  ignored: number;
 }
 
 interface GithubFetchOptions {
   method?: "GET" | "POST";
   token?: string;
   appAuthentication?: boolean;
+  appCredentials?: Pick<AppUpgradeCandidate, "metadata" | "privateKey">;
   body?: unknown;
 }
 
@@ -308,6 +354,7 @@ export class GitHubService {
   }
 
   async previewCapability(installationId?: string): Promise<GitHubPreviewCapability> {
+    const upgrade = this.pendingUpgrade();
     if (!this.state().configured) {
       return {
         ready: false,
@@ -319,7 +366,8 @@ export class GitHubService {
         installationPullRequestEvent: installationId ? false : null,
         installationSuspended: null,
         remediation: "configure_app",
-        remediationUrl: null
+        remediationUrl: null,
+        ...upgrade
       };
     }
     const app = this.parseUpstream(
@@ -356,7 +404,8 @@ export class GitHubService {
           ? appRemediationUrl
           : installationReady
             ? null
-            : this.installationSettingsUrl(installation)
+            : this.installationSettingsUrl(installation),
+        ...upgrade
       };
     }
     return {
@@ -369,7 +418,8 @@ export class GitHubService {
       installationPullRequestEvent: null,
       installationSuspended: null,
       remediation: pullRequestsPermission && pullRequestEvent ? "none" : "update_existing_app",
-      remediationUrl: pullRequestsPermission && pullRequestEvent ? null : appRemediationUrl
+      remediationUrl: pullRequestsPermission && pullRequestEvent ? null : appRemediationUrl,
+      ...upgrade
     };
   }
 
@@ -379,6 +429,12 @@ export class GitHubService {
     browserNonce: string;
     secureCookie: true;
   } {
+    if (this.hasStoredAppState() || this.database.listGithubProjectBindings().length > 0) {
+      throw conflict(
+        "Die GitHub App ist bereits verbunden. Verwende den sicheren Upgrade-Flow.",
+        "GITHUB_ALREADY_CONFIGURED"
+      );
+    }
     const origin = this.panelOrigin();
     const state = randomToken();
     const browserNonce = randomToken();
@@ -397,20 +453,12 @@ export class GitHubService {
     });
 
     const panelName = new URL(origin).hostname.replaceAll(".", "-");
-    const manifest: GitHubManifest = {
-      name: `Shelter ${panelName}`.slice(0, 34),
-      url: origin,
-      hook_attributes: { url: `${origin}/api/webhooks/github`, active: true },
-      redirect_url: callbackUrl,
-      setup_url: `${origin}${GITHUB_SETUP_CALLBACK_PATH}?state=${encodeURIComponent(setupState)}`,
-      public: false,
-      request_oauth_on_install: false,
-      setup_on_update: true,
-      default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
-      // GitHub Apps always receive installation and installation_repositories.
-      // GitHub rejects manifests that try to subscribe to those implicit events.
-      default_events: ["push", "pull_request"]
-    };
+    const manifest = this.manifest(
+      origin,
+      callbackUrl,
+      setupState,
+      `Shelter ${panelName}`.slice(0, 34)
+    );
     return {
       registrationUrl: `${GITHUB_REGISTRATION_URL}?state=${encodeURIComponent(state)}`,
       manifest,
@@ -419,13 +467,92 @@ export class GitHubService {
     };
   }
 
-  cancelManifest(state: string, browserNonce: string): void {
-    this.database.consumeGithubManifestFlow(hashToken(state), hashToken(browserNonce));
+  async startUpgradeManifest(userId: string, sessionTokenHash: string): Promise<{
+    registrationUrl: string;
+    manifest: GitHubManifest;
+    browserNonce: string;
+    secureCookie: true;
+  }> {
+    this.cleanupExpiredUpgradeBuffers();
+    const metadata = this.requireMetadata();
+    if (this.database.hasBufferedGithubWebhooks(metadata.appId)) {
+      throw conflict(
+        "Vor einem weiteren GitHub-App-Upgrade müssen gepufferte Webhooks verarbeitet werden",
+        "GITHUB_UPGRADE_WEBHOOKS_PENDING"
+      );
+    }
+    const app = this.parseUpstream(
+      AppCapabilitySchema,
+      await this.githubRequest<unknown>("/app", { appAuthentication: true })
+    );
+    if (app.slug !== metadata.appSlug) {
+      throw upstreamError("GitHub hat eine unerwartete App-Identität geliefert", "GITHUB_API_INVALID");
+    }
+    if (app.owner.type === "Enterprise") {
+      throw conflict(
+        "Enterprise-eigene GitHub Apps können nicht über ein Manifest ersetzt werden",
+        "GITHUB_UPGRADE_ENTERPRISE_UNSUPPORTED"
+      );
+    }
+
+    const origin = this.panelOrigin();
+    const state = randomToken();
+    const browserNonce = randomToken();
+    const setupState = randomToken();
+    const callbackUrl = `${origin}${GITHUB_MANIFEST_CALLBACK_PATH}`;
+    const now = new Date();
+    const suffix = ` upgrade-${createHash("sha256").update(randomToken()).digest("hex").slice(0, 6)}`;
+    const panelName = new URL(origin).hostname.replaceAll(".", "-");
+    const baseName = `Shelter ${panelName}`.slice(0, Math.max(1, 34 - suffix.length));
+    const manifest = this.manifest(origin, callbackUrl, setupState, `${baseName}${suffix}`);
+
+    this.database.createGithubAppUpgradeFlow({
+      id: randomToken(),
+      manifest_state_hash: hashToken(state),
+      manifest_browser_nonce_hash: hashToken(browserNonce),
+      setup_state_hash: hashToken(setupState),
+      setup_browser_nonce_hash: null,
+      user_id: userId,
+      session_token_hash: sessionTokenHash,
+      previous_app_id: metadata.appId,
+      expected_owner_login: app.owner.login,
+      expected_owner_type: app.owner.type,
+      candidate_app_id: null,
+      encrypted_candidate: null,
+      phase: "registering",
+      expires_at: new Date(now.getTime() + MANIFEST_TTL_MS).toISOString(),
+      created_at: now.toISOString(),
+      updated_at: now.toISOString()
+    });
+
+    const registrationBase = app.owner.type === "Organization"
+      ? `https://github.com/organizations/${encodeURIComponent(app.owner.login)}/settings/apps/new`
+      : GITHUB_REGISTRATION_URL;
+    return {
+      registrationUrl: `${registrationBase}?state=${encodeURIComponent(state)}`,
+      manifest,
+      browserNonce,
+      secureCookie: true
+    };
   }
 
-  async completeManifest(state: string, browserNonce: string, code: string): Promise<{ installUrl: string }> {
-    const flow = this.database.consumeGithubManifestFlow(hashToken(state), hashToken(browserNonce));
-    if (!flow) throw conflict("Die GitHub-App-Anmeldung ist abgelaufen oder ungültig", "GITHUB_MANIFEST_STATE_INVALID");
+  cancelManifest(state: string, browserNonce: string): void {
+    const stateHash = hashToken(state);
+    const browserNonceHash = hashToken(browserNonce);
+    this.database.consumeGithubManifestFlow(stateHash, browserNonceHash);
+    this.database.cancelGithubAppUpgradeManifestFlow(stateHash, browserNonceHash);
+  }
+
+  async completeManifest(state: string, browserNonce: string, code: string): Promise<{
+    installUrl: string;
+    setupBrowserNonce?: string;
+  }> {
+    const stateHash = hashToken(state);
+    const browserNonceHash = hashToken(browserNonce);
+    const flow = this.database.consumeGithubManifestFlow(stateHash, browserNonceHash);
+    if (!flow) {
+      return this.completeUpgradeManifest(stateHash, browserNonceHash, code);
+    }
     const setupState = this.decryptSecret("github.setup_state:v1", flow.encrypted_setup_state);
     const raw = await this.githubRequest<unknown>(`/app-manifests/${encodeURIComponent(code)}/conversions`, {
       method: "POST"
@@ -443,8 +570,12 @@ export class GitHubService {
       createdAt: new Date().toISOString()
     };
     this.database.sqlite.transaction(() => {
-      const previousAppId = this.metadata()?.appId;
-      if (previousAppId && previousAppId !== appId) this.database.disconnectGithubProjects();
+      if (this.hasStoredAppState() || this.database.listGithubProjectBindings().length > 0) {
+        throw conflict(
+          "Während der GitHub-App-Anmeldung wurde bereits eine App verbunden",
+          "GITHUB_ALREADY_CONFIGURED"
+        );
+      }
       this.database.setSetting(APP_METADATA_KEY, JSON.stringify(metadata));
       this.database.setSetting(PRIVATE_KEY_KEY, this.encryptSecret("github.private_key:v1", conversion.pem));
       this.database.setSetting(WEBHOOK_SECRET_KEY, this.encryptSecret("github.webhook_secret:v1", conversion.webhook_secret));
@@ -456,7 +587,21 @@ export class GitHubService {
     return { installUrl: `${appUrl}/installations/new` };
   }
 
-  async completeSetup(state: string, installationId: string): Promise<void> {
+  async completeSetup(
+    state: string,
+    installationId: string,
+    upgradeBrowserNonce?: string
+  ): Promise<"installed" | "upgraded"> {
+    if (upgradeBrowserNonce) {
+      const upgrade = this.database.getGithubAppUpgradeSetupFlow(
+        hashToken(state),
+        hashToken(upgradeBrowserNonce)
+      );
+      if (upgrade) {
+        await this.completeUpgradeSetup(upgrade, installationId);
+        return "upgraded";
+      }
+    }
     const expectedHash = this.database.getSetting(SETUP_STATE_HASH_KEY);
     if (!expectedHash || !this.safeEqualHex(expectedHash, hashToken(state))) {
       throw conflict("Die GitHub-Installation konnte nicht sicher zugeordnet werden", "GITHUB_SETUP_STATE_INVALID");
@@ -470,14 +615,258 @@ export class GitHubService {
       throw conflict("Die Installation gehört nicht zu dieser GitHub App", "GITHUB_INSTALLATION_MISMATCH");
     }
     this.invalidateInstallationTokens(String(installation.id));
+    return "installed";
+  }
+
+  private async completeUpgradeManifest(
+    stateHash: string,
+    browserNonceHash: string,
+    code: string
+  ): Promise<{ installUrl: string; setupBrowserNonce: string }> {
+    const flow = this.database.claimGithubAppUpgradeManifestFlow(stateHash, browserNonceHash);
+    if (!flow) {
+      throw conflict("Die GitHub-App-Anmeldung ist abgelaufen oder ungültig", "GITHUB_MANIFEST_STATE_INVALID");
+    }
+    let candidatePersisted = false;
+    try {
+      const current = this.requireMetadata();
+      if (current.appId !== flow.previous_app_id) {
+        throw conflict(
+          "Die aktive GitHub App hat sich während des Upgrades geändert",
+          "GITHUB_UPGRADE_STALE"
+        );
+      }
+      const raw = await this.githubRequest<unknown>(`/app-manifests/${encodeURIComponent(code)}/conversions`, {
+        method: "POST"
+      });
+      const conversion = this.parseUpstream(ManifestConversionSchema, raw);
+      const appUrl = this.validatedAppUrl(conversion.html_url, conversion.slug);
+      this.validatePrivateKey(conversion.pem);
+      const candidate: AppUpgradeCandidate = {
+        version: 1,
+        metadata: {
+          version: 1,
+          appId: String(conversion.id),
+          appName: conversion.name,
+          appSlug: conversion.slug,
+          appUrl,
+          createdAt: new Date().toISOString()
+        },
+        privateKey: conversion.pem,
+        webhookSecret: conversion.webhook_secret
+      };
+      const setupBrowserNonce = randomToken();
+      const encryptedCandidate = this.encryptSecret(
+        "github.upgrade_candidate:v1",
+        JSON.stringify(candidate)
+      );
+      const completed = this.database.completeGithubAppUpgradeManifestFlow(
+        flow.id,
+        candidate.metadata.appId,
+        encryptedCandidate,
+        hashToken(setupBrowserNonce),
+        new Date(Date.now() + UPGRADE_SETUP_TTL_MS).toISOString()
+      );
+      if (!completed) {
+        throw conflict(
+          "Der GitHub-App-Upgradezustand hat sich unerwartet geändert",
+          "GITHUB_UPGRADE_STALE"
+        );
+      }
+      candidatePersisted = true;
+      return {
+        installUrl: `${candidate.metadata.appUrl}/installations/new`,
+        setupBrowserNonce
+      };
+    } catch (error) {
+      // A manifest conversion code can only be exchanged once. Once GitHub has
+      // returned the candidate credentials and they have been encrypted, never
+      // discard them because a later GitHub API request failed. All remote
+      // identity/capability checks deliberately happen in completeUpgradeSetup.
+      if (!candidatePersisted) this.database.deleteGithubAppUpgradeFlow(flow.id);
+      throw error;
+    }
+  }
+
+  private async completeUpgradeSetup(flow: GithubAppUpgradeFlowRow, installationId: string): Promise<void> {
+    const current = this.requireMetadata();
+    if (current.appId !== flow.previous_app_id) {
+      throw conflict(
+        "Die aktive GitHub App hat sich während des Upgrades geändert",
+        "GITHUB_UPGRADE_STALE"
+      );
+    }
+    const candidate = this.upgradeCandidate(flow);
+    const candidateApp = this.parseUpstream(
+      AppCapabilitySchema,
+      await this.githubRequest<unknown>("/app", { appCredentials: candidate })
+    );
+    if (
+      candidateApp.slug !== candidate.metadata.appSlug
+      || candidateApp.owner.login !== flow.expected_owner_login
+      || candidateApp.owner.type !== flow.expected_owner_type
+    ) {
+      throw conflict(
+        "Die neue GitHub App gehört nicht zum erwarteten Account",
+        "GITHUB_UPGRADE_OWNER_MISMATCH"
+      );
+    }
+    this.requirePreviewCapabilities(candidateApp.permissions, candidateApp.events, "GITHUB_UPGRADE_APP_CAPABILITIES");
+
+    const normalizedInstallationId = this.installationId(installationId);
+    const candidateInstallation = this.parseUpstream(InstallationSchema, await this.githubRequest<unknown>(
+      `/app/installations/${normalizedInstallationId}`,
+      { appCredentials: candidate }
+    ));
+    if (String(candidateInstallation.app_id) !== candidate.metadata.appId) {
+      throw conflict(
+        "Die Installation gehört nicht zur neuen GitHub App",
+        "GITHUB_INSTALLATION_MISMATCH"
+      );
+    }
+    if (candidateInstallation.suspended_at) {
+      throw conflict(
+        "Die neue GitHub-Installation ist pausiert",
+        "GITHUB_UPGRADE_INSTALLATION_SUSPENDED"
+      );
+    }
+    this.requirePreviewCapabilities(
+      candidateInstallation.permissions,
+      candidateInstallation.events,
+      "GITHUB_UPGRADE_INSTALLATION_CAPABILITIES"
+    );
+
+    const bindings = this.database.listGithubProjectBindings();
+    const referencedInstallationIds = [...new Set(bindings.map((binding) => binding.installation_id))];
+    if (referencedInstallationIds.length > 1) {
+      throw conflict(
+        "Mehrere GitHub-Installationen können nicht automatisch ersetzt werden",
+        "GITHUB_UPGRADE_MULTIPLE_INSTALLATIONS"
+      );
+    }
+    const activeInstallations = await this.installations();
+    if (activeInstallations.length > 1) {
+      throw conflict(
+        "Mehrere GitHub-Installationen können nicht automatisch ersetzt werden",
+        "GITHUB_UPGRADE_MULTIPLE_INSTALLATIONS"
+      );
+    }
+    const previousInstallation = activeInstallations[0] ?? null;
+    if (
+      previousInstallation
+      && (
+        candidateInstallation.account.login !== previousInstallation.accountLogin
+        || candidateInstallation.account.type !== previousInstallation.accountType
+      )
+    ) {
+      throw conflict(
+        "Die neue GitHub-Installation gehört nicht zum bisherigen Installations-Account",
+        "GITHUB_UPGRADE_OWNER_MISMATCH"
+      );
+    }
+    if (
+      referencedInstallationIds.length === 1
+      && previousInstallation?.id !== referencedInstallationIds[0]
+    ) {
+      throw conflict(
+        "Die verknüpften Projekte gehören nicht zur bisherigen GitHub-Installation",
+        "GITHUB_UPGRADE_INSTALLATION_MISMATCH"
+      );
+    }
+
+    const tokenResponse = this.parseUpstream(InstallationTokenSchema, await this.githubRequest<unknown>(
+      `/app/installations/${normalizedInstallationId}/access_tokens`,
+      { method: "POST", appCredentials: candidate }
+    ));
+    const candidateRepositories: unknown[] = [];
+    for (let page = 1; page <= MAX_PAGES; page += 1) {
+      const response = this.parseUpstream(
+        z.object({ repositories: z.array(z.unknown()) }).passthrough(),
+        await this.githubRequest<unknown>(
+          `/installation/repositories?per_page=${PAGE_SIZE}&page=${page}`,
+          { token: tokenResponse.token }
+        )
+      );
+      candidateRepositories.push(...response.repositories);
+      if (response.repositories.length < PAGE_SIZE) break;
+    }
+    const accessibleRepositoryIds = new Set(candidateRepositories.map((repository) => (
+      String(this.parseUpstream(RepositorySchema, repository).id)
+    )));
+    const requiredRepositoryIds = previousInstallation
+      ? this.database.listGithubRepositoryIdsForInstallation(previousInstallation.id)
+      : [...new Set(bindings.map((binding) => binding.repository_id))];
+    const missingRepositoryIds = requiredRepositoryIds
+      .filter((repositoryId) => !accessibleRepositoryIds.has(repositoryId));
+    if (missingRepositoryIds.length > 0) {
+      throw conflict(
+        "Die neue GitHub-Installation hat noch nicht auf alle verknüpften Repositories Zugriff",
+        "GITHUB_UPGRADE_REPOSITORIES_MISSING"
+      );
+    }
+
+    const retiredAt = new Date();
+    const encryptedRetiredWebhookSecret = this.encryptSecret(
+      "github.retired_webhook_secret:v1",
+      this.secret(WEBHOOK_SECRET_KEY, "github.webhook_secret:v1")
+    );
+    this.database.sqlite.transaction(() => {
+      const latest = this.metadata();
+      if (!latest || latest.appId !== flow.previous_app_id) {
+        throw conflict(
+          "Die aktive GitHub App hat sich während des Upgrades geändert",
+          "GITHUB_UPGRADE_STALE"
+        );
+      }
+      this.database.remapGithubInstallation(
+        previousInstallation?.id ?? null,
+        normalizedInstallationId,
+        bindings
+      );
+      this.database.setSetting(APP_METADATA_KEY, JSON.stringify(candidate.metadata));
+      this.database.setSetting(
+        PRIVATE_KEY_KEY,
+        this.encryptSecret("github.private_key:v1", candidate.privateKey)
+      );
+      this.database.setSetting(
+        WEBHOOK_SECRET_KEY,
+        this.encryptSecret("github.webhook_secret:v1", candidate.webhookSecret)
+      );
+      if (previousInstallation) {
+        this.database.retargetGithubRetiredWebhookSources(
+          previousInstallation.id,
+          normalizedInstallationId
+        );
+      }
+      this.database.saveGithubRetiredWebhookSource({
+        app_id: current.appId,
+        encrypted_webhook_secret: encryptedRetiredWebhookSecret,
+        previous_installation_id: previousInstallation?.id ?? null,
+        successor_installation_id: normalizedInstallationId,
+        expires_at: new Date(retiredAt.getTime() + RETIRED_WEBHOOK_TTL_MS).toISOString(),
+        created_at: retiredAt.toISOString(),
+        updated_at: retiredAt.toISOString()
+      });
+      this.database.setSetting(SETUP_STATE_HASH_KEY, flow.setup_state_hash);
+      this.database.deleteGithubAppUpgradeFlow(flow.id);
+    })();
+    this.invalidateAllInstallationTokens();
   }
 
   async disconnect(): Promise<GitHubState> {
     this.database.sqlite.transaction(() => {
-      for (const key of [APP_METADATA_KEY, PRIVATE_KEY_KEY, WEBHOOK_SECRET_KEY, SETUP_STATE_HASH_KEY]) {
+      for (const key of [
+        APP_METADATA_KEY,
+        PRIVATE_KEY_KEY,
+        WEBHOOK_SECRET_KEY,
+        SETUP_STATE_HASH_KEY
+      ]) {
         this.database.deleteSetting(key);
       }
       this.database.deleteGithubManifestFlows();
+      this.database.deleteGithubAppUpgradeFlows();
+      this.database.deleteGithubRetiredWebhookSources();
+      this.database.deleteGithubWebhookDeliveries();
       this.database.disconnectGithubProjects();
     })();
     reconcileRouting(this.config, this.database);
@@ -485,7 +874,7 @@ export class GitHubService {
     return this.state();
   }
 
-  resultUrl(result: "connected" | "installed" | "error"): string {
+  resultUrl(result: "connected" | "installed" | "upgraded" | "upgrade_incomplete" | "error"): string {
     return `${this.panelOrigin()}/settings/github?github=${result}`;
   }
 
@@ -671,24 +1060,57 @@ export class GitHubService {
     });
   }
 
-  verifyWebhook(rawBody: Buffer, signatureHeader: string | undefined): void {
+  verifyWebhook(rawBody: Buffer, signatureHeader: string | undefined): GitHubWebhookSource {
+    this.cleanupExpiredUpgradeBuffers();
     if (!signatureHeader || !/^sha256=[a-f0-9]{64}$/i.test(signatureHeader)) {
       throw new HttpError(401, "GITHUB_SIGNATURE_INVALID", "Ungültige GitHub-Webhook-Signatur");
     }
-    const secret = this.secret(WEBHOOK_SECRET_KEY, "github.webhook_secret:v1");
-    const expected = createHmac("sha256", secret).update(rawBody).digest();
     const supplied = Buffer.from(signatureHeader.slice("sha256=".length), "hex");
-    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
-      throw new HttpError(401, "GITHUB_SIGNATURE_INVALID", "Ungültige GitHub-Webhook-Signatur");
+    const active = this.requireMetadata();
+    const candidates: Array<{ source: GitHubWebhookSource; secret: string }> = [{
+      source: { kind: "active", appId: active.appId },
+      secret: this.secret(WEBHOOK_SECRET_KEY, "github.webhook_secret:v1")
+    }];
+    const pending = this.database.getPendingGithubAppUpgradeFlow();
+    if (pending) {
+      try {
+        const candidate = this.upgradeCandidate(pending);
+        candidates.push({
+          source: { kind: "pending", appId: candidate.metadata.appId },
+          secret: candidate.webhookSecret
+        });
+      } catch {
+        // A damaged pending upgrade must not prevent the active app's webhook
+        // from being authenticated.
+      }
     }
+    for (const retired of this.retiredWebhookSources()) {
+      candidates.push({
+        source: {
+          kind: "retired",
+          appId: retired.appId,
+          previousInstallationId: retired.previousInstallationId,
+          successorInstallationId: retired.successorInstallationId
+        },
+        secret: retired.webhookSecret
+      });
+    }
+
+    for (const candidate of candidates) {
+      const expected = createHmac("sha256", candidate.secret).update(rawBody).digest();
+      if (supplied.length === expected.length && timingSafeEqual(supplied, expected)) {
+        return candidate.source;
+      }
+    }
+    throw new HttpError(401, "GITHUB_SIGNATURE_INVALID", "Ungültige GitHub-Webhook-Signatur");
   }
 
-  async handleWebhook(eventName: string, deliveryId: string, rawBody: Buffer): Promise<{
-    duplicate: boolean;
-    queued: number;
-    pending: number;
-    ignored: number;
-  }> {
+  async handleWebhook(
+    eventName: string,
+    deliveryId: string,
+    rawBody: Buffer,
+    source?: GitHubWebhookSource
+  ): Promise<GitHubWebhookResult> {
     if (!/^[A-Za-z0-9._-]{1,128}$/.test(deliveryId)) {
       throw new HttpError(400, "GITHUB_DELIVERY_INVALID", "Ungültige GitHub-Delivery-ID");
     }
@@ -702,36 +1124,86 @@ export class GitHubService {
       throw new HttpError(400, "GITHUB_PAYLOAD_INVALID", "GitHub-Webhook enthält kein gültiges JSON");
     }
     const payloadHash = createHash("sha256").update(rawBody).digest("hex");
+    let handledSourceKind: GitHubWebhookSource["kind"] | null = null;
     const accept = this.database.sqlite.transaction(() => {
-      const claimed = this.database.claimGithubWebhookDelivery(deliveryId, eventName, payloadHash);
+      const currentSource = this.currentWebhookSource(source);
+      if (!currentSource) {
+        return { duplicate: false, queued: 0, pending: 0, ignored: 1 };
+      }
+      handledSourceKind = currentSource.kind;
+      if (
+        currentSource.kind === "pending"
+        && (eventName === "push" || eventName === "pull_request")
+      ) {
+        this.validateBufferedWebhook(eventName, payload);
+        const buffered = this.database.bufferGithubWebhookDelivery(
+          currentSource.appId,
+          deliveryId,
+          eventName,
+          payloadHash,
+          rawBody,
+          {
+            maxCount: PENDING_WEBHOOK_MAX_COUNT,
+            maxBytes: PENDING_WEBHOOK_MAX_BYTES
+          }
+        );
+        if (buffered === "duplicate") {
+          return { duplicate: true, queued: 0, pending: 0, ignored: 0 };
+        }
+        if (buffered === "mismatch") {
+          throw conflict(
+            "GitHub-Delivery-ID wurde mit abweichendem Inhalt wiederverwendet",
+            "GITHUB_DELIVERY_MISMATCH"
+          );
+        }
+        if (buffered === "full") {
+          throw new HttpError(
+            503,
+            "GITHUB_WEBHOOK_BUFFER_FULL",
+            "Der GitHub-Webhook-Puffer ist ausgelastet; GitHub soll die Delivery erneut senden"
+          );
+        }
+        return { duplicate: false, queued: 0, pending: 1, ignored: 0 };
+      }
+      const claimed = this.database.claimGithubWebhookDelivery(
+        currentSource.appId,
+        deliveryId,
+        eventName,
+        payloadHash
+      );
       if (claimed === "duplicate") return { duplicate: true, queued: 0, pending: 0, ignored: 0 };
       if (claimed === "mismatch") {
         throw conflict("GitHub-Delivery-ID wurde mit abweichendem Inhalt wiederverwendet", "GITHUB_DELIVERY_MISMATCH");
       }
-      const result = eventName === "push"
-        ? this.acceptPush(deliveryId, payload)
-        : eventName === "pull_request"
-          ? this.acceptPullRequest(deliveryId, payload)
-        : eventName === "installation"
-          ? this.handleInstallation(payload)
-          : eventName === "installation_repositories"
-            ? this.handleInstallationRepositories(payload)
-            : { queued: 0, pending: 0, ignored: 1 };
+      const result = this.acceptWebhookPayload(eventName, deliveryId, payload, currentSource);
       const status = result.pending > 0 || result.queued > 0 ? "processed" : "ignored";
-      this.database.finishGithubWebhookDelivery(deliveryId, status);
+      this.database.finishGithubWebhookDelivery(currentSource.appId, deliveryId, status);
       return { duplicate: false, ...result };
     });
     const result = accept.immediate();
     // A close or GitHub-App/repository revocation must unpublish the route even
     // when the worker is offline. Reconcile duplicates as well: if the atomic
     // file replacement failed, GitHub's retry gets another safe attempt.
-    if (["pull_request", "installation", "installation_repositories"].includes(eventName)) {
+    if (
+      (eventName === "pull_request" && handledSourceKind !== "pending")
+      || (
+        handledSourceKind === "active"
+        && ["installation", "installation_repositories"].includes(eventName)
+      )
+    ) {
       reconcileRouting(this.config, this.database);
     }
     return result;
   }
 
   async processNextWebhookJob(): Promise<boolean> {
+    const buffered = this.processNextBufferedWebhook();
+    if (buffered) {
+      if (buffered.eventName === "pull_request") {
+        reconcileRouting(this.config, this.database);
+      }
+      return true;
+    }
     const dirty = this.database.claimNextGithubDirtyRef();
     if (!dirty) return false;
     try {
@@ -791,7 +1263,97 @@ export class GitHubService {
     return true;
   }
 
-  private acceptPush(deliveryId: string, rawPayload: unknown): {
+  private processNextBufferedWebhook(): { eventName: "push" | "pull_request" } | null {
+    const active = this.metadata();
+    if (!active) return null;
+    let attempted: GithubBufferedWebhookRow | undefined;
+    try {
+      const process = this.database.sqlite.transaction(() => {
+        const buffered = this.database.claimNextBufferedGithubWebhook(active.appId);
+        if (!buffered) return null;
+        attempted = buffered;
+        const currentSource = this.currentWebhookSource({
+          kind: "active",
+          appId: buffered.source_app_id
+        });
+        if (!currentSource || currentSource.kind !== "active") {
+          throw conflict(
+            "Die gepufferte GitHub-Delivery gehört nicht mehr zur aktiven App",
+            "GITHUB_WEBHOOK_SOURCE_STALE"
+          );
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(buffered.raw_body.toString("utf8"));
+        } catch {
+          throw new HttpError(400, "GITHUB_PAYLOAD_INVALID", "GitHub-Webhook enthält kein gültiges JSON");
+        }
+        const result = this.acceptWebhookPayload(
+          buffered.event_name,
+          buffered.delivery_id,
+          payload,
+          currentSource
+        );
+        const status = result.pending > 0 || result.queued > 0 ? "processed" : "ignored";
+        this.database.finishGithubWebhookDelivery(
+          buffered.source_app_id,
+          buffered.delivery_id,
+          status
+        );
+        return { eventName: buffered.event_name };
+      });
+      return process.immediate();
+    } catch (error) {
+      if (!attempted) throw error;
+      const code = error instanceof HttpError
+        ? error.code
+        : error instanceof Error
+          ? error.name
+          : "GITHUB_BUFFER_PROCESSING_FAILED";
+      // Claim, materialization and acknowledgement share one immediate
+      // transaction. A crash or exception rolls the claim back to "buffered".
+      // Repeated deterministic failures are quarantined after a bounded retry
+      // count so one damaged row cannot stop the worker forever.
+      const terminal = this.database.bufferedGithubWebhookAttempts(
+        attempted.source_app_id,
+        attempted.delivery_id
+      ) >= 2;
+      this.database.failGithubWebhookDelivery(
+        attempted.source_app_id,
+        attempted.delivery_id,
+        code,
+        terminal
+      );
+      return { eventName: attempted.event_name };
+    }
+  }
+
+  private validateBufferedWebhook(eventName: "push" | "pull_request", payload: unknown): void {
+    if (eventName === "push") PushSchema.parse(payload);
+    else PullRequestEventSchema.parse(payload);
+  }
+
+  private acceptWebhookPayload(
+    eventName: string,
+    deliveryId: string,
+    payload: unknown,
+    source: GitHubWebhookSource
+  ): Omit<GitHubWebhookResult, "duplicate"> {
+    if (eventName === "push") return this.acceptPush(deliveryId, payload, source);
+    if (eventName === "pull_request") {
+      return this.acceptPullRequest(deliveryId, payload, source);
+    }
+    if (source.kind !== "active") return { queued: 0, pending: 0, ignored: 1 };
+    if (eventName === "installation") return this.handleInstallation(payload);
+    if (eventName === "installation_repositories") return this.handleInstallationRepositories(payload);
+    return { queued: 0, pending: 0, ignored: 1 };
+  }
+
+  private acceptPush(
+    deliveryId: string,
+    rawPayload: unknown,
+    source: GitHubWebhookSource
+  ): {
     queued: number;
     pending: number;
     ignored: number;
@@ -802,8 +1364,13 @@ export class GitHubService {
     }
     const branch = payload.ref.slice("refs/heads/".length);
     if (!branch || branch.length > 255) return { queued: 0, pending: 0, ignored: 1 };
-    const installationId = String(payload.installation.id);
     const repositoryId = String(payload.repository.id);
+    const installationId = this.webhookInstallationId(
+      source,
+      String(payload.installation.id),
+      repositoryId
+    );
+    if (!installationId) return { queued: 0, pending: 0, ignored: 1 };
     const linked = this.database.listGithubProjects(installationId, repositoryId, branch);
     if (linked.length === 0) return { queued: 0, pending: 0, ignored: 1 };
     this.database.enqueueGithubDirtyRef({
@@ -816,14 +1383,23 @@ export class GitHubService {
     return { queued: 0, pending: linked.length, ignored: 0 };
   }
 
-  private acceptPullRequest(deliveryId: string, rawPayload: unknown): {
+  private acceptPullRequest(
+    deliveryId: string,
+    rawPayload: unknown,
+    source: GitHubWebhookSource
+  ): {
     queued: number;
     pending: number;
     ignored: number;
   } {
     const payload = PullRequestEventSchema.parse(rawPayload);
-    const installationId = String(payload.installation.id);
     const repositoryId = String(payload.repository.id);
+    const installationId = this.webhookInstallationId(
+      source,
+      String(payload.installation.id),
+      repositoryId
+    );
+    if (!installationId) return { queued: 0, pending: 0, ignored: 1 };
     const pullRequest = payload.pull_request;
 
     // GitHub's outer repository and PR base repository must describe the exact
@@ -833,20 +1409,33 @@ export class GitHubService {
       pullRequest.base.repo.full_name.toLowerCase() !== payload.repository.full_name.toLowerCase()
     ) return { queued: 0, pending: 0, ignored: 1 };
 
-    const projects = this.database.listGithubPreviewProjects(
+    const projects = this.database.listGithubPullRequestProjects(
       installationId,
-      repositoryId,
-      pullRequest.base.ref
+      repositoryId
     );
     if (projects.length === 0) return { queued: 0, pending: 0, ignored: 1 };
 
     if (payload.action === "closed") {
       let closed = 0;
+      let ignored = 0;
       for (const project of projects) {
+        const claimed = this.database.claimGithubPullRequestEventWatermark({
+          projectId: project.id,
+          repositoryId,
+          pullRequestNumber: pullRequest.number,
+          githubUpdatedAt: pullRequest.updated_at,
+          action: payload.action,
+          deliveryId
+        });
+        if (claimed === "ignored") {
+          ignored += 1;
+          continue;
+        }
         const preview = this.database.findPullRequestPreview(project.id, pullRequest.number);
         if (preview && this.database.requestPullRequestPreviewClose(project.id, preview.id)) closed += 1;
+        else ignored += 1;
       }
-      return { queued: 0, pending: closed, ignored: closed === 0 ? 1 : 0 };
+      return { queued: 0, pending: closed, ignored };
     }
 
     // A fork (including a deleted/null head repository) is untrusted. Shelter
@@ -862,11 +1451,28 @@ export class GitHubService {
     let pending = 0;
     let ignored = 0;
     for (const project of projects) {
-      const suffix = project.preview_domain_suffix;
-      if (!suffix) {
+      const claimed = this.database.claimGithubPullRequestEventWatermark({
+        projectId: project.id,
+        repositoryId,
+        pullRequestNumber: pullRequest.number,
+        githubUpdatedAt: pullRequest.updated_at,
+        action: payload.action,
+        deliveryId
+      });
+      if (claimed === "ignored") {
         ignored += 1;
         continue;
       }
+      if (
+        project.repository_branch !== pullRequest.base.ref
+        || project.preview_deployments_enabled !== 1
+        || !project.preview_domain_suffix
+        || project.github_connection_error
+      ) {
+        ignored += 1;
+        continue;
+      }
+      const suffix = project.preview_domain_suffix;
       const hostname = pullRequestPreviewHostname(pullRequest.number, project.slug, suffix);
       const result = this.database.queuePullRequestPreview({
         projectId: project.id,
@@ -1042,11 +1648,13 @@ export class GitHubService {
 
   private async githubRequest<T>(endpoint: string, options: GithubFetchOptions = {}): Promise<T> {
     if (!endpoint.startsWith("/")) throw new Error("GitHub endpoint must be relative");
-    const authorization = options.appAuthentication
-      ? `Bearer ${this.appJwt()}`
-      : options.token
-        ? `Bearer ${options.token}`
-        : undefined;
+    const authorization = options.appCredentials
+      ? `Bearer ${this.appJwt(options.appCredentials)}`
+      : options.appAuthentication
+        ? `Bearer ${this.appJwt()}`
+        : options.token
+          ? `Bearer ${options.token}`
+          : undefined;
     let response: Response;
     try {
       response = await this.fetcher(`${GITHUB_API}${endpoint}`, {
@@ -1083,9 +1691,9 @@ export class GitHubService {
     return data as T;
   }
 
-  private appJwt(): string {
-    const metadata = this.requireMetadata();
-    const privateKey = this.secret(PRIVATE_KEY_KEY, "github.private_key:v1");
+  private appJwt(credentials?: Pick<AppUpgradeCandidate, "metadata" | "privateKey">): string {
+    const metadata = credentials?.metadata ?? this.requireMetadata();
+    const privateKey = credentials?.privateKey ?? this.secret(PRIVATE_KEY_KEY, "github.private_key:v1");
     const now = Math.floor(Date.now() / 1000);
     const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
     const payload = Buffer.from(JSON.stringify({ iat: now - 60, exp: now + 9 * 60, iss: metadata.appId })).toString("base64url");
@@ -1100,6 +1708,183 @@ export class GitHubService {
       throw upstreamError("GitHub hat eine unerwartete API-Antwort geliefert", "GITHUB_API_INVALID");
     }
     return parsed.data;
+  }
+
+  private manifest(
+    origin: string,
+    callbackUrl: string,
+    setupState: string,
+    name: string
+  ): GitHubManifest {
+    return {
+      name,
+      url: origin,
+      hook_attributes: { url: `${origin}/api/webhooks/github`, active: true },
+      redirect_url: callbackUrl,
+      setup_url: `${origin}${GITHUB_SETUP_CALLBACK_PATH}?state=${encodeURIComponent(setupState)}`,
+      public: false,
+      request_oauth_on_install: false,
+      setup_on_update: true,
+      default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
+      // GitHub Apps always receive installation and installation_repositories.
+      // GitHub rejects manifests that try to subscribe to those implicit events.
+      default_events: ["push", "pull_request"]
+    };
+  }
+
+  private requirePreviewCapabilities(
+    permissions: Record<string, string>,
+    events: string[],
+    code: string
+  ): void {
+    const requiredPermissions = {
+      contents: "read",
+      metadata: "read",
+      pull_requests: "read",
+      statuses: "write"
+    } as const;
+    const activePermissions = Object.entries(permissions)
+      .filter(([, permission]) => permission !== "none");
+    const exactPermissions = activePermissions.length === Object.keys(requiredPermissions).length
+      && Object.entries(requiredPermissions).every(
+        ([name, permission]) => permissions[name] === permission
+      );
+    const eventSet = new Set(events);
+    const exactEvents = events.length === 2
+      && eventSet.size === 2
+      && eventSet.has("push")
+      && eventSet.has("pull_request");
+    if (
+      !exactPermissions
+      || !exactEvents
+    ) {
+      throw conflict(
+        "Die neue GitHub App muss exakt die von Shelter angeforderten Berechtigungen und Events enthalten",
+        code
+      );
+    }
+  }
+
+  private upgradeCandidate(flow: GithubAppUpgradeFlowRow): AppUpgradeCandidate {
+    if (!flow.encrypted_candidate) {
+      throw conflict(
+        "Die neue GitHub App wurde noch nicht vollständig registriert",
+        "GITHUB_UPGRADE_CANDIDATE_MISSING"
+      );
+    }
+    try {
+      const candidate = AppUpgradeCandidateSchema.parse(JSON.parse(
+        this.decryptSecret("github.upgrade_candidate:v1", flow.encrypted_candidate)
+      ));
+      this.validatePrivateKey(candidate.privateKey);
+      return candidate;
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(
+        503,
+        "GITHUB_UPGRADE_CANDIDATE_INVALID",
+        "Die zwischengespeicherte GitHub App ist beschädigt"
+      );
+    }
+  }
+
+  private pendingUpgrade(): Pick<
+    GitHubPreviewCapability,
+    "upgradePending" | "upgradeInstallUrl" | "upgradeExpiresAt"
+  > {
+    const flow = this.database.getPendingGithubAppUpgradeFlow();
+    if (!flow) {
+      return {
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null
+      };
+    }
+    const candidate = this.upgradeCandidate(flow);
+    return {
+      upgradePending: true,
+      upgradeInstallUrl: `${candidate.metadata.appUrl}/installations/new`,
+      upgradeExpiresAt: flow.expires_at
+    };
+  }
+
+  private cleanupExpiredUpgradeBuffers(): void {
+    for (const flow of this.database.listExpiredGithubAppUpgradeFlows()) {
+      // The database trigger owns candidate buffer cleanup. It also covers
+      // session cascades caused by logout, password rotation and startup prune.
+      this.database.deleteGithubAppUpgradeFlow(flow.id);
+    }
+  }
+
+  private retiredWebhookSources(): RetiredWebhookSource[] {
+    const sources: RetiredWebhookSource[] = [];
+    for (const row of this.database.listGithubRetiredWebhookSources()) {
+      try {
+        sources.push({
+          appId: row.app_id,
+          webhookSecret: this.decryptSecret(
+            "github.retired_webhook_secret:v1",
+            row.encrypted_webhook_secret
+          ),
+          previousInstallationId: row.previous_installation_id,
+          successorInstallationId: row.successor_installation_id,
+          expiresAt: row.expires_at
+        });
+      } catch {
+        // A corrupt grace-period credential must never block the active app.
+      }
+    }
+    return sources;
+  }
+
+  private webhookInstallationId(
+    source: GitHubWebhookSource,
+    payloadInstallationId: string,
+    repositoryId: string
+  ): string | null {
+    if (source.kind === "active") return payloadInstallationId;
+    if (source.kind !== "retired") return null;
+    const currentInstallationId = this.database.currentGithubInstallationIdForRepository(repositoryId);
+    if (
+      !source.previousInstallationId
+      || source.previousInstallationId !== payloadInstallationId
+      || !source.successorInstallationId
+      || source.successorInstallationId !== currentInstallationId
+    ) return null;
+    return currentInstallationId;
+  }
+
+  private currentWebhookSource(source?: GitHubWebhookSource): GitHubWebhookSource | null {
+    const active = this.metadata();
+    if (!source) {
+      // Direct service callers (workers/tests) predate signature-source
+      // routing. HTTP webhook requests always pass the verified source.
+      return { kind: "active", appId: active?.appId ?? "direct" };
+    }
+    if (active?.appId === source.appId) {
+      return { kind: "active", appId: source.appId };
+    }
+    const pending = this.database.getPendingGithubAppUpgradeFlow();
+    if (pending) {
+      try {
+        const candidate = this.upgradeCandidate(pending);
+        if (candidate.metadata.appId === source.appId) {
+          return { kind: "pending", appId: source.appId };
+        }
+      } catch {
+        // A corrupt candidate cannot be trusted as a current webhook source.
+      }
+    }
+    const retired = this.database.getGithubRetiredWebhookSource(source.appId);
+    if (retired) {
+      return {
+        kind: "retired",
+        appId: source.appId,
+        previousInstallationId: retired.previous_installation_id,
+        successorInstallationId: retired.successor_installation_id
+      };
+    }
+    return null;
   }
 
   private metadata(): AppMetadata | null {
@@ -1122,6 +1907,14 @@ export class GitHubService {
 
   private hasStoredSecrets(): boolean {
     return Boolean(this.database.getSetting(PRIVATE_KEY_KEY) && this.database.getSetting(WEBHOOK_SECRET_KEY));
+  }
+
+  private hasStoredAppState(): boolean {
+    return Boolean(
+      this.database.getSetting(APP_METADATA_KEY)
+      || this.database.getSetting(PRIVATE_KEY_KEY)
+      || this.database.getSetting(WEBHOOK_SECRET_KEY)
+    );
   }
 
   private panelOrigin(): string {

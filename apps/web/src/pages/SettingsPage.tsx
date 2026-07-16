@@ -43,7 +43,13 @@ import { NavigationGuard } from '../components/NavigationGuard';
 import { GitHubIcon } from '../components/GitHubIcon';
 import { GitHubPreviewCapabilityNotice } from '../components/GitHubPreviewCapabilityNotice';
 import { CloudflareAccessProtectionCard } from '../components/CloudflareAccessProtectionCard';
-import { trustedGitHubAppUrl, trustedGitHubManifestRegistrationUrl } from '../utils/github';
+import {
+  githubPreviewCapabilityStatus,
+  shouldRefetchGitHubPreviewCapability,
+  trustedGitHubAppUrl,
+} from '../utils/github';
+import { githubCallbackNotice } from '../utils/github-callback';
+import { submitGitHubManifest } from '../utils/github-manifest';
 import { currentLocale, localize, useI18n } from '@/i18n';
 import type { CloudflareSettings } from '../types';
 
@@ -128,25 +134,6 @@ function formatExpiry(value?: string | null) {
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
-}
-
-function submitGitHubManifest(registrationUrl: string, manifest: string | Record<string, unknown>) {
-  const target = trustedGitHubManifestRegistrationUrl(registrationUrl);
-  if (!target) {
-    throw new Error(localize('GitHub returned an invalid registration URL.', 'GitHub hat eine ungültige Registrierungsadresse zurückgegeben.'));
-  }
-
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = target;
-  form.hidden = true;
-  const input = document.createElement('input');
-  input.type = 'hidden';
-  input.name = 'manifest';
-  input.value = typeof manifest === 'string' ? manifest : JSON.stringify(manifest);
-  form.append(input);
-  document.body.append(form);
-  form.submit();
 }
 
 function SectionHeading({
@@ -242,8 +229,12 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     queryFn: api.github,
     enabled: section === 'github',
     retry: false,
-    refetchOnWindowFocus: (query) => query.state.data?.previewCapability?.ready === false ? 'always' : false,
-    refetchOnReconnect: (query) => query.state.data?.previewCapability?.ready === false ? 'always' : false,
+    refetchOnWindowFocus: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data?.previewCapability) ? 'always' : false
+    ),
+    refetchOnReconnect: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data?.previewCapability) ? 'always' : false
+    ),
   });
   const registerGitHub = useMutation({
     mutationFn: api.startGitHubManifest,
@@ -330,17 +321,11 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     const callbackStatus = params.get('github');
     if (!callbackStatus) return;
 
-    if (callbackStatus === 'connected' || callbackStatus === 'registered' || callbackStatus === 'installed') {
-      toast.success(callbackStatus === 'installed' ? t('GitHub installation connected', 'GitHub-Installation verbunden') : t('GitHub App connected', 'GitHub App verbunden'), {
-        description: t('Repositories can now be selected directly in Shelter.', 'Repositories können jetzt direkt in Shelter ausgewählt werden.'),
-        id: 'github-callback',
-      });
-    } else {
-      toast.error(t('GitHub could not be connected', 'GitHub konnte nicht verbunden werden'), {
-        description: params.get('message') ?? t('Setup was cancelled or rejected by GitHub.', 'Die Einrichtung wurde abgebrochen oder von GitHub abgelehnt.'),
-        id: 'github-callback',
-      });
-    }
+    const callbackNotice = githubCallbackNotice(callbackStatus, params.get('message'), t);
+    const callbackOptions = { description: callbackNotice.description, id: 'github-callback' };
+    if (callbackNotice.tone === 'success') toast.success(callbackNotice.title, callbackOptions);
+    else if (callbackNotice.tone === 'warning') toast.warning(callbackNotice.title, callbackOptions);
+    else toast.error(callbackNotice.title, callbackOptions);
 
     ['github', 'github_error', 'error', 'error_description', 'message', 'reason'].forEach((key) => params.delete(key));
     const remainingQuery = params.toString();
@@ -679,11 +664,7 @@ export function SettingsPage({ section }: { section: SettingsSection }) {
     const connected = Boolean(github?.connected && installations.length > 0);
     const githubAppUrl = trustedGitHubAppUrl(github?.appUrl);
     const githubInstallUrl = trustedGitHubAppUrl(github?.installUrl);
-    const previewCapabilityStatus = github?.previewCapability?.ready === true
-      ? 'ready'
-      : github?.previewCapability?.ready === false
-        ? 'update'
-        : 'unavailable';
+    const previewCapabilityStatus = githubPreviewCapabilityStatus(github?.previewCapability);
     const previewCapabilityNeedsUpdate = previewCapabilityStatus === 'update';
 
     return (

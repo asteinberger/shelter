@@ -6,11 +6,23 @@ import {
   GITHUB_MANIFEST_CALLBACK_PATH,
   GITHUB_MANIFEST_COOKIE,
   GITHUB_SETUP_CALLBACK_PATH,
+  GITHUB_UPGRADE_SETUP_COOKIE,
   LEGACY_GITHUB_MANIFEST_COOKIE,
   type GitHubService
 } from "../services/github.js";
 
 const NumericId = z.string().regex(/^\d{1,20}$/);
+const RECOVERABLE_GITHUB_UPGRADE_ERRORS = new Set([
+  "GITHUB_UPGRADE_APP_CAPABILITIES",
+  "GITHUB_UPGRADE_INSTALLATION_CAPABILITIES",
+  "GITHUB_UPGRADE_REPOSITORIES_MISSING",
+  "GITHUB_UPGRADE_INSTALLATION_SUSPENDED",
+  "GITHUB_UPGRADE_MULTIPLE_INSTALLATIONS",
+  "GITHUB_UPGRADE_BINDINGS_CHANGED",
+  "GITHUB_UPGRADE_INSTALLATION_MISMATCH",
+  "GITHUB_UNREACHABLE",
+  "GITHUB_API"
+]);
 const AnalysisBranch = z.string().trim().min(1).max(160).refine((branch) => (
   !branch.startsWith("-")
   && !branch.startsWith("/")
@@ -39,6 +51,12 @@ function manifestCookie(request: Pick<FastifyRequest, "headers" | "cookies">): s
     : request.cookies[LEGACY_GITHUB_MANIFEST_COOKIE];
 }
 
+function upgradeSetupCookie(request: Pick<FastifyRequest, "headers" | "cookies">): string | undefined {
+  return cookieOccurrences(request.headers.cookie ?? "", GITHUB_UPGRADE_SETUP_COOKIE) === 1
+    ? request.cookies[GITHUB_UPGRADE_SETUP_COOKIE]
+    : undefined;
+}
+
 function callbackHeaders(reply: { header(name: string, value: string): unknown }): void {
   reply.header("cache-control", "no-store");
   reply.header("pragma", "no-cache");
@@ -63,7 +81,10 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
           installationPullRequestEvent: null,
           installationSuspended: null,
           remediation: "configure_app",
-          remediationUrl: null
+          remediationUrl: null,
+          upgradePending: false,
+          upgradeInstallUrl: null,
+          upgradeExpiresAt: null
         },
         error: null
       }
@@ -125,6 +146,30 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
     return { registrationUrl: started.registrationUrl, manifest: started.manifest };
   });
 
+  app.post("/api/settings/github/manifest/upgrade/start", {
+    preHandler: requireSessionMutationAuth,
+    config: { rateLimit: { max: 5, timeWindow: "10 minutes" } }
+  }, async (request, reply) => {
+    if (request.body !== undefined && request.body !== null) {
+      throw new HttpError(400, "UNEXPECTED_BODY", "Diese Anfrage akzeptiert keinen Body");
+    }
+    const authentication = sessionAuthentication(request);
+    const started = await github.startUpgradeManifest(
+      authentication.user.id,
+      authentication.sessionTokenHash
+    );
+    reply.setCookie(GITHUB_MANIFEST_COOKIE, started.browserNonce, {
+      path: GITHUB_MANIFEST_CALLBACK_PATH,
+      httpOnly: true,
+      secure: started.secureCookie,
+      sameSite: "lax",
+      maxAge: 10 * 60
+    });
+    reply.clearCookie(LEGACY_GITHUB_MANIFEST_COOKIE, { path: GITHUB_MANIFEST_CALLBACK_PATH });
+    reply.header("cache-control", "no-store");
+    return { registrationUrl: started.registrationUrl, manifest: started.manifest };
+  });
+
   app.get(GITHUB_MANIFEST_CALLBACK_PATH, {
     logLevel: "silent",
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
@@ -155,6 +200,15 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
       const code = codes[0]!;
       if (code.length < 1 || code.length > 4096) return fail();
       const completed = await github.completeManifest(states[0]!, browserNonce, code);
+      if (completed.setupBrowserNonce) {
+        reply.setCookie(GITHUB_UPGRADE_SETUP_COOKIE, completed.setupBrowserNonce, {
+          path: GITHUB_SETUP_CALLBACK_PATH,
+          httpOnly: true,
+          secure: true,
+          sameSite: "lax",
+          maxAge: 60 * 60
+        });
+      }
       return reply.redirect(completed.installUrl, 303);
     } catch (error) {
       app.log.warn({
@@ -174,6 +228,7 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
   }, async (request, reply) => {
     callbackHeaders(reply);
     const fail = (): ReturnType<typeof reply.redirect> => reply.redirect(github.resultUrl("error"), 303);
+    const upgradeBrowserNonce = upgradeSetupCookie(request);
     try {
       const states = queryValues(request.raw.url, "state");
       const installations = queryValues(request.raw.url, "installation_id");
@@ -183,12 +238,26 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
         installations.length !== 1 || !/^\d{1,20}$/.test(installations[0]!) ||
         actions.length > 1 || (actions.length === 1 && !["install", "update"].includes(actions[0]!))
       ) return fail();
-      await github.completeSetup(states[0]!, installations[0]!);
-      return reply.redirect(github.resultUrl("installed"), 303);
+      const result = await github.completeSetup(
+        states[0]!,
+        installations[0]!,
+        upgradeBrowserNonce
+      );
+      if (result === "upgraded") {
+        reply.clearCookie(GITHUB_UPGRADE_SETUP_COOKIE, { path: GITHUB_SETUP_CALLBACK_PATH });
+      }
+      return reply.redirect(github.resultUrl(result), 303);
     } catch (error) {
       app.log.warn({
         githubError: error instanceof Error ? { name: error.name, message: error.message } : { name: "UnknownError" }
       }, "GitHub App setup callback failed");
+      if (
+        upgradeBrowserNonce
+        && error instanceof HttpError
+        && RECOVERABLE_GITHUB_UPGRADE_ERRORS.has(error.code)
+      ) {
+        return reply.redirect(github.resultUrl("upgrade_incomplete"), 303);
+      }
       return fail();
     }
   });
@@ -254,11 +323,14 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
       const signature = request.headers["x-hub-signature-256"];
       const eventName = request.headers["x-github-event"];
       const deliveryId = request.headers["x-github-delivery"];
-      github.verifyWebhook(request.body, typeof signature === "string" ? signature : undefined);
+      const source = github.verifyWebhook(
+        request.body,
+        typeof signature === "string" ? signature : undefined
+      );
       if (typeof eventName !== "string" || typeof deliveryId !== "string") {
         throw new HttpError(400, "GITHUB_HEADERS_REQUIRED", "GitHub-Webhook-Header fehlen");
       }
-      const result = await github.handleWebhook(eventName, deliveryId, request.body);
+      const result = await github.handleWebhook(eventName, deliveryId, request.body, source);
       return reply.code(202).send({ ok: true, ...result });
     });
   });

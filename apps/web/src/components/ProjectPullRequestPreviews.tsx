@@ -25,6 +25,7 @@ import type {
   PullRequestPreviewStatus,
 } from '../types';
 import { formatDate, formatRelative } from '../utils/format';
+import { shouldRefetchGitHubPreviewCapability } from '../utils/github';
 import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
 import { Button, ErrorState, Field, SelectField, Skeleton, StatusBadge } from './ui';
@@ -302,8 +303,12 @@ export function ProjectPullRequestPreviews({
     retry: false,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
-    refetchOnWindowFocus: (query) => query.state.data?.ready === false ? 'always' : false,
-    refetchOnReconnect: (query) => query.state.data?.ready === false ? 'always' : false,
+    refetchOnWindowFocus: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data) ? 'always' : false
+    ),
+    refetchOnReconnect: (query) => (
+      shouldRefetchGitHubPreviewCapability(query.state.data) ? 'always' : false
+    ),
   });
   const data = previewsQuery.data;
   const capability = capabilityQuery.data;

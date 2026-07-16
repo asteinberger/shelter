@@ -1,8 +1,10 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../i18n';
 import type { PullRequestPreview } from '../types';
+import { GitHubAppUpgradeImpact } from './GitHubPreviewCapabilityNotice';
 import {
   isTransitionalPullRequestPreview,
   previewEnvironmentValidation,
@@ -23,7 +25,17 @@ function setLocale(locale: 'en' | 'de') {
 
 function render(node: React.ReactNode, locale: 'en' | 'de' = 'en') {
   setLocale(locale);
-  return renderToStaticMarkup(<I18nProvider><MemoryRouter>{node}</MemoryRouter></I18nProvider>);
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  return renderToStaticMarkup(
+    <QueryClientProvider client={queryClient}>
+      <I18nProvider><MemoryRouter>{node}</MemoryRouter></I18nProvider>
+    </QueryClientProvider>,
+  );
 }
 
 function preview(overrides: Partial<PullRequestPreview> = {}): PullRequestPreview {
@@ -144,7 +156,7 @@ describe('PullRequestPreviewList', () => {
 describe('PreviewCapability', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('guides the app owner through the first reauthorization step', () => {
+  it('offers a preconfigured replacement without pretending that GitHub can update the existing App', () => {
     const html = render(<PreviewCapability
       capability={{
         ready: false,
@@ -153,15 +165,123 @@ describe('PreviewCapability', () => {
         pullRequestEvent: false,
         remediation: 'update_existing_app',
         remediationUrl: 'https://github.com/organizations/shelter/settings/apps/shelter-host/permissions',
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null,
       }}
       onRetry={() => undefined}
     />);
-    expect(html).toContain('Step 1 of 2');
-    expect(html).toContain('GitHub access needs an update');
-    expect(html).toContain('Update GitHub App');
+    expect(html).toContain('Preconfigured permissions upgrade');
+    expect(html).toContain('GitHub App upgrade required');
+    expect(html).toContain('Create preconfigured replacement');
+    expect(html).toContain('Update current App manually');
+    expect(html).toContain('GitHub manifests cannot modify the connected App');
     expect(html).toContain('href="https://github.com/organizations/shelter/settings/apps/shelter-host/permissions"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('Missing:');
+    expect(html).not.toContain('Step 1 of 2');
+  });
+
+  it('resumes a pending replacement installation without starting another manifest flow', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: false,
+        configured: true,
+        pullRequestsPermission: false,
+        pullRequestEvent: false,
+        remediation: 'update_existing_app',
+        remediationUrl: 'https://github.com/organizations/shelter/settings/apps/shelter-host/permissions',
+        upgradePending: true,
+        upgradeInstallUrl: 'https://github.com/apps/shelter-host-replacement/installations/new',
+        upgradeExpiresAt: '2026-07-16T18:30:00.000Z',
+      }}
+      onRetry={() => undefined}
+    />);
+    expect(html).toContain('Replacement setup in progress');
+    expect(html).toContain('Replacement GitHub App ready to install');
+    expect(html).toContain('Continue replacement setup');
+    expect(html).toContain('href="https://github.com/apps/shelter-host-replacement/installations/new"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('current GitHub App remains active');
+    expect(html).toContain('replacement setup expires');
+    expect(html).not.toContain('Create preconfigured replacement');
+    expect(html).not.toContain('Update current App manually');
+  });
+
+  it('keeps a pending replacement visible when the active GitHub App is already ready', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: true,
+        configured: true,
+        pullRequestsPermission: true,
+        pullRequestEvent: true,
+        remediation: 'none',
+        remediationUrl: null,
+        upgradePending: true,
+        upgradeInstallUrl: 'https://github.com/apps/shelter-host-replacement/installations/new',
+        upgradeExpiresAt: null,
+      }}
+      onRetry={() => undefined}
+    />);
+    expect(html).toContain('Replacement setup in progress');
+    expect(html).toContain('Continue replacement setup');
+    expect(html).toContain('current GitHub App remains active');
+    expect(html).not.toContain('Pull requests can be read and the pull_request webhook is active');
+  });
+
+  it('prioritizes a pending replacement over installation approval for the active App', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: false,
+        configured: true,
+        pullRequestsPermission: true,
+        pullRequestEvent: true,
+        installationChecked: true,
+        installationPullRequestsPermission: false,
+        installationPullRequestEvent: false,
+        installationSuspended: false,
+        remediation: 'approve_installation_update',
+        remediationUrl: 'https://github.com/organizations/shelter/settings/installations/123',
+        upgradePending: true,
+        upgradeInstallUrl: 'https://github.com/apps/shelter-host-replacement/installations/new',
+        upgradeExpiresAt: null,
+      }}
+      onRetry={() => undefined}
+    />);
+    expect(html).toContain('Replacement setup in progress');
+    expect(html).toContain('Continue replacement setup');
+    expect(html).not.toContain('Approve the updated GitHub access');
+    expect(html).not.toContain('Approve on GitHub');
+  });
+
+  it('does not expose or restart a pending replacement when its installation URL is untrusted', () => {
+    const html = render(<PreviewCapability
+      capability={{
+        ready: false,
+        configured: true,
+        pullRequestsPermission: false,
+        pullRequestEvent: false,
+        remediation: 'update_existing_app',
+        remediationUrl: 'https://github.com/settings/apps/shelter-host/permissions',
+        upgradePending: true,
+        upgradeInstallUrl: 'https://github.com.evil.test/apps/shelter-host/installations/new',
+        upgradeExpiresAt: null,
+      }}
+      onRetry={() => undefined}
+    />);
+    expect(html).toContain('Replacement installation unavailable');
+    expect(html).not.toContain('github.com.evil.test');
+    expect(html).not.toContain('Create preconfigured replacement');
+    expect(html).not.toContain('Update current App manually');
+  });
+
+  it('explains the atomic migration and the repository selection requirement before replacement', () => {
+    const html = render(<GitHubAppUpgradeImpact />);
+    expect(html).toContain('Read repository contents and pull requests');
+    expect(html).toContain('same accounts and repositories');
+    expect(html).toContain('preserves existing project connections, auto-deploy, and previews');
+    expect(html).toContain('keeps the current GitHub App active');
+    expect(html).toContain('Production deployments stay online');
   });
 
   it('guides the installation owner through the second reauthorization step', () => {
@@ -177,6 +297,9 @@ describe('PreviewCapability', () => {
         installationSuspended: false,
         remediation: 'approve_installation_update',
         remediationUrl: 'https://github.com/organizations/shelter/settings/installations/123',
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null,
       }}
       onRetry={() => undefined}
     />);
@@ -189,7 +312,7 @@ describe('PreviewCapability', () => {
     expect(html).toContain('Missing:');
   });
 
-  it('falls back to internal GitHub settings when the remediation URL is not trusted', () => {
+  it('hides an untrusted manual-update URL while keeping the safe replacement action', () => {
     const html = render(<PreviewCapability
       capability={{
         ready: false,
@@ -198,10 +321,14 @@ describe('PreviewCapability', () => {
         pullRequestEvent: false,
         remediation: 'update_existing_app',
         remediationUrl: 'https://github.example.com/settings/apps/shelter/permissions',
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null,
       }}
       onRetry={() => undefined}
     />);
-    expect(html).toContain('href="/settings/github"');
+    expect(html).toContain('Create preconfigured replacement');
+    expect(html).not.toContain('Update current App manually');
     expect(html).not.toContain('github.example.com');
   });
 });

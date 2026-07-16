@@ -215,6 +215,28 @@ describe('github api', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/settings/github', expect.objectContaining({ credentials: 'include' }));
   });
 
+  it('starts the explicit preconfigured GitHub App upgrade flow', async () => {
+    const result = {
+      registrationUrl: 'https://github.com/settings/apps/new?state=abcdefghijklmnop',
+      manifest: {
+        default_permissions: { contents: 'read', statuses: 'write', metadata: 'read', pull_requests: 'read' },
+        default_events: ['push', 'pull_request'],
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(result));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.startGitHubUpgradeManifest()).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/settings/github/manifest/upgrade/start',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+      }),
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty('body');
+  });
+
   it('creates a project from a GitHub App repository', async () => {
     const input = {
       name: 'Website',
@@ -357,6 +379,9 @@ describe('pull request preview api', () => {
         pullRequestEvent: true,
         remediation: 'none',
         remediationUrl: null,
+        upgradePending: false,
+        upgradeInstallUrl: null,
+        upgradeExpiresAt: null,
       } }))
       .mockResolvedValueOnce(Response.json({
         settings: { enabled: false, domainId: null, domainSuffix: null, ttlHours: 72, maxActive: 3, inheritsProductionEnvironment: false },
@@ -371,6 +396,9 @@ describe('pull request preview api', () => {
           installationSuspended: false,
           remediation: 'none',
           remediationUrl: null,
+          upgradePending: false,
+          upgradeInstallUrl: null,
+          upgradeExpiresAt: null,
         },
         environmentKeys: [],
         previews: [],
