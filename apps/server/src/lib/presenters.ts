@@ -89,7 +89,11 @@ export function presentProject(
       id: domain.id,
       hostname: domain.hostname,
       status: domain.status,
-      error: domain.error
+      error: domain.error,
+      passwordProtectionEnabled: domain.password_protection_enabled === 1,
+      passwordConfigured: Boolean(domain.password_hash),
+      accessSessionTtlHours: domain.access_session_ttl_hours ?? 168,
+      seoIndexing: domain.password_protection_enabled === 1 ? false : domain.seo_indexing === 1
     }));
   }
   if (deployments) {

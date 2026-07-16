@@ -5,7 +5,7 @@ import type { AppConfig } from "../config.js";
 import type { Database } from "../lib/database.js";
 import { presentDeployment, presentProject } from "../lib/presenters.js";
 import { badRequest, conflict, HttpError, notFound } from "../lib/errors.js";
-import { decryptString, encryptString, newId, normalizeHostname, toSlug, validEnvironmentKey } from "../lib/security.js";
+import { decryptString, encryptString, hashPassword, newId, normalizeHostname, toSlug, validEnvironmentKey } from "../lib/security.js";
 import { isValidStaticBasePath, STATIC_BASE_PATH_ERROR } from "../lib/static-base-path.js";
 import type { DeploymentRow, ProjectRow } from "../types/models.js";
 import { requireScopedAuth, requireScopedMutation, requireSessionMutationAuth } from "../services/auth.js";
@@ -925,6 +925,66 @@ export function registerProjectRoutes(
     reconcileRouting(config, database);
     return { ok: true };
   });
+
+  app.put<{ Params: { id: string; domainId: string }; Body: unknown }>(
+    "/api/projects/:id/domains/:domainId/access",
+    { preHandler: requireScopedMutation("domains:write") },
+    async (request, reply) => {
+      mutableProject(database, request.params.id);
+      const domain = database.getDomain(request.params.domainId);
+      if (!domain || domain.project_id !== request.params.id) {
+        return reply.code(404).send({ error: "Domain nicht gefunden", code: "NOT_FOUND" });
+      }
+      if (domain.status !== "active") {
+        throw conflict("Die Domain muss aktiv sein, bevor der Zugriff konfiguriert wird", "DOMAIN_NOT_ACTIVE");
+      }
+      const input = z.object({
+        passwordProtectionEnabled: z.boolean(),
+        password: z.string().min(8).max(256).optional(),
+        accessSessionTtlHours: z.number().int().min(1).max(720),
+        seoIndexing: z.boolean()
+      }).strict().parse(request.body);
+      if (input.passwordProtectionEnabled && !input.password && !domain.password_hash) {
+        throw badRequest("Lege zuerst ein Passwort mit mindestens 8 Zeichen fest", "SITE_PASSWORD_REQUIRED");
+      }
+      const passwordHash = input.password
+        ? await hashPassword(input.password)
+        : domain.password_hash ?? null;
+      const protectionChanged = input.passwordProtectionEnabled !== (domain.password_protection_enabled === 1);
+      const ttlChanged = input.accessSessionTtlHours !== (domain.access_session_ttl_hours ?? 168);
+      const updated = database.updateDomainAccess(domain.id, domain.project_id, {
+        password_protection_enabled: input.passwordProtectionEnabled ? 1 : 0,
+        password_hash: passwordHash,
+        access_session_ttl_hours: input.accessSessionTtlHours,
+        seo_indexing: input.passwordProtectionEnabled ? 0 : input.seoIndexing ? 1 : 0
+      }, protectionChanged || ttlChanged || Boolean(input.password));
+      if (!updated) throw conflict("Domainstatus hat sich während der Änderung verändert", "DOMAIN_STATE_CONFLICT");
+      reconcileRouting(config, database);
+      return {
+        domain: {
+          id: updated.id,
+          hostname: updated.hostname,
+          status: updated.status,
+          error: updated.error,
+          passwordProtectionEnabled: updated.password_protection_enabled === 1,
+          passwordConfigured: Boolean(updated.password_hash),
+          accessSessionTtlHours: updated.access_session_ttl_hours ?? 168,
+          seoIndexing: updated.password_protection_enabled === 1 ? false : updated.seo_indexing === 1
+        }
+      };
+    }
+  );
+
+  app.post<{ Params: { id: string; domainId: string } }>(
+    "/api/projects/:id/domains/:domainId/access/revoke",
+    { preHandler: requireScopedMutation("domains:write") },
+    async (request, reply) => {
+      mutableProject(database, request.params.id);
+      const updated = database.revokeDomainAccessSessions(request.params.domainId, request.params.id);
+      if (!updated) return reply.code(404).send({ error: "Domain nicht gefunden", code: "NOT_FOUND" });
+      return { ok: true };
+    }
+  );
 }
 
 function pathBase(value: string | null): string | null {

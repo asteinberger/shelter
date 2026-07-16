@@ -139,6 +139,56 @@ describe('deployment api', () => {
   });
 });
 
+describe('domain access api', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('updates protection and visibility without sending an omitted password', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      domain: {
+        id: 'dom/42',
+        hostname: 'preview.example.com',
+        passwordProtectionEnabled: true,
+        passwordConfigured: true,
+        accessSessionTtlHours: 168,
+        seoIndexing: false,
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.updateDomainAccess('prj/42', 'dom/42', {
+      passwordProtectionEnabled: true,
+      accessSessionTtlHours: 168,
+      seoIndexing: false,
+    })).resolves.toMatchObject({
+      id: 'dom/42',
+      passwordProtectionEnabled: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/prj%2F42/domains/dom%2F42/access',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          passwordProtectionEnabled: true,
+          accessSessionTtlHours: 168,
+          seoIndexing: false,
+        }),
+      }),
+    );
+  });
+
+  it('revokes visitor sessions independently from administrator sessions', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ ok: true }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.revokeDomainAccessSessions('prj_1', 'dom_1')).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/projects/prj_1/domains/dom_1/access/revoke',
+      expect.objectContaining({ method: 'POST', credentials: 'include' }),
+    );
+  });
+});
+
 describe('cloudflare access protection api', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

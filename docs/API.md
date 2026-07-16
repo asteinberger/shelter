@@ -168,6 +168,24 @@ Use the Shelter CLI for this workflow unless direct HTTP integration is required
 
 List active Cloudflare zones with `GET /api/settings/cloudflare/zones`. Add a hostname with `POST /api/projects/{projectId}/domains` and remove it with `DELETE /api/projects/{projectId}/domains/{domainId}`. Domain mutations require a connected Cloudflare account and the `domains:write` scope.
 
+Configure sharing and search visibility with:
+
+```http
+PUT /api/projects/{projectId}/domains/{domainId}/access
+Content-Type: application/json
+
+{
+  "passwordProtectionEnabled": true,
+  "password": "a separate shared site password",
+  "accessSessionTtlHours": 168,
+  "seoIndexing": false
+}
+```
+
+`password` is required when protection is enabled for the first time and otherwise optional; omitting it preserves the current password. It must contain 8–256 characters. Session duration is 1–720 hours. Enabling protection always forces effective search indexing off. The response exposes only `passwordConfigured`, never the password hash.
+
+`POST /api/projects/{projectId}/domains/{domainId}/access/revoke` invalidates every visitor cookie for that domain without changing the password. Both endpoints require `domains:write`.
+
 ### Inspect project observability in the administrator panel
 
 The following read-only endpoints intentionally require the administrator's browser session and reject personal access tokens because application output can contain sensitive data:

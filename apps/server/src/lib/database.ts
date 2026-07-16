@@ -278,6 +278,11 @@ CREATE TABLE IF NOT EXISTS domains (
   dns_record_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'active', 'error')),
   error TEXT,
+  password_protection_enabled INTEGER NOT NULL DEFAULT 0 CHECK(password_protection_enabled IN (0, 1)),
+  password_hash TEXT,
+  access_session_version INTEGER NOT NULL DEFAULT 1 CHECK(access_session_version >= 1),
+  access_session_ttl_hours INTEGER NOT NULL DEFAULT 168 CHECK(access_session_ttl_hours BETWEEN 1 AND 720),
+  seo_indexing INTEGER NOT NULL DEFAULT 1 CHECK(seo_indexing IN (0, 1)),
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS domains_project_idx ON domains(project_id);
@@ -620,6 +625,22 @@ export class Database {
     }
     if (!projectColumns.some((column) => column.name === "preview_ttl_hours")) {
       this.sqlite.exec("ALTER TABLE projects ADD COLUMN preview_ttl_hours INTEGER NOT NULL DEFAULT 72 CHECK(preview_ttl_hours BETWEEN 1 AND 168)");
+    }
+    const domainColumns = this.sqlite.pragma("table_info(domains)") as Array<{ name: string }>;
+    if (!domainColumns.some((column) => column.name === "password_protection_enabled")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN password_protection_enabled INTEGER NOT NULL DEFAULT 0 CHECK(password_protection_enabled IN (0, 1))");
+    }
+    if (!domainColumns.some((column) => column.name === "password_hash")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN password_hash TEXT");
+    }
+    if (!domainColumns.some((column) => column.name === "access_session_version")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN access_session_version INTEGER NOT NULL DEFAULT 1 CHECK(access_session_version >= 1)");
+    }
+    if (!domainColumns.some((column) => column.name === "access_session_ttl_hours")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN access_session_ttl_hours INTEGER NOT NULL DEFAULT 168 CHECK(access_session_ttl_hours BETWEEN 1 AND 720)");
+    }
+    if (!domainColumns.some((column) => column.name === "seo_indexing")) {
+      this.sqlite.exec("ALTER TABLE domains ADD COLUMN seo_indexing INTEGER NOT NULL DEFAULT 1 CHECK(seo_indexing IN (0, 1))");
     }
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS projects_github_link_idx
@@ -2768,9 +2789,24 @@ export class Database {
 
   createDomain(domain: DomainRow): void {
     this.sqlite.prepare(`
-      INSERT INTO domains (id, project_id, hostname, zone_id, dns_record_id, status, error, created_at)
-      VALUES (@id, @project_id, @hostname, @zone_id, @dns_record_id, @status, @error, @created_at)
-    `).run(domain);
+      INSERT INTO domains (
+        id, project_id, hostname, zone_id, dns_record_id, status, error,
+        password_protection_enabled, password_hash, access_session_version,
+        access_session_ttl_hours, seo_indexing, created_at
+      )
+      VALUES (
+        @id, @project_id, @hostname, @zone_id, @dns_record_id, @status, @error,
+        @password_protection_enabled, @password_hash, @access_session_version,
+        @access_session_ttl_hours, @seo_indexing, @created_at
+      )
+    `).run({
+      ...domain,
+      password_protection_enabled: domain.password_protection_enabled ?? 0,
+      password_hash: domain.password_hash ?? null,
+      access_session_version: domain.access_session_version ?? 1,
+      access_session_ttl_hours: domain.access_session_ttl_hours ?? 168,
+      seo_indexing: domain.seo_indexing ?? 1
+    });
   }
 
   createOrRetryPendingDomain(domain: DomainRow):
@@ -2872,6 +2908,43 @@ export class Database {
     this.sqlite.prepare(`
       UPDATE domains SET zone_id = @zone_id, dns_record_id = @dns_record_id, status = @status, error = @error WHERE id = @id
     `).run({ id, ...updates });
+  }
+
+  updateDomainAccess(
+    id: string,
+    projectId: string,
+    updates: Pick<DomainRow,
+      "password_protection_enabled" | "password_hash" | "access_session_ttl_hours" | "seo_indexing"
+    >,
+    revokeSessions: boolean
+  ): DomainRow | undefined {
+    const result = this.sqlite.prepare(`
+      UPDATE domains
+      SET password_protection_enabled = @password_protection_enabled,
+          password_hash = @password_hash,
+          access_session_ttl_hours = @access_session_ttl_hours,
+          seo_indexing = @seo_indexing,
+          access_session_version = access_session_version + @version_increment
+      WHERE id = @id AND project_id = @project_id
+    `).run({
+      id,
+      project_id: projectId,
+      password_protection_enabled: updates.password_protection_enabled ?? 0,
+      password_hash: updates.password_hash ?? null,
+      access_session_ttl_hours: updates.access_session_ttl_hours ?? 168,
+      seo_indexing: updates.seo_indexing ?? 1,
+      version_increment: revokeSessions ? 1 : 0
+    });
+    return result.changes === 1 ? this.getDomain(id) : undefined;
+  }
+
+  revokeDomainAccessSessions(id: string, projectId: string): DomainRow | undefined {
+    const result = this.sqlite.prepare(`
+      UPDATE domains
+      SET access_session_version = access_session_version + 1
+      WHERE id = ? AND project_id = ?
+    `).run(id, projectId);
+    return result.changes === 1 ? this.getDomain(id) : undefined;
   }
 
   deleteDomain(id: string): void {

@@ -11,6 +11,7 @@ import type {
   DeleteProjectResult,
   Deployment,
   Domain,
+  DomainAccessInput,
   EnvironmentVariable,
   GitHubBranch,
   GitHubPreviewCapability,
@@ -447,6 +448,21 @@ export const api = {
     return request(`/api/projects/${encodeURIComponent(id)}/domains/${encodeURIComponent(domainId)}`, {
       method: 'DELETE',
     });
+  },
+
+  async updateDomainAccess(id: string, domainId: string, input: DomainAccessInput) {
+    const payload = await request<{ domain: Domain }>(
+      `/api/projects/${encodeURIComponent(id)}/domains/${encodeURIComponent(domainId)}/access`,
+      { method: 'PUT', body: JSON.stringify(input) },
+    );
+    return payload.domain;
+  },
+
+  revokeDomainAccessSessions(id: string, domainId: string) {
+    return request<{ ok: true }>(
+      `/api/projects/${encodeURIComponent(id)}/domains/${encodeURIComponent(domainId)}/access/revoke`,
+      { method: 'POST' },
+    );
   },
 
   updateEnvironment(id: string, variables: EnvironmentVariable[]) {

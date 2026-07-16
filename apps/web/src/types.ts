@@ -78,6 +78,17 @@ export interface Domain {
   error?: string | null;
   url?: string;
   createdAt?: string;
+  passwordProtectionEnabled?: boolean;
+  passwordConfigured?: boolean;
+  accessSessionTtlHours?: number;
+  seoIndexing?: boolean;
+}
+
+export interface DomainAccessInput {
+  passwordProtectionEnabled: boolean;
+  password?: string;
+  accessSessionTtlHours: number;
+  seoIndexing: boolean;
 }
 
 export interface Deployment {
