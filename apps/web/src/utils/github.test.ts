@@ -5,6 +5,7 @@ import {
   shouldSynchronizeGitHubProjectDraft,
   trustedGitHubAppUrl,
   trustedGitHubManifestRegistrationUrl,
+  trustedGitHubRemediationUrl,
   trustedGitHubRepositoryUrl,
 } from './github';
 
@@ -67,6 +68,37 @@ describe('GitHub URL allowlists', () => {
     expect(trustedGitHubAppUrl('https://user@github.com/apps/shelter-raum')).toBeUndefined();
     expect(trustedGitHubAppUrl('https://github.com:444/apps/shelter-raum')).toBeUndefined();
     expect(trustedGitHubAppUrl('https://github.com/apps/shelter-raum#settings')).toBeUndefined();
+  });
+
+  it('allows only exact GitHub App update and installation approval destinations', () => {
+    for (const value of [
+      'https://github.com/settings/apps/shelter-raum/permissions',
+      'https://github.com/organizations/raum/settings/apps/shelter-raum/permissions',
+      'https://github.com/enterprises/raum-cloud/settings/apps/shelter-raum/permissions',
+      'https://github.com/settings/installations/123',
+      'https://github.com/organizations/raum/settings/installations/123',
+      'https://github.com/enterprises/raum-cloud/settings/installations/123',
+    ]) expect(trustedGitHubRemediationUrl(value)).toBe(value);
+
+    for (const value of [
+      'https://github.com.evil.test/settings/apps/shelter-raum/permissions',
+      'https://user@github.com/settings/apps/shelter-raum/permissions',
+      'https://github.com:444/settings/apps/shelter-raum/permissions',
+      'https://github.com/settings/apps/shelter-raum/permissions?next=/apps',
+      'https://github.com/settings/apps/shelter-raum/permissions#events',
+      'https://github.com/settings/apps/shelter-raum/permissions/',
+      'https://github.com/settings/apps/Shelter-Raum/permissions',
+      'https://github.com/settings/apps/shelter-raum',
+      'https://github.com/organizations/raum/settings/apps/shelter-raum',
+      'https://github.com/organizations/raum/settings/installations/not-a-number',
+      'https://github.com/organizations/raum/settings/installations/123/repositories',
+      'https://github.com/apps/shelter-raum/installations/new',
+      'https://github.com/apps/shelter-raum/installations/new/permissions',
+      'https://github.com/apps/shelter-raum',
+    ]) expect(trustedGitHubRemediationUrl(value)).toBeUndefined();
+
+    expect(trustedGitHubRemediationUrl(null)).toBeUndefined();
+    expect(trustedGitHubRemediationUrl(undefined)).toBeUndefined();
   });
 
   it('allows repository links only and derives them from safe full names', () => {

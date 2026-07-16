@@ -73,7 +73,8 @@ const InstallationSchema = z.object({
   repository_selection: z.enum(["all", "selected"]).optional().default("selected"),
   suspended_at: z.string().nullable().optional(),
   permissions: z.record(z.string(), z.string()).optional().default({}),
-  events: z.array(z.string()).optional().default([])
+  events: z.array(z.string()).optional().default([]),
+  html_url: z.url().nullable().optional()
 }).passthrough();
 
 const RepositorySchema = z.object({
@@ -109,6 +110,11 @@ const InstallationTokenSchema = z.object({
 }).passthrough();
 
 const AppCapabilitySchema = z.object({
+  slug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,99}$/),
+  owner: z.object({
+    login: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$/),
+    type: z.enum(["User", "Organization", "Enterprise"])
+  }).passthrough(),
   permissions: z.record(z.string(), z.string()).default({}),
   events: z.array(z.string()).default([])
 }).passthrough();
@@ -194,6 +200,7 @@ export interface GitHubManifest {
   setup_url: string;
   public: false;
   request_oauth_on_install: false;
+  setup_on_update: true;
   default_permissions: { contents: "read"; statuses: "write"; metadata: "read"; pull_requests: "read" };
   default_events: ["push", "pull_request"];
 }
@@ -205,6 +212,7 @@ export interface GitHubInstallation {
   accountAvatarUrl: string | null;
   repositorySelection: "all" | "selected";
   suspendedAt: string | null;
+  htmlUrl: string | null;
 }
 
 export interface GitHubRepository {
@@ -248,6 +256,7 @@ export interface GitHubPreviewCapability {
   installationPullRequestEvent: boolean | null;
   installationSuspended: boolean | null;
   remediation: "none" | "configure_app" | "update_existing_app" | "approve_installation_update";
+  remediationUrl: string | null;
 }
 
 interface GithubFetchOptions {
@@ -309,7 +318,8 @@ export class GitHubService {
         installationPullRequestsPermission: installationId ? false : null,
         installationPullRequestEvent: installationId ? false : null,
         installationSuspended: null,
-        remediation: "configure_app"
+        remediation: "configure_app",
+        remediationUrl: null
       };
     }
     const app = this.parseUpstream(
@@ -318,6 +328,7 @@ export class GitHubService {
     );
     const pullRequestsPermission = app.permissions.pull_requests === "read" || app.permissions.pull_requests === "write";
     const pullRequestEvent = app.events.includes("pull_request");
+    const appRemediationUrl = this.appPermissionsUrl(app);
     if (installationId) {
       const installation = this.parseUpstream(InstallationSchema, await this.githubRequest<unknown>(
         `/app/installations/${this.installationId(installationId)}`,
@@ -340,7 +351,12 @@ export class GitHubService {
         installationPullRequestsPermission,
         installationPullRequestEvent,
         installationSuspended,
-        remediation: !appReady ? "update_existing_app" : installationReady ? "none" : "approve_installation_update"
+        remediation: !appReady ? "update_existing_app" : installationReady ? "none" : "approve_installation_update",
+        remediationUrl: !appReady
+          ? appRemediationUrl
+          : installationReady
+            ? null
+            : this.installationSettingsUrl(installation)
       };
     }
     return {
@@ -352,7 +368,8 @@ export class GitHubService {
       installationPullRequestsPermission: null,
       installationPullRequestEvent: null,
       installationSuspended: null,
-      remediation: pullRequestsPermission && pullRequestEvent ? "none" : "update_existing_app"
+      remediation: pullRequestsPermission && pullRequestEvent ? "none" : "update_existing_app",
+      remediationUrl: pullRequestsPermission && pullRequestEvent ? null : appRemediationUrl
     };
   }
 
@@ -388,6 +405,7 @@ export class GitHubService {
       setup_url: `${origin}${GITHUB_SETUP_CALLBACK_PATH}?state=${encodeURIComponent(setupState)}`,
       public: false,
       request_oauth_on_install: false,
+      setup_on_update: true,
       default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
       // GitHub Apps always receive installation and installation_repositories.
       // GitHub rejects manifests that try to subscribe to those implicit events.
@@ -451,6 +469,7 @@ export class GitHubService {
     if (String(installation.app_id) !== metadata.appId) {
       throw conflict("Die Installation gehört nicht zu dieser GitHub App", "GITHUB_INSTALLATION_MISMATCH");
     }
+    this.invalidateInstallationTokens(String(installation.id));
   }
 
   async disconnect(): Promise<GitHubState> {
@@ -480,7 +499,8 @@ export class GitHubService {
         accountType: parsed.account.type,
         accountAvatarUrl: parsed.account.avatar_url ?? null,
         repositorySelection: parsed.repository_selection,
-        suspendedAt: parsed.suspended_at ?? null
+        suspendedAt: parsed.suspended_at ?? null,
+        htmlUrl: this.installationSettingsUrl(parsed)
       };
     });
   }
@@ -885,6 +905,10 @@ export class GitHubService {
       const changed = this.database.enableGithubInstallation(String(payload.installation.id));
       return { queued: 0, pending: 0, ignored: changed === 0 ? 1 : 0 };
     }
+    if (payload.action === "new_permissions_accepted") {
+      this.invalidateInstallationTokens(String(payload.installation.id));
+      return { queued: 0, pending: 0, ignored: 0 };
+    }
     return { queued: 0, pending: 0, ignored: 1 };
   }
 
@@ -1150,6 +1174,48 @@ export class GitHubService {
       throw upstreamError("GitHub hat eine ungültige App-URL geliefert", "GITHUB_MANIFEST_INVALID");
     }
     return url.toString().replace(/\/$/, "");
+  }
+
+  private appPermissionsUrl(app: z.infer<typeof AppCapabilitySchema>): string {
+    const metadata = this.requireMetadata();
+    if (app.slug !== metadata.appSlug) {
+      throw upstreamError("GitHub hat eine unerwartete App-Identität geliefert", "GITHUB_API_INVALID");
+    }
+    const owner = app.owner.login;
+    const path = app.owner.type === "Organization"
+      ? `/organizations/${owner}/settings/apps/${metadata.appSlug}/permissions`
+      : app.owner.type === "Enterprise"
+        ? `/enterprises/${owner}/settings/apps/${metadata.appSlug}/permissions`
+        : `/settings/apps/${metadata.appSlug}/permissions`;
+    return `https://github.com${path}`;
+  }
+
+  private installationSettingsUrl(installation: z.infer<typeof InstallationSchema>): string {
+    if (!installation.html_url) {
+      const id = String(installation.id);
+      const login = installation.account.login;
+      const path = installation.account.type === "Organization"
+        ? `/organizations/${login}/settings/installations/${id}`
+        : installation.account.type === "Enterprise"
+          ? `/enterprises/${login}/settings/installations/${id}`
+          : `/settings/installations/${id}`;
+      return `https://github.com${path}`;
+    }
+    const url = new URL(installation.html_url);
+    const id = String(installation.id);
+    const login = installation.account.login;
+    const allowedPaths = new Set([
+      `/settings/installations/${id}`,
+      `/organizations/${login}/settings/installations/${id}`,
+      `/enterprises/${login}/settings/installations/${id}`
+    ]);
+    if (
+      url.protocol !== "https:" || url.hostname !== "github.com" || url.port ||
+      url.username || url.password || url.search || url.hash || !allowedPaths.has(url.pathname)
+    ) {
+      throw upstreamError("GitHub hat eine ungültige Installations-URL geliefert", "GITHUB_API_INVALID");
+    }
+    return url.toString();
   }
 
   private validatedGithubUrl(value: string): string {

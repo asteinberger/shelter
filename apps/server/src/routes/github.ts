@@ -62,7 +62,8 @@ export function registerGithubRoutes(app: FastifyInstance, github: GitHubService
           installationPullRequestsPermission: null,
           installationPullRequestEvent: null,
           installationSuspended: null,
-          remediation: "configure_app"
+          remediation: "configure_app",
+          remediationUrl: null
         },
         error: null
       }

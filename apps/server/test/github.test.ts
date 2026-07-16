@@ -189,6 +189,7 @@ describe("GitHub App manifest and API authentication", () => {
       redirect_url: "https://hosting.example.com/api/settings/github/manifest/callback",
       public: false,
       request_oauth_on_install: false,
+      setup_on_update: true,
       default_permissions: { contents: "read", statuses: "write", metadata: "read", pull_requests: "read" },
       default_events: ["push", "pull_request"]
     });
@@ -274,13 +275,19 @@ describe("GitHub App manifest and API authentication", () => {
     database.close();
   });
 
-  it("requires the selected installation to approve pull-request preview permissions", async () => {
+  it("guides app and installation owners through both pull-request permission updates", async () => {
+    let appApproved = false;
     let installationApproved = false;
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
       if (url.endsWith("/app")) {
-        return json({ permissions: { pull_requests: "read" }, events: ["push", "pull_request"] });
+        return json({
+          slug: "portsmith-test",
+          owner: { login: "example", type: "Organization" },
+          permissions: appApproved ? { pull_requests: "read" } : { contents: "read" },
+          events: appApproved ? ["push", "pull_request"] : ["push"]
+        });
       }
       if (url.endsWith("/app/installations/123")) {
         return json({
@@ -290,7 +297,8 @@ describe("GitHub App manifest and API authentication", () => {
           repository_selection: "selected",
           suspended_at: null,
           permissions: installationApproved ? { pull_requests: "read" } : { contents: "read" },
-          events: installationApproved ? ["push", "pull_request"] : ["push"]
+          events: installationApproved ? ["push", "pull_request"] : ["push"],
+          html_url: "https://github.com/organizations/example/settings/installations/123"
         });
       }
       throw new Error(`Unexpected request: ${url}`);
@@ -300,18 +308,182 @@ describe("GitHub App manifest and API authentication", () => {
 
     await expect(github.previewCapability("123")).resolves.toMatchObject({
       ready: false,
+      pullRequestsPermission: false,
+      pullRequestEvent: false,
       installationChecked: true,
       installationPullRequestsPermission: false,
       installationPullRequestEvent: false,
-      remediation: "approve_installation_update"
+      remediation: "update_existing_app",
+      remediationUrl: "https://github.com/organizations/example/settings/apps/portsmith-test/permissions"
+    });
+    appApproved = true;
+    await expect(github.previewCapability("123")).resolves.toMatchObject({
+      ready: false,
+      pullRequestsPermission: true,
+      pullRequestEvent: true,
+      installationPullRequestsPermission: false,
+      installationPullRequestEvent: false,
+      remediation: "approve_installation_update",
+      remediationUrl: "https://github.com/organizations/example/settings/installations/123"
     });
     installationApproved = true;
     await expect(github.previewCapability("123")).resolves.toMatchObject({
       ready: true,
       installationPullRequestsPermission: true,
       installationPullRequestEvent: true,
-      remediation: "none"
+      remediation: "none",
+      remediationUrl: null
     });
+    database.close();
+  });
+
+  it.each([
+    ["User", "andy", "https://github.com/settings/apps/portsmith-test/permissions"],
+    ["Organization", "raum", "https://github.com/organizations/raum/settings/apps/portsmith-test/permissions"],
+    ["Enterprise", "raum-enterprise", "https://github.com/enterprises/raum-enterprise/settings/apps/portsmith-test/permissions"]
+  ] as const)("uses the exact %s app-owner permissions URL", async (type, login, expectedUrl) => {
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.endsWith("/app")) {
+        return json({
+          slug: "portsmith-test",
+          owner: { login, type },
+          permissions: { contents: "read" },
+          events: ["push"]
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    await expect(github.previewCapability()).resolves.toMatchObject({
+      ready: false,
+      remediation: "update_existing_app",
+      remediationUrl: expectedUrl
+    });
+    database.close();
+  });
+
+  it("rejects a GitHub App identity that does not match the connected manifest", async () => {
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.endsWith("/app")) {
+        return json({
+          slug: "different-app",
+          owner: { login: "example", type: "Organization" },
+          permissions: { contents: "read" },
+          events: ["push"]
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    await expect(github.previewCapability()).rejects.toMatchObject({ code: "GITHUB_API_INVALID" });
+    database.close();
+  });
+
+  it("returns only validated GitHub installation settings URLs", async () => {
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.includes("/app/installations?")) {
+        return json([
+          {
+            id: 123,
+            app_id: 42,
+            account: { login: "andy", type: "User", avatar_url: null },
+            repository_selection: "all",
+            suspended_at: null,
+            html_url: "https://github.com/settings/installations/123"
+          },
+          {
+            id: 124,
+            app_id: 42,
+            account: { login: "raum", type: "Organization", avatar_url: null },
+            repository_selection: "selected",
+            suspended_at: null,
+            html_url: "https://github.com/organizations/raum/settings/installations/124"
+          },
+          {
+            id: 125,
+            app_id: 42,
+            account: { login: "raum-enterprise", type: "Enterprise", avatar_url: null },
+            repository_selection: "selected",
+            suspended_at: null,
+            html_url: "https://github.com/enterprises/raum-enterprise/settings/installations/125"
+          },
+          {
+            id: 126,
+            app_id: 42,
+            account: { login: "fallback-org", type: "Organization", avatar_url: null },
+            repository_selection: "selected",
+            suspended_at: null
+          }
+        ]);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    await expect(github.installations()).resolves.toEqual([
+      expect.objectContaining({
+        id: "123",
+        htmlUrl: "https://github.com/settings/installations/123"
+      }),
+      expect.objectContaining({
+        id: "124",
+        htmlUrl: "https://github.com/organizations/raum/settings/installations/124"
+      }),
+      expect.objectContaining({
+        id: "125",
+        htmlUrl: "https://github.com/enterprises/raum-enterprise/settings/installations/125"
+      }),
+      expect.objectContaining({
+        id: "126",
+        htmlUrl: "https://github.com/organizations/fallback-org/settings/installations/126"
+      })
+    ]);
+    database.close();
+  });
+
+  it("rejects unsafe or mismatched GitHub installation settings URLs", async () => {
+    let installationUrl = "https://github.com/settings/installations/123";
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.includes("/app/installations?")) {
+        return json([{
+          id: 123,
+          app_id: 42,
+          account: { login: "example", type: "Organization", avatar_url: null },
+          repository_selection: "selected",
+          suspended_at: null,
+          html_url: installationUrl
+        }]);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    for (const invalidUrl of [
+      "https://evil.example/settings/installations/123",
+      "https://attacker@github.com/settings/installations/123",
+      "https://github.com:444/settings/installations/123",
+      "https://github.com/settings/installations/123?next=https://evil.example",
+      "https://github.com/settings/installations/123#permissions",
+      "https://github.com/settings/installations/999",
+      "https://github.com/organizations/different/settings/installations/123"
+    ]) {
+      installationUrl = invalidUrl;
+      await expect(github.installations()).rejects.toMatchObject({ code: "GITHUB_API_INVALID" });
+    }
     database.close();
   });
 
@@ -653,6 +825,39 @@ describe("GitHub webhook deployment queue", () => {
       github_repository_full_name: "example/private",
       repository_url: "https://github.com/example/private.git"
     });
+    database.close();
+  });
+
+  it("invalidates cached installation tokens when updated permissions are accepted", async () => {
+    let tokenCalls = 0;
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/app-manifests/manifest-code/conversions")) return json(conversion(), 201);
+      if (url.endsWith("/app/installations/123/access_tokens")) {
+        tokenCalls += 1;
+        return json({
+          token: `ghs_permissions_token_${tokenCalls}_1234567890`,
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString()
+        }, 201);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as unknown as typeof fetch;
+    const { database, github } = context(fetcher);
+    await connect(github);
+
+    await expect(github.installationToken("123"))
+      .resolves.toBe("ghs_permissions_token_1_1234567890");
+    await expect(github.handleWebhook(
+      "installation",
+      "delivery-new-permissions-accepted",
+      Buffer.from(JSON.stringify({
+        action: "new_permissions_accepted",
+        installation: { id: 123 }
+      }))
+    )).resolves.toEqual({ duplicate: false, queued: 0, pending: 0, ignored: 0 });
+    await expect(github.installationToken("123"))
+      .resolves.toBe("ghs_permissions_token_2_1234567890");
+    expect(tokenCalls).toBe(2);
     database.close();
   });
 

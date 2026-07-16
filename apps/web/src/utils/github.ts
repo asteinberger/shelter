@@ -70,6 +70,26 @@ export function trustedGitHubAppUrl(value?: string | null) {
   return url.toString();
 }
 
+export function trustedGitHubRemediationUrl(value?: string | null) {
+  if (!value) return undefined;
+  const url = parseExactGithubUrl(value);
+  if (!url || url.search) return undefined;
+
+  const appSlug = '[a-z0-9][a-z0-9-]{0,99}';
+  const owner = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?';
+  const installationId = '\\d{1,20}';
+  const allowedPaths = [
+    new RegExp(`^/settings/apps/${appSlug}/permissions$`),
+    new RegExp(`^/organizations/${owner}/settings/apps/${appSlug}/permissions$`),
+    new RegExp(`^/enterprises/${owner}/settings/apps/${appSlug}/permissions$`),
+    new RegExp(`^/settings/installations/${installationId}$`),
+    new RegExp(`^/organizations/${owner}/settings/installations/${installationId}$`),
+    new RegExp(`^/enterprises/${owner}/settings/installations/${installationId}$`),
+  ];
+  if (!allowedPaths.some((pattern) => pattern.test(url.pathname))) return undefined;
+  return url.toString();
+}
+
 export function trustedGitHubRepositoryUrl(value?: string | null) {
   if (!value) return undefined;
   const url = parseExactGithubUrl(value);
