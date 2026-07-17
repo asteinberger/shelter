@@ -17,7 +17,11 @@ import { decryptString, encryptString, hashToken, randomToken } from "../lib/sec
 import type { GithubAppUpgradeFlowRow } from "../types/models.js";
 import {
   analyzeProjectFiles,
+  isEnvironmentSourceContentPath,
+  isProjectConfigurationContentPath,
   MAX_ANALYSIS_CONTENT_BYTES,
+  MAX_ANALYSIS_SOURCE_CONTENT_BYTES,
+  MAX_ANALYSIS_SOURCE_FILE_BYTES,
   relevantGitHubTreePaths,
   requiresAnalysisContent,
   type ProjectAnalysis,
@@ -1585,15 +1589,27 @@ export class GitHubService {
       treeFacts.push({ path: item.path, ...(item.size === undefined ? {} : { size: item.size }) });
     }
     const limited = relevantGitHubTreePaths(treeFacts, tree.truncated || droppedUnsafePath);
-    const contentFiles = limited.files.filter((file) => requiresAnalysisContent(file.path));
-    if (contentFiles.length > ANALYSIS_MAX_CONTENT_FILES) {
+    const configurationFiles = limited.files.filter((file) => (
+      requiresAnalysisContent(file.path) && isProjectConfigurationContentPath(file.path)
+    ));
+    if (configurationFiles.length > ANALYSIS_MAX_CONTENT_FILES) {
       throw badRequest(
         "GitHub repository contains too many project manifests to analyze safely",
         "GITHUB_ANALYSIS_TOO_LARGE"
       );
     }
+    const sourceCandidates = limited.files
+      .filter((file) => requiresAnalysisContent(file.path) && !isProjectConfigurationContentPath(file.path))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    const sourceFiles = sourceCandidates
+      .filter((file) => file.size === undefined || file.size <= MAX_ANALYSIS_SOURCE_FILE_BYTES)
+      .slice(0, ANALYSIS_MAX_CONTENT_FILES - configurationFiles.length);
+    const contentFiles = [...configurationFiles, ...sourceFiles];
+    let analysisPartial = limited.partial
+      || sourceFiles.length < sourceCandidates.length;
 
     let totalContentBytes = 0;
+    let sourceContentBytes = 0;
     let nextIndex = 0;
     const workers = Array.from({ length: Math.min(ANALYSIS_CONTENT_CONCURRENCY, contentFiles.length) }, async () => {
       while (nextIndex < contentFiles.length) {
@@ -1605,18 +1621,28 @@ export class GitHubService {
           { token }
         ));
         const content = Buffer.from(response.content.replaceAll(/\s/g, ""), "base64");
+        const sourceFile = isEnvironmentSourceContentPath(file.path)
+          && !isProjectConfigurationContentPath(file.path);
         if (content.length !== response.size || totalContentBytes + content.length > MAX_ANALYSIS_CONTENT_BYTES) {
           throw badRequest(
             "GitHub project configuration is too large to analyze safely",
             "GITHUB_ANALYSIS_TOO_LARGE"
           );
         }
+        if (sourceFile && (
+          content.length > MAX_ANALYSIS_SOURCE_FILE_BYTES
+          || sourceContentBytes + content.length > MAX_ANALYSIS_SOURCE_CONTENT_BYTES
+        )) {
+          analysisPartial = true;
+          continue;
+        }
         totalContentBytes += content.length;
+        if (sourceFile) sourceContentBytes += content.length;
         file.content = content.toString("utf8");
       }
     });
     await Promise.all(workers);
-    return analyzeProjectFiles(limited.files, { partial: limited.partial });
+    return analyzeProjectFiles(limited.files, { partial: analysisPartial });
   }
 
   private cacheAnalysis(key: string, analysis: ProjectAnalysis): void {

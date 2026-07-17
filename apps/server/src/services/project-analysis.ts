@@ -7,6 +7,8 @@ import { badRequest } from "../lib/errors.js";
 
 export const MAX_ANALYSIS_PATHS = 10_000;
 export const MAX_ANALYSIS_CONTENT_BYTES = 512 * 1024;
+export const MAX_ANALYSIS_SOURCE_FILE_BYTES = 64 * 1024;
+export const MAX_ANALYSIS_SOURCE_CONTENT_BYTES = 384 * 1024;
 export const MAX_ANALYSIS_APPLICATIONS = 100;
 
 export type DetectedFramework =
@@ -22,6 +24,25 @@ export type DetectedFramework =
 
 export type DetectedRendering = "ssr" | "spa" | "static" | "server" | "container" | "files";
 export type DetectedPackageManager = "npm" | "pnpm" | "yarn" | "bun";
+export type EnvironmentRequirementConfidence = "high" | "medium";
+export type EnvironmentRequirementScope = "build" | "runtime" | "both";
+export type EnvironmentRequirementVisibility = "server" | "public";
+
+export interface ProjectEnvironmentRequirementSource {
+  path: string;
+  line: number;
+  kind: "example" | "reference" | "validation";
+}
+
+export interface ProjectEnvironmentRequirement {
+  key: string;
+  required: boolean;
+  secret: boolean;
+  scope: EnvironmentRequirementScope;
+  visibility: EnvironmentRequirementVisibility;
+  confidence: EnvironmentRequirementConfidence;
+  sources: ProjectEnvironmentRequirementSource[];
+}
 
 export interface ProjectFileFact {
   path: string;
@@ -45,6 +66,7 @@ export interface ProjectApplicationAnalysis {
   healthcheckPath: string;
   spaFallback: boolean;
   environmentKeys: string[];
+  environmentRequirements: ProjectEnvironmentRequirement[];
   confidence: number;
   evidence: string[];
 }
@@ -85,19 +107,40 @@ export const ProjectAnalysisRequestSchema = z.object({
   files: z.array(ProjectFileFactSchema).max(MAX_ANALYSIS_PATHS)
 }).strict().superRefine((value, context) => {
   let contentBytes = 0;
+  let sourceContentBytes = 0;
   const paths = new Set<string>();
   value.files.forEach((file, index) => {
     if (paths.has(file.path)) {
       context.addIssue({ code: "custom", path: ["files", index, "path"], message: "File paths must be unique" });
     }
     paths.add(file.path);
-    if (file.content !== undefined) contentBytes += Buffer.byteLength(file.content, "utf8");
+    if (file.content !== undefined) {
+      const bytes = Buffer.byteLength(file.content, "utf8");
+      contentBytes += bytes;
+      if (isEnvironmentSourceOnlyPath(file.path)) {
+        sourceContentBytes += bytes;
+        if (bytes > MAX_ANALYSIS_SOURCE_FILE_BYTES) {
+          context.addIssue({
+            code: "custom",
+            path: ["files", index, "content"],
+            message: "Source files may contribute at most 64 KiB each to project analysis"
+          });
+        }
+      }
+    }
   });
   if (contentBytes > MAX_ANALYSIS_CONTENT_BYTES) {
     context.addIssue({
       code: "custom",
       path: ["files"],
       message: "Configuration content may total at most 512 KiB"
+    });
+  }
+  if (sourceContentBytes > MAX_ANALYSIS_SOURCE_CONTENT_BYTES) {
+    context.addIssue({
+      code: "custom",
+      path: ["files"],
+      message: "Source files may contribute at most 384 KiB to project analysis"
     });
   }
 });
@@ -124,6 +167,13 @@ const CONFIG_FILE_NAMES = new Set([
   "nx.json",
   "turbo.json",
   "pnpm-workspace.yaml"
+]);
+
+const ENVIRONMENT_SOURCE_EXTENSIONS = new Set([
+  ".astro", ".cjs", ".js", ".jsx", ".mjs", ".svelte", ".ts", ".tsx", ".vue"
+]);
+const ENVIRONMENT_SOURCE_IGNORED_SEGMENTS = new Set([
+  "__fixtures__", "__mocks__", "__tests__", "fixtures", "mocks", "test", "tests"
 ]);
 
 const LOCK_FILES = ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"] as const;
@@ -187,6 +237,10 @@ function isIgnoredAnalysisPath(filePath: string): boolean {
 }
 
 export function isAnalysisContentPath(filePath: string): boolean {
+  return isProjectConfigurationContentPath(filePath) || isEnvironmentSourceContentPath(filePath);
+}
+
+export function isProjectConfigurationContentPath(filePath: string): boolean {
   const name = basename(filePath);
   return CONFIG_FILE_NAMES.has(name) || /^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(name);
 }
@@ -195,7 +249,20 @@ export function requiresAnalysisContent(filePath: string): boolean {
   const name = basename(filePath);
   return name === "package.json"
     || /^(?:next|astro|vite)\.config\.(?:js|cjs|mjs|ts|jsx|tsx)$/.test(name)
-    || /^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(name);
+    || /^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(name)
+    || isEnvironmentSourceContentPath(filePath);
+}
+
+export function isEnvironmentSourceContentPath(filePath: string): boolean {
+  const segments = filePath.toLowerCase().split("/");
+  const name = segments.at(-1) ?? "";
+  if (segments.some((segment) => ENVIRONMENT_SOURCE_IGNORED_SEGMENTS.has(segment))) return false;
+  if (/\.(?:spec|test|stories)\.[^.]+$/.test(name)) return false;
+  return ENVIRONMENT_SOURCE_EXTENSIONS.has(path.posix.extname(name));
+}
+
+function isEnvironmentSourceOnlyPath(filePath: string): boolean {
+  return isEnvironmentSourceContentPath(filePath) && !isProjectConfigurationContentPath(filePath);
 }
 
 function joinRoot(root: string, name: string): string {
@@ -452,18 +519,199 @@ function hasAstroNodeStandaloneAdapter(config: string): boolean {
   return false;
 }
 
-function environmentKeys(root: string, files: ReadonlyMap<string, ProjectFileFact>): string[] {
-  const keys = new Set<string>();
-  for (const file of files.values()) {
-    if (rootOf(file.path) !== root || !/^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(basename(file.path))) continue;
-    const content = file.content;
-    if (!content) continue;
-    for (const line of content.split(/\r?\n/)) {
-      const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (match?.[1]) keys.add(match[1]);
+interface MutableEnvironmentRequirement extends ProjectEnvironmentRequirement {
+  sourceIdentities: Set<string>;
+}
+
+const PUBLIC_ENVIRONMENT_PREFIXES = ["NEXT_PUBLIC_", "NUXT_PUBLIC_", "PUBLIC_", "REACT_APP_", "VITE_"];
+
+function publicEnvironmentKey(key: string): boolean {
+  return PUBLIC_ENVIRONMENT_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function secretEnvironmentKey(key: string): boolean {
+  if (publicEnvironmentKey(key)) return false;
+  return /(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|DATABASE_URL|DB_URL|PASS(?:WORD)?|PRIVATE|SECRET|TOKEN)/.test(key);
+}
+
+function environmentScope(filePath: string, key: string): EnvironmentRequirementScope {
+  if (publicEnvironmentKey(key)) return "build";
+  const name = basename(filePath);
+  return /^(?:next|astro|vite)\.config\./.test(name) ? "build" : "runtime";
+}
+
+function mergedEnvironmentScope(
+  left: EnvironmentRequirementScope,
+  right: EnvironmentRequirementScope
+): EnvironmentRequirementScope {
+  return left === right ? left : "both";
+}
+
+function sourceLineLocator(content: string): (index: number) => number {
+  const starts = [0];
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.charCodeAt(index) === 10) starts.push(index + 1);
+  }
+  return (index: number): number => {
+    let low = 0;
+    let high = starts.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if ((starts[middle] ?? 0) <= index) low = middle + 1;
+      else high = middle;
+    }
+    return Math.max(1, low);
+  };
+}
+
+function sourceBelongsToApplication(filePath: string, root: string): boolean {
+  return root === "." || filePath.startsWith(`${root}/`);
+}
+
+function explicitlyRequiredEnvironmentKey(source: string, key: string): boolean {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const access = `(?:process\\.env(?:\\.${escaped}|\\[\\s*[\"']${escaped}[\"']\\s*\\])|import\\.meta\\.env\\.${escaped}|Deno\\.env\\.get\\(\\s*[\"']${escaped}[\"']\\s*\\)|Bun\\.env\\.${escaped})`;
+  return new RegExp(`${access}\\s*!`).test(source)
+    || new RegExp(`if\\s*\\(\\s*!\\s*${access}\\s*\\)[\\s\\S]{0,240}?\\bthrow\\b`).test(source)
+    || new RegExp(`(?:assert|invariant)\\s*\\(\\s*${access}`).test(source);
+}
+
+function addEnvironmentRequirement(
+  requirements: Map<string, MutableEnvironmentRequirement>,
+  requirement: Omit<ProjectEnvironmentRequirement, "sources"> & { source: ProjectEnvironmentRequirementSource }
+): void {
+  const key = requirement.key.toUpperCase();
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) return;
+  const sourceIdentity = `${requirement.source.path}:${requirement.source.line}:${requirement.source.kind}`;
+  const existing = requirements.get(key);
+  if (existing) {
+    existing.required ||= requirement.required;
+    existing.secret ||= requirement.secret;
+    existing.scope = mergedEnvironmentScope(existing.scope, requirement.scope);
+    if (requirement.confidence === "high") existing.confidence = "high";
+    if (!existing.sourceIdentities.has(sourceIdentity) && existing.sources.length < 5) {
+      existing.sourceIdentities.add(sourceIdentity);
+      existing.sources.push(requirement.source);
+    }
+    return;
+  }
+  requirements.set(key, {
+    key,
+    required: requirement.required,
+    secret: requirement.secret,
+    scope: requirement.scope,
+    visibility: publicEnvironmentKey(key) ? "public" : "server",
+    confidence: requirement.confidence,
+    sources: [requirement.source],
+    sourceIdentities: new Set([sourceIdentity])
+  });
+}
+
+function sourceEnvironmentReferences(source: string): Array<{ key: string; index: number }> {
+  const references: Array<{ key: string; index: number }> = [];
+  const patterns = [
+    /\bprocess\.env\.([A-Z_][A-Z0-9_]*)\b/g,
+    /\bprocess\.env\[\s*["']([A-Z_][A-Z0-9_]*)["']\s*\]/g,
+    /\bimport\.meta\.env\.([A-Z_][A-Z0-9_]*)\b/g,
+    /\bDeno\.env\.get\(\s*["']([A-Z_][A-Z0-9_]*)["']\s*\)/g,
+    /\bBun\.env\.([A-Z_][A-Z0-9_]*)\b/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      if (match.index !== undefined && match[1]) references.push({ key: match[1], index: match.index });
     }
   }
-  return [...keys].sort((a, b) => a.localeCompare(b));
+  return references;
+}
+
+function environmentRequirements(
+  root: string,
+  files: ReadonlyMap<string, ProjectFileFact>
+): ProjectEnvironmentRequirement[] {
+  const requirements = new Map<string, MutableEnvironmentRequirement>();
+  for (const file of files.values()) {
+    const content = file.content;
+    if (!content) continue;
+    const name = basename(file.path);
+    const example = rootOf(file.path) === root
+      && /^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(name);
+    if (example) {
+      let previousComment = "";
+      content.split(/\r?\n/).forEach((line, index) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("#")) {
+          previousComment = trimmed.slice(1).trim();
+          return;
+        }
+        const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^#]*)/);
+        if (!match?.[1]) {
+          if (trimmed) previousComment = "";
+          return;
+        }
+        const optional = /\boptional\b/i.test(`${previousComment} ${line.slice(match[0].length)}`);
+        const value = match[2]?.trim() ?? "";
+        addEnvironmentRequirement(requirements, {
+          key: match[1],
+          required: !optional && value.length === 0,
+          secret: secretEnvironmentKey(match[1].toUpperCase()),
+          scope: environmentScope(file.path, match[1].toUpperCase()),
+          visibility: publicEnvironmentKey(match[1].toUpperCase()) ? "public" : "server",
+          confidence: "high",
+          source: { path: file.path, line: index + 1, kind: "example" }
+        });
+        previousComment = "";
+      });
+      continue;
+    }
+    if (!sourceBelongsToApplication(file.path, root) || !isEnvironmentSourceContentPath(file.path)) continue;
+
+    const uncommented = withoutJavaScriptComments(content);
+    const lineAt = sourceLineLocator(uncommented);
+    for (const reference of sourceEnvironmentReferences(uncommented)) {
+      const required = explicitlyRequiredEnvironmentKey(uncommented, reference.key);
+      addEnvironmentRequirement(requirements, {
+        key: reference.key,
+        required,
+        secret: secretEnvironmentKey(reference.key),
+        scope: environmentScope(file.path, reference.key),
+        visibility: publicEnvironmentKey(reference.key) ? "public" : "server",
+        confidence: required ? "high" : "medium",
+        source: { path: file.path, line: lineAt(reference.index), kind: required ? "validation" : "reference" }
+      });
+    }
+
+    const envSchema = /(?:createEnv|envsafe|processEnv|runtimeEnv)/.test(uncommented)
+      || /(?:^|[._-])env(?:ironment)?(?:[._-]|$)/i.test(name);
+    if (!envSchema) continue;
+    const schemaPattern = /\b([A-Z_][A-Z0-9_]*)\s*:\s*z\.[A-Za-z_$][\w$]*\s*\([^\r\n]{0,240}/g;
+    for (const match of uncommented.matchAll(schemaPattern)) {
+      if (match.index === undefined || !match[1]) continue;
+      const required = !/\.optional\s*\(/.test(match[0]);
+      addEnvironmentRequirement(requirements, {
+        key: match[1],
+        required,
+        secret: secretEnvironmentKey(match[1]),
+        scope: environmentScope(file.path, match[1]),
+        visibility: publicEnvironmentKey(match[1]) ? "public" : "server",
+        confidence: "high",
+        source: { path: file.path, line: lineAt(match.index), kind: "validation" }
+      });
+    }
+  }
+  return [...requirements.values()]
+    .map(({ sourceIdentities: _sourceIdentities, ...requirement }) => requirement)
+    .sort((left, right) => Number(right.required) - Number(left.required) || left.key.localeCompare(right.key));
+}
+
+function environmentAnalysis(
+  root: string,
+  files: ReadonlyMap<string, ProjectFileFact>
+): Pick<ProjectApplicationAnalysis, "environmentKeys" | "environmentRequirements"> {
+  const requirements = environmentRequirements(root, files);
+  return {
+    environmentKeys: requirements.map((requirement) => requirement.key).sort((left, right) => left.localeCompare(right)),
+    environmentRequirements: requirements
+  };
 }
 
 function applicationId(root: string): string {
@@ -496,6 +744,7 @@ function detectPackageApplication(
   const manager = packageManagerFor(root, manifest, manifests, paths);
   const buildCommand = manifest.scripts?.build ? managerCommand(manager, "build") : null;
   const startCommand = manifest.scripts?.start ? managerCommand(manager, "start") : null;
+  const detectedEnvironment = environmentAnalysis(root, files);
   const common = {
     id: applicationId(root),
     rootDirectory: root,
@@ -503,7 +752,7 @@ function detectPackageApplication(
     packageManager: manager,
     buildCommand,
     healthcheckPath: "/",
-    environmentKeys: environmentKeys(root, files),
+    ...detectedEnvironment,
     confidence: 0.98
   };
 
@@ -677,7 +926,7 @@ export function analyzeProjectFiles(
       port: 3000,
       healthcheckPath: "/",
       spaFallback: false,
-      environmentKeys: environmentKeys(root, files),
+      ...environmentAnalysis(root, files),
       confidence: 0.99,
       evidence: ["Dockerfile found at application root"]
     });
@@ -704,7 +953,7 @@ export function analyzeProjectFiles(
       port: 8080,
       healthcheckPath: "/",
       spaFallback: false,
-      environmentKeys: environmentKeys(root, files),
+      ...environmentAnalysis(root, files),
       confidence: 0.98,
       evidence: ["index.html found"]
     });
@@ -728,7 +977,7 @@ export function analyzeProjectFiles(
         port: 8080,
         healthcheckPath: "/",
         spaFallback: false,
-        environmentKeys: environmentKeys(".", files),
+        ...environmentAnalysis(".", files),
         confidence: 0.98,
         evidence: ["Only publishable files were found"]
       });
@@ -785,6 +1034,7 @@ export function analyzeProjectDirectory(directory: string): ProjectAnalysis {
   const root = fs.realpathSync(directory);
   const facts: ProjectFileFact[] = [];
   let contentBytes = 0;
+  let sourceContentBytes = 0;
   let partial = false;
   const pending = [root];
   while (pending.length > 0) {
@@ -812,14 +1062,23 @@ export function analyzeProjectDirectory(directory: string): ProjectAnalysis {
       const stat = fs.statSync(absolute);
       const fact: ProjectFileFact = { path: relative, size: stat.size };
       if (requiresAnalysisContent(relative)) {
-        if (contentBytes + stat.size > MAX_ANALYSIS_CONTENT_BYTES) {
+        const sourceFile = isEnvironmentSourceOnlyPath(relative);
+        if (
+          contentBytes + stat.size > MAX_ANALYSIS_CONTENT_BYTES
+          || (sourceFile && (
+            stat.size > MAX_ANALYSIS_SOURCE_FILE_BYTES
+            || sourceContentBytes + stat.size > MAX_ANALYSIS_SOURCE_CONTENT_BYTES
+          ))
+        ) {
           partial = true;
           facts.push(fact);
           continue;
         }
         try {
           fact.content = fs.readFileSync(absolute, "utf8");
-          contentBytes += Buffer.byteLength(fact.content, "utf8");
+          const bytes = Buffer.byteLength(fact.content, "utf8");
+          contentBytes += bytes;
+          if (sourceFile) sourceContentBytes += bytes;
         } catch {
           partial = true;
         }
@@ -846,6 +1105,7 @@ export function analyzeZipProject(archivePath: string): Promise<ProjectAnalysis>
       if (openError || !zip) return reject(badRequest("ZIP archive cannot be analyzed", "INVALID_ZIP"));
       const facts: ProjectFileFact[] = [];
       let contentBytes = 0;
+      let sourceContentBytes = 0;
       let partial = false;
       let settled = false;
       const fail = (error: Error): void => {
@@ -878,7 +1138,14 @@ export function analyzeZipProject(archivePath: string): Promise<ProjectAnalysis>
           facts.push(fact);
           return next();
         }
-        if (contentBytes + entry.uncompressedSize > MAX_ANALYSIS_CONTENT_BYTES) {
+        const sourceFile = isEnvironmentSourceOnlyPath(normalized);
+        if (
+          contentBytes + entry.uncompressedSize > MAX_ANALYSIS_CONTENT_BYTES
+          || (sourceFile && (
+            entry.uncompressedSize > MAX_ANALYSIS_SOURCE_FILE_BYTES
+            || sourceContentBytes + entry.uncompressedSize > MAX_ANALYSIS_SOURCE_CONTENT_BYTES
+          ))
+        ) {
           partial = true;
           facts.push(fact);
           return next();
@@ -889,7 +1156,13 @@ export function analyzeZipProject(archivePath: string): Promise<ProjectAnalysis>
           let bytes = 0;
           stream.on("data", (chunk: Buffer) => {
             bytes += chunk.length;
-            if (contentBytes + bytes > MAX_ANALYSIS_CONTENT_BYTES) {
+            if (
+              contentBytes + bytes > MAX_ANALYSIS_CONTENT_BYTES
+              || (sourceFile && (
+                bytes > MAX_ANALYSIS_SOURCE_FILE_BYTES
+                || sourceContentBytes + bytes > MAX_ANALYSIS_SOURCE_CONTENT_BYTES
+              ))
+            ) {
               stream.destroy(badRequest("ZIP project configuration is too large to analyze", "ANALYSIS_CONTENT_TOO_LARGE"));
               return;
             }
@@ -907,7 +1180,9 @@ export function analyzeZipProject(archivePath: string): Promise<ProjectAnalysis>
             if (finished) return;
             finished = true;
             fact.content = Buffer.concat(chunks).toString("utf8");
-            contentBytes += Buffer.byteLength(fact.content, "utf8");
+            const contentLength = Buffer.byteLength(fact.content, "utf8");
+            contentBytes += contentLength;
+            if (sourceFile) sourceContentBytes += contentLength;
             facts.push(fact);
             next();
           });
@@ -934,15 +1209,19 @@ export function relevantGitHubTreePaths(
 ): { files: ProjectFileFact[]; partial: boolean } {
   const publishableTree = files.filter((file) => !isIgnoredAnalysisPath(file.path));
   if (publishableTree.length <= MAX_ANALYSIS_PATHS && !truncated) return { files: publishableTree, partial: false };
-  const relevant = publishableTree.filter((file) => {
+  const structural = publishableTree.filter((file) => {
     const name = basename(file.path);
-    return isAnalysisContentPath(file.path)
+    return isProjectConfigurationContentPath(file.path)
       || name === "dockerfile"
       || name === "index.html"
       || LOCK_FILES.includes(name as typeof LOCK_FILES[number]);
   });
-  if (relevant.length > MAX_ANALYSIS_PATHS) {
+  if (structural.length > MAX_ANALYSIS_PATHS) {
     throw badRequest("GitHub repository is too large to analyze safely", "GITHUB_ANALYSIS_TOO_LARGE");
   }
-  return { files: relevant, partial: true };
+  const source = publishableTree
+    .filter((file) => isEnvironmentSourceOnlyPath(file.path))
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .slice(0, MAX_ANALYSIS_PATHS - structural.length);
+  return { files: [...structural, ...source], partial: true };
 }
