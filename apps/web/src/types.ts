@@ -188,6 +188,22 @@ export interface GitHubBranch {
 
 export type ProjectAnalysisRendering = 'ssr' | 'spa' | 'static' | 'server' | 'files' | string;
 
+export interface ProjectEnvironmentRequirementSource {
+  path: string;
+  line: number;
+  kind: 'example' | 'reference' | 'validation';
+}
+
+export interface ProjectEnvironmentRequirement {
+  key: string;
+  required: boolean;
+  secret: boolean;
+  scope: 'build' | 'runtime' | 'both';
+  visibility: 'server' | 'public';
+  confidence: 'high' | 'medium';
+  sources: ProjectEnvironmentRequirementSource[];
+}
+
 export interface ProjectAnalysisApplication {
   id: string;
   rootDirectory: string;
@@ -204,6 +220,7 @@ export interface ProjectAnalysisApplication {
   healthcheckPath: string;
   spaFallback: boolean;
   environmentKeys: string[];
+  environmentRequirements?: ProjectEnvironmentRequirement[];
   confidence: number | 'high' | 'medium' | 'low';
   evidence: string[];
 }

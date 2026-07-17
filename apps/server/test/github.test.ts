@@ -2511,6 +2511,7 @@ describe("GitHub webhook deployment queue", () => {
 
   it("analyzes GitHub trees with bounded content reads and caches the result by branch SHA", async () => {
     const commitSha = "a".repeat(40);
+    const pageSource = "process.env.ANTHROPIC_API_KEY";
     let treeRequests = 0;
     let contentRequests = 0;
     const fetcher = vi.fn(async (input: string | URL | Request) => {
@@ -2545,7 +2546,7 @@ describe("GitHub webhook deployment queue", () => {
           tree: [
             { path: "package.json", type: "blob", size: 120, sha: "b".repeat(40) },
             { path: "next.config.mjs", type: "blob", size: 36, sha: "c".repeat(40) },
-            { path: "app/page.tsx", type: "blob", size: 20, sha: "d".repeat(40) },
+            { path: "app/page.tsx", type: "blob", size: Buffer.byteLength(pageSource), sha: "d".repeat(40) },
             { path: ".env", type: "blob", size: 500, sha: "e".repeat(40) },
             { path: "node_modules/evil/package.json", type: "blob", size: 20, sha: "f".repeat(40) },
             ...Array.from({ length: 150 }, (_, index) => ({
@@ -2568,6 +2569,11 @@ describe("GitHub webhook deployment queue", () => {
         const content = Buffer.from("export default { output: 'export' }");
         return json({ type: "file", encoding: "base64", content: content.toString("base64"), size: content.length });
       }
+      if (url.includes("/contents/app/page.tsx?")) {
+        contentRequests += 1;
+        const content = Buffer.from(pageSource);
+        return json({ type: "file", encoding: "base64", content: content.toString("base64"), size: content.length });
+      }
       throw new Error(`Unexpected request: ${url}`);
     }) as unknown as typeof fetch;
     const { database, github } = context(fetcher);
@@ -2579,10 +2585,16 @@ describe("GitHub webhook deployment queue", () => {
     expect(first.applications[0]).toMatchObject({
       framework: "next",
       rendering: "static",
-      outputDirectory: "out"
+      outputDirectory: "out",
+      environmentRequirements: [expect.objectContaining({
+        key: "ANTHROPIC_API_KEY",
+        required: false,
+        secret: true,
+        sources: [expect.objectContaining({ path: "app/page.tsx", line: 1 })]
+      })]
     });
     expect(treeRequests).toBe(1);
-    expect(contentRequests).toBe(2);
+    expect(contentRequests).toBe(3);
     expect(JSON.stringify(first)).not.toContain(".env");
     database.close();
   });

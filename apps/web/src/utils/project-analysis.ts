@@ -1,4 +1,8 @@
-import type { ProjectAnalysisApplication, ProjectSourceAnalysis } from '../types';
+import type {
+  ProjectAnalysisApplication,
+  ProjectEnvironmentRequirement,
+  ProjectSourceAnalysis,
+} from '../types';
 
 export interface DetectableBuildConfig {
   rootDirectory: string;
@@ -69,6 +73,34 @@ export function missingDetectedEnvironmentKeys(
       && !seen.has(key)
       && Boolean(seen.add(key))
     ));
+}
+
+function legacyEnvironmentRequirement(key: string): ProjectEnvironmentRequirement {
+  const publicVariable = /^(?:NEXT_PUBLIC_|NUXT_PUBLIC_|PUBLIC_|REACT_APP_|VITE_)/.test(key);
+  return {
+    key,
+    required: false,
+    secret: !publicVariable && /(?:API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|DATABASE_URL|DB_URL|PASS(?:WORD)?|PRIVATE|SECRET|TOKEN)/.test(key),
+    scope: publicVariable ? 'build' : 'runtime',
+    visibility: publicVariable ? 'public' : 'server',
+    confidence: 'medium',
+    sources: [],
+  };
+}
+
+export function detectedEnvironmentRequirements(
+  application: ProjectAnalysisApplication | null | undefined,
+): ProjectEnvironmentRequirement[] {
+  const requirements = application?.environmentRequirements;
+  if (Array.isArray(requirements)) {
+    return requirements.filter((requirement) => (
+      /^[A-Z_][A-Z0-9_]*$/.test(requirement.key)
+      && (requirement.confidence === 'high' || requirement.confidence === 'medium')
+      && (requirement.visibility === 'server' || requirement.visibility === 'public')
+      && Array.isArray(requirement.sources)
+    ));
+  }
+  return (application?.environmentKeys ?? []).map(legacyEnvironmentRequirement);
 }
 
 export class AnalysisRequestCoordinator {

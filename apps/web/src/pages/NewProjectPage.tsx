@@ -23,6 +23,7 @@ import { api } from '../api/client';
 import { NavigationGuard } from '../components/NavigationGuard';
 import { GitHubIcon } from '../components/GitHubIcon';
 import { ProjectAnalysisCard, type ProjectAnalysisStatus } from '../components/ProjectAnalysisCard';
+import { ProjectEnvironmentSetup } from '../components/ProjectEnvironmentSetup';
 import { StaticBasePathControl } from '../components/StaticBasePathControl';
 import { Button, Field, PageIntro, SelectField } from '../components/ui';
 import {
@@ -58,8 +59,8 @@ import { collectFolderAnalysisFiles, collectZipAnalysisFiles } from '../utils/pr
 import {
   AnalysisRequestCoordinator,
   analysisApplication,
+  detectedEnvironmentRequirements,
   mergeDetectedBuildConfig,
-  missingDetectedEnvironmentKeys,
   recommendedAnalysisApplicationId,
   type DetectableBuildConfigField,
 } from '../utils/project-analysis';
@@ -208,6 +209,7 @@ export function NewProjectPage() {
   const [folderFiles, setFolderFiles] = useState<File[]>([]);
   const [staticBasePath, setStaticBasePath] = useState<string | null>(null);
   const [environment, setEnvironment] = useState<EnvironmentEntry[]>([]);
+  const [skippedDetectedEnvironmentKeys, setSkippedDetectedEnvironmentKeys] = useState<Set<string>>(new Set());
   const [progress, setProgress] = useState<{ percent: number; label: string; detail?: string } | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState('');
@@ -591,6 +593,10 @@ export function NewProjectPage() {
     || Boolean(activeAnalysisIdentity && appliedAnalysisIdentity !== activeAnalysisIdentity);
 
   useEffect(() => {
+    setSkippedDetectedEnvironmentKeys(new Set());
+  }, [activeAnalysisIdentity, selectedApplicationId]);
+
+  useEffect(() => {
     if (!activeAnalysisIdentity || !activeAnalysis) {
       setSelectedApplicationId('');
       setAppliedAnalysisIdentity('');
@@ -608,25 +614,38 @@ export function NewProjectPage() {
   const selectedApplication = analysisApplication(activeAnalysis, selectedApplicationId)
     ?? activeAnalysis?.applications[0]
     ?? null;
-  const detectedMissingEnvironmentKeys = useMemo(() => missingDetectedEnvironmentKeys(
-    selectedApplication?.environmentKeys ?? [],
-    environment.map((variable) => variable.key),
-    reservedEnvironmentKeys,
-  ), [environment, selectedApplication]);
-  const addableDetectedEnvironmentKeys = detectedMissingEnvironmentKeys.slice(
-    0,
-    Math.max(0, MAX_ENVIRONMENT_VARIABLES - environment.length),
-  );
+  const environmentRequirements = useMemo(() => (
+    detectedEnvironmentRequirements(selectedApplication)
+      .filter((requirement) => !reservedEnvironmentKeys.has(requirement.key))
+      .slice(0, MAX_ENVIRONMENT_VARIABLES)
+  ), [selectedApplication]);
+  const detectedEnvironmentValues = useMemo(() => Object.fromEntries(
+    environment.map((variable) => [variable.key, variable.value]),
+  ), [environment]);
+  const firstUnresolvedEnvironmentRequirement = environmentRequirements.find((requirement) => (
+    requirement.required
+    && !skippedDetectedEnvironmentKeys.has(requirement.key)
+    && !(detectedEnvironmentValues[requirement.key] ?? '').trim()
+  ));
 
-  function addDetectedEnvironmentVariables() {
-    const keys = addableDetectedEnvironmentKeys;
-    if (!keys.length) return;
-    const entries = keys.map((key) => {
+  function updateDetectedEnvironmentVariable(key: string, value: string) {
+    if (value.trim()) {
+      setSkippedDetectedEnvironmentKeys((current) => {
+        if (!current.has(key)) return current;
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+    setEnvironment((current) => {
+      const existing = current.find((variable) => variable.key === key);
+      if (existing) {
+        return current.map((variable) => variable.id === existing.id ? { ...variable, value } : variable);
+      }
+      if (current.length >= MAX_ENVIRONMENT_VARIABLES) return current;
       environmentId.current += 1;
-      return { id: environmentId.current, key, value: '' };
+      return [...current, { id: environmentId.current, key, value }];
     });
-    setEnvironment((current) => [...current, ...entries]);
-    setEnvironmentOpen('environment');
   }
 
   const folderSize = folderFiles.reduce((sum, file) => sum + file.size, 0);
@@ -680,6 +699,18 @@ export function NewProjectPage() {
     : environmentBytes > MAX_ENVIRONMENT_BYTES
       ? t('Environment variables may total at most 256 KiB.', 'Umgebungsvariablen dürfen zusammen höchstens 256 KiB groß sein.')
       : undefined;
+  const detectedEnvironmentErrors = useMemo(() => Object.fromEntries(
+    environmentRequirements.map((requirement) => {
+      const environmentIndex = environment.findIndex((variable) => variable.key === requirement.key);
+      const entryError = environmentIndex >= 0 ? environmentErrors[environmentIndex]?.value : undefined;
+      const missingError = requirement.required
+        && !skippedDetectedEnvironmentKeys.has(requirement.key)
+        && !(detectedEnvironmentValues[requirement.key] ?? '').trim()
+        ? t('{key} is required before the first deployment.', '{key} wird vor dem ersten Deployment benötigt.', { key: requirement.key })
+        : undefined;
+      return [requirement.key, missingError ?? entryError];
+    }),
+  ), [detectedEnvironmentValues, environment, environmentErrors, environmentRequirements, skippedDetectedEnvironmentKeys, t]);
 
   const validationErrors = useMemo(() => {
     const port = Number(config.port);
@@ -716,7 +747,9 @@ export function NewProjectPage() {
           : name.length > MAX_PROJECT_NAME_LENGTH
             ? t('The project name may contain at most {count} characters.', 'Der Projektname darf höchstens {count} Zeichen lang sein.', { count: MAX_PROJECT_NAME_LENGTH })
             : undefined,
-      environment: firstEnvironmentError?.key ?? firstEnvironmentError?.value ?? environmentGlobalError,
+      environment: firstUnresolvedEnvironmentRequirement
+        ? t('{key} is required before the first deployment.', '{key} wird vor dem ersten Deployment benötigt.', { key: firstUnresolvedEnvironmentRequirement.key })
+        : firstEnvironmentError?.key ?? firstEnvironmentError?.value ?? environmentGlobalError,
       port: config.port && (!Number.isInteger(port) || port < 1 || port > 65535)
         ? t('The port must be an integer between 1 and 65535.', 'Der Port muss eine ganze Zahl zwischen 1 und 65535 sein.')
         : undefined,
@@ -740,6 +773,7 @@ export function NewProjectPage() {
     config.rootDirectory,
     environmentErrors,
     environmentGlobalError,
+    firstUnresolvedEnvironmentRequirement,
     gitSourceMode,
     githubSettings.data?.connected,
     hasUpload,
@@ -849,13 +883,17 @@ export function NewProjectPage() {
       setAdvancedOpen('advanced');
       targetId = 'new-project-static-base-path';
     } else if (validationErrors.environment) {
-      setEnvironmentOpen('environment');
-      const index = environmentErrors.findIndex((error) => error.key || error.value);
-      const variable = environment[index] ?? environment.at(-1);
-      const error = environmentErrors[index];
-      if (variable) targetId = index === -1 || (error?.value && !error.key)
-        ? `environment-value-${variable.id}`
-        : `environment-key-${variable.id}`;
+      if (firstUnresolvedEnvironmentRequirement) {
+        targetId = `detected-environment-${firstUnresolvedEnvironmentRequirement.key}`;
+      } else {
+        setEnvironmentOpen('environment');
+        const index = environmentErrors.findIndex((error) => error.key || error.value);
+        const variable = environment[index] ?? environment.at(-1);
+        const error = environmentErrors[index];
+        if (variable) targetId = index === -1 || (error?.value && !error.key)
+          ? `environment-value-${variable.id}`
+          : `environment-key-${variable.id}`;
+      }
     }
 
     window.setTimeout(() => targetId && document.getElementById(targetId)?.focus(), 0);
@@ -1353,8 +1391,6 @@ export function NewProjectPage() {
               }}
               onShowAdvanced={showDetectedSettings}
               onRetry={analysisStatus === 'error' ? retrySourceAnalysis : undefined}
-              missingEnvironmentKeys={addableDetectedEnvironmentKeys}
-              onAddEnvironmentKeys={addableDetectedEnvironmentKeys.length ? addDetectedEnvironmentVariables : undefined}
             />
           </section>
 
@@ -1382,6 +1418,27 @@ export function NewProjectPage() {
               />
             </div>
           </section>
+
+          {environmentRequirements.length > 0 && (
+            <section className="py-8" aria-labelledby="detected-environment-step-title">
+              <h2 id="detected-environment-step-title" className="sr-only">{t('Configure your environment', 'Umgebung konfigurieren')}</h2>
+              <ProjectEnvironmentSetup
+                requirements={environmentRequirements}
+                values={detectedEnvironmentValues}
+                errors={detectedEnvironmentErrors}
+                skippedKeys={skippedDetectedEnvironmentKeys}
+                showErrors={submitAttempted}
+                disabled={createProject.isPending}
+                onChange={updateDetectedEnvironmentVariable}
+                onSkippedChange={(key, skipped) => setSkippedDetectedEnvironmentKeys((current) => {
+                  const next = new Set(current);
+                  if (skipped) next.add(key);
+                  else next.delete(key);
+                  return next;
+                })}
+              />
+            </section>
+          )}
 
           <section className="py-8" aria-labelledby="advanced-step-title">
             <Accordion type="single" collapsible value={advancedOpen} onValueChange={setAdvancedOpen}>
