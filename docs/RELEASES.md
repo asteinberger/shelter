@@ -189,6 +189,34 @@ visibility. For a public Shelter release, an administrator must change the
 linked `shelter` container package to public once. Installations always use the
 digest recorded in the verified bundle regardless of package visibility.
 
+### Migration to the `raum-so` organization
+
+The canonical source and release repository is `raum-so/shelter`. GitHub keeps
+the former `asteinberger/shelter` location as a redirect, and the release
+downloader resolves that redirect before it verifies a release. Existing source
+clones should still update their remote explicitly:
+
+```sh
+git remote set-url origin https://github.com/raum-so/shelter.git
+```
+
+Operators with an existing `.env.server` should set the canonical repository
+before their next verified deployment:
+
+```sh
+SHELTER_RELEASE_REPOSITORY=raum-so/shelter
+```
+
+Already running control-plane images and locally retained rollback bundles are
+unaffected. Releases built before the transfer continue to reference
+`ghcr.io/asteinberger/shelter`; the downloader accepts that one explicit legacy
+namespace only for the five published pre-transfer tags and only when the
+canonical repository is `raum-so/shelter`. GitHub does not expose the
+transferred `v0.4.0` release attestation under the new owner, so the fail-closed
+downloader intentionally refuses a fresh `v0.4.0` download. Use the first
+organization-owned release or a locally retained authenticated bundle instead
+of bypassing verification.
+
 ## Download and install a verified release
 
 The download helper requires a current, authenticated GitHub CLI with
@@ -201,22 +229,22 @@ Run the helper from a trusted Shelter checkout:
 ```sh
 gh auth login
 ./ops/download-release.sh \
-  --repo asteinberger/shelter \
-  --tag v0.2.1 \
-  --destination ../shelter-v0.2.1
+  --repo raum-so/shelter \
+  --tag v0.4.1 \
+  --destination ../shelter-v0.4.1
 ```
 
 Inspect the immutable plan without contacting Docker or changing the current
 installation:
 
 ```sh
-../shelter-v0.2.1/ops/install-release-bundle.sh --dry-run
+../shelter-v0.4.1/ops/install-release-bundle.sh --dry-run
 ```
 
 For a new interactive installation:
 
 ```sh
-cd ../shelter-v0.2.1
+cd ../shelter-v0.4.1
 ./ops/install-release-bundle.sh
 ```
 
@@ -257,9 +285,9 @@ a fail-closed marker; rerun the same release command before using `install`,
 The release and any downloaded asset can be verified again with GitHub CLI:
 
 ```sh
-gh release verify v0.2.1 --repo asteinberger/shelter
-gh release verify-asset v0.2.1 shelter-v0.2.1.tar.gz \
-  --repo asteinberger/shelter
+gh release verify v0.4.1 --repo raum-so/shelter
+gh release verify-asset v0.4.1 shelter-v0.4.1.tar.gz \
+  --repo raum-so/shelter
 ```
 
 After authenticating to GHCR, verify the OCI provenance against this repository
@@ -267,10 +295,10 @@ and the release workflow:
 
 ```sh
 gh attestation verify \
-  oci://ghcr.io/asteinberger/shelter@sha256:RELEASE_DIGEST \
-  --repo asteinberger/shelter \
-  --signer-workflow asteinberger/shelter/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.2.1 \
+  oci://ghcr.io/raum-so/shelter@sha256:RELEASE_DIGEST \
+  --repo raum-so/shelter \
+  --signer-workflow raum-so/shelter/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.4.1 \
   --bundle-from-oci
 ```
 

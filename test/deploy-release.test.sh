@@ -106,6 +106,7 @@ EOF
 set -eu
 printf '%s\n' "$*" >> "$MOCK_GH_LOG"
 case "$1 ${2:-}" in
+  'api repos/example/shelter') printf '%s\n' 'example/shelter' ;;
   'release verify') exit 0 ;;
   'release verify-asset') exit 0 ;;
   'release download')
