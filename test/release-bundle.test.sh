@@ -130,6 +130,11 @@ EOF
 #!/bin/sh
 set -u
 printf '%s\n' "$*" >> "$MOCK_GH_LOG"
+if [ "${1:-}" = api ]; then
+  [ "${MOCK_GH_FAIL_API:-0}" -eq 0 ] || exit 40
+  printf '%s\n' "${MOCK_CANONICAL_REPOSITORY:-example/shelter}"
+  exit 0
+fi
 [ "${1:-}" = release ] || exit 99
 case "${2:-}" in
   verify)
@@ -169,6 +174,7 @@ EOF
   export MOCK_LOCAL_IMAGE=$TEST_LOCAL_IMAGE MOCK_IMAGE_ID=$TEST_IMAGE_ID
   export MOCK_DOCKER_FAIL_PULL=0 MOCK_DOCKER_MUTATE_BUNDLE=0 MOCK_LOCAL_COLLISION=0
   export MOCK_GH_FAIL_RELEASE=0 MOCK_GH_FAIL_DOWNLOAD=0 MOCK_GH_FAIL_ASSET=0
+  export MOCK_GH_FAIL_API=0 MOCK_CANONICAL_REPOSITORY=example/shelter
   export MOCK_RELEASE_ASSET=
 }
 
@@ -226,6 +232,7 @@ test_download_verifies_release_and_asset_before_publish() {
     --repo example/shelter --tag v1.2.3 --asset shelter-v1.2.3.tar.gz --destination "$destination"
   assert_status 0
   [[ -f "$destination/release.manifest" ]] || fail_test 'verified release destination was not published'
+  assert_contains "$MOCK_GH_LOG" 'api repos/example/shelter --jq .full_name'
   assert_contains "$MOCK_GH_LOG" 'release verify v1.2.3 --repo example/shelter'
   assert_contains "$MOCK_GH_LOG" 'release download v1.2.3 --repo example/shelter --pattern shelter-v1.2.3.tar.gz --output'
   assert_contains "$MOCK_GH_LOG" 'release verify-asset v1.2.3'
@@ -236,6 +243,62 @@ test_download_verifies_release_and_asset_before_publish() {
   [[ "$release_line" -lt "$download_line" && "$download_line" -lt "$asset_line" ]] || fail_test 'GitHub verification order is wrong'
   expected_destination=$(CDPATH= cd -P "$TEST_TMP/releases" && pwd -P)/v1.2.3
   assert_contains "$COMMAND_OUTPUT" "Shelter release downloaded and verified at ${expected_destination}"
+}
+
+test_download_follows_repository_transfer_before_verification() {
+  TEST_IMAGE_REFERENCE=ghcr.io/raum-so/shelter:v1.2.3
+  prepare_download_asset
+  TEST_IMAGE_REFERENCE=ghcr.io/example/shelter:v1.2.3
+  MOCK_CANONICAL_REPOSITORY=raum-so/shelter
+  export MOCK_CANONICAL_REPOSITORY
+  destination=$TEST_TMP/releases/v1.2.3
+
+  run_command "$REPO_ROOT/ops/download-release.sh" \
+    --repo asteinberger/shelter --tag v1.2.3 --destination "$destination"
+
+  assert_status 0
+  assert_contains "$COMMAND_OUTPUT" 'Following repository transfer asteinberger/shelter -> raum-so/shelter'
+  assert_contains "$MOCK_GH_LOG" 'release verify v1.2.3 --repo raum-so/shelter'
+  assert_contains "$MOCK_GH_LOG" 'release verify-asset v1.2.3'
+}
+
+test_download_rejects_invalid_canonical_repository() {
+  mkdir -p "$TEST_TMP/releases"
+  MOCK_CANONICAL_REPOSITORY='raum-so/shelter/extra'
+  export MOCK_CANONICAL_REPOSITORY
+  destination=$TEST_TMP/releases/v1.2.3
+
+  run_command "$REPO_ROOT/ops/download-release.sh" \
+    --repo asteinberger/shelter --tag v1.2.3 --destination "$destination"
+
+  assert_status 1
+  assert_contains "$COMMAND_OUTPUT" 'GitHub returned an invalid canonical repository identity'
+  assert_not_contains "$MOCK_GH_LOG" 'release verify'
+  assert_absent "$destination"
+}
+
+test_download_limits_legacy_image_namespace_to_pre_transfer_tags() {
+  TEST_VERSION=0.4.0
+  TEST_IMAGE_REFERENCE=ghcr.io/asteinberger/shelter:v0.4.0
+  prepare_download_asset
+  MOCK_CANONICAL_REPOSITORY=raum-so/shelter
+  export MOCK_CANONICAL_REPOSITORY
+  destination=$TEST_TMP/releases/v0.4.0
+
+  run_command "$REPO_ROOT/ops/download-release.sh" \
+    --repo raum-so/shelter --tag v0.4.0 --destination "$destination"
+  assert_status 0
+
+  rm -rf "$destination" "$TEST_TMP/releases" "$MOCK_RELEASE_ASSET"
+  TEST_VERSION=1.2.3
+  TEST_IMAGE_REFERENCE=ghcr.io/asteinberger/shelter:v1.2.3
+  prepare_download_asset
+  destination=$TEST_TMP/releases/v1.2.3
+  run_command "$REPO_ROOT/ops/download-release.sh" \
+    --repo raum-so/shelter --tag v1.2.3 --destination "$destination"
+  assert_status 1
+  assert_contains "$COMMAND_OUTPUT" 'bundle image does not belong to the verified GitHub repository and tag'
+  assert_absent "$destination"
 }
 
 test_download_fails_closed_on_attestation_errors() {
@@ -527,6 +590,9 @@ printf 'Shelter release-bundle tests (%s)\n\n' "$TEST_SHELL"
 run_test 'release scripts parse as POSIX shell' test_posix_syntax
 run_test 'manifest creation produces a verifiable offline bundle' test_create_and_verify_bundle
 run_test 'download verifies GitHub release and asset attestations' test_download_verifies_release_and_asset_before_publish
+run_test 'download follows the canonical repository after a transfer' test_download_follows_repository_transfer_before_verification
+run_test 'download rejects an unsafe canonical repository identity' test_download_rejects_invalid_canonical_repository
+run_test 'legacy image namespace is limited to pre-transfer tags' test_download_limits_legacy_image_namespace_to_pre_transfer_tags
 run_test 'attestation failures never publish or extract a release' test_download_fails_closed_on_attestation_errors
 run_test 'authenticated archives still reject links before extraction' test_download_rejects_links_before_extraction
 run_test 'download binds bundle metadata to repository and tag' test_download_binds_bundle_to_repository_and_tag
