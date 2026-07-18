@@ -3,8 +3,11 @@
   <h1>Shelter</h1>
   <p><strong>give your code a home</strong></p>
   <p>
-    A small, self-hosted deployment platform for Git repositories,<br />
-    ZIP archives, and project folders on your own VPS.
+    Open-source deployment infrastructure for people who want<br />
+    the simplicity of a platform and the ownership of their own VPS.
+  </p>
+  <p>
+    Built by <a href="https://raum.so"><strong>raum</strong></a>.
   </p>
   <p>
     <a href="https://shelter.host">Website</a>
@@ -28,7 +31,9 @@
 
 ---
 
-Shelter turns one VPS into a focused deployment control plane. Connect GitHub, use a public HTTPS Git source, or upload a project directly. Shelter builds a container image, checks the candidate, and only then switches production traffic. Domains and the administrator panel are published through a managed Cloudflare Tunnel, so project containers need no public host ports.
+Shelter turns one VPS into a deployment platform you own. Connect GitHub, use a public HTTPS Git source, or upload a project directly. Shelter builds a container image, checks the candidate, and only then switches production traffic. Domains and the administrator panel are published through a managed Cloudflare Tunnel, so project containers need no public host ports.
+
+It is built on a simple belief: owning your infrastructure should not mean operating every deployment by hand.
 
 The product and marketing site live at [shelter.host](https://shelter.host). Every installation intentionally uses its own domain for the control panel.
 
@@ -36,6 +41,8 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 > Shelter is currently a single-operator MVP for **trusted application code**. Docker builds are not a sandbox for hostile tenants. Read the [threat model](SECURITY.md#threat-model) before using Shelter in production.
 
 ## Why Shelter
+
+Most deployment platforms trade ownership for convenience. Traditional self-hosting often trades convenience for ownership. Shelter is built for the middle: platform-style workflows on infrastructure you control.
 
 | Deploy | Route | Control |
 | --- | --- | --- |
