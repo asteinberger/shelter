@@ -19,7 +19,7 @@
     · <a href="SECURITY.md">Security</a>
   </p>
   <p>
-    <a href="https://github.com/asteinberger/shelter/actions/workflows/ci.yml?query=branch%3Adev"><img alt="CI" src="https://github.com/asteinberger/shelter/actions/workflows/ci.yml/badge.svg?branch=dev" /></a>
+    <a href="https://github.com/raum-so/shelter/actions/workflows/ci.yml?query=branch%3Adev"><img alt="CI" src="https://github.com/raum-so/shelter/actions/workflows/ci.yml/badge.svg?branch=dev" /></a>
     <img alt="Status: MVP" src="https://img.shields.io/badge/status-MVP-f59e0b" />
     <img alt="Node.js 24+" src="https://img.shields.io/badge/Node.js-24%2B-3c873a?logo=nodedotjs&logoColor=white" />
     <img alt="Docker Compose v2" src="https://img.shields.io/badge/Docker_Compose-v2-2496ed?logo=docker&logoColor=white" />
@@ -71,7 +71,7 @@ Most deployment platforms trade ownership for convenience. Traditional self-host
 - recommended: 2 vCPU, 4 GB RAM, and 40 GB SSD
 
 ```sh
-git clone https://github.com/asteinberger/shelter.git
+git clone https://github.com/raum-so/shelter.git
 cd shelter
 ./install.sh doctor
 ./install.sh

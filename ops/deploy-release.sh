@@ -31,7 +31,7 @@ installs it by OCI digest, and runs Shelter doctor.
 Options:
   --tag TAG          Required immutable release tag, for example v0.3.0.
   --server-env FILE  Read VPS access from FILE instead of .env.server.
-  --repo OWNER/REPO  GitHub repository (default: asteinberger/shelter).
+  --repo OWNER/REPO  GitHub repository (default: raum-so/shelter).
   --dry-run          Verify locally and remotely and run the remote installer
                      dry run. Temporary staging is removed; no release is
                      published or installed.
@@ -116,7 +116,7 @@ shelter_server_connection_init "$server_env_file" shelter-release-deploy || exit
 [[ "$SHELTER_SERVER_PATH" == /opt/shelter ]] ||
   fail "Verified releases are installed only at /opt/shelter; SHELTER_SERVER_PATH currently points elsewhere."
 
-repository="${repository_argument:-${SHELTER_RELEASE_REPOSITORY:-asteinberger/shelter}}"
+repository="${repository_argument:-${SHELTER_RELEASE_REPOSITORY:-raum-so/shelter}}"
 case "$repository" in
   */*) ;;
   *) fail "--repo must use OWNER/REPOSITORY." ;;

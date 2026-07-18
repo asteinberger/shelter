@@ -10,6 +10,7 @@ script_dir=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)
 . "$script_dir/lib/release-bundle.sh"
 
 repository=
+requested_repository=
 tag=
 asset=
 destination=
@@ -144,6 +145,24 @@ for required_command in gh tar mktemp awk tr wc; do
   command -v "$required_command" >/dev/null 2>&1 || fail "${required_command} is required"
 done
 
+# Repository transfers keep GitHub redirects, but release attestations and new
+# GHCR images are bound to the repository's current owner. Resolve the canonical
+# identity before verifying anything so old, documented clone configurations
+# continue to select the transferred repository without weakening provenance.
+requested_repository=$repository
+repository=$(gh api "repos/${requested_repository}" --jq .full_name) ||
+  fail "the canonical GitHub repository identity could not be resolved"
+case "$repository" in
+  [A-Za-z0-9_.-]*/*[A-Za-z0-9_.-]) ;;
+  *) fail "GitHub returned an invalid canonical repository identity" ;;
+esac
+case "$repository" in
+  *[!A-Za-z0-9_./-]*|*/*/*|*..*) fail "GitHub returned an invalid canonical repository identity" ;;
+esac
+if [ "$repository" != "$requested_repository" ]; then
+  printf 'Following repository transfer %s -> %s…\n' "$requested_repository" "$repository"
+fi
+
 staging_directory=$(mktemp -d "$resolved_parent/.shelter-release-download.XXXXXX")
 archive_path=$staging_directory/$asset
 archive_entries=$staging_directory/archive.entries
@@ -218,8 +237,18 @@ shelter_release_load "$extracted_bundle"
   fail "the bundle version does not match the verified GitHub Release tag"
 normalized_repository=$(printf '%s' "$repository" | tr '[:upper:]' '[:lower:]')
 expected_image_reference=ghcr.io/${normalized_repository}:${tag}
-[ "$SHELTER_RELEASE_IMAGE_REFERENCE" = "$expected_image_reference" ] ||
+legacy_image_reference=
+if [ "$normalized_repository" = raum-so/shelter ]; then
+  case "$tag" in
+    v0.2.0|v0.2.1|v0.3.0|v0.3.1|v0.4.0)
+      legacy_image_reference=ghcr.io/asteinberger/shelter:${tag}
+      ;;
+  esac
+fi
+if [ "$SHELTER_RELEASE_IMAGE_REFERENCE" != "$expected_image_reference" ] &&
+  [ "$SHELTER_RELEASE_IMAGE_REFERENCE" != "$legacy_image_reference" ]; then
   fail "the bundle image does not belong to the verified GitHub repository and tag"
+fi
 
 mv "$extracted_bundle" "$resolved_destination"
 printf 'Shelter release downloaded and verified at %s\n' "$resolved_destination"
