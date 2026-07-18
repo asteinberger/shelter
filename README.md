@@ -7,7 +7,7 @@
     the simplicity of a platform and the ownership of their own VPS.
   </p>
   <p>
-    Built by <a href="https://raum.so"><strong>raum</strong></a>.
+    Built by <a href="https://raum.so"><strong>[ʁaʊ̯m̩]</strong></a>.
   </p>
   <p>
     <a href="https://shelter.host">Website</a>
