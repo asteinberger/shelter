@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ProjectAnalysisApplication, ProjectSourceAnalysis } from '../types';
 import {
   AnalysisRequestCoordinator,
+  detectedEnvironmentRequirements,
   mergeDetectedBuildConfig,
   missingDetectedEnvironmentKeys,
   recommendedAnalysisApplicationId,
@@ -68,6 +69,30 @@ describe('project analysis selection', () => {
       ['PUBLIC_KEY'],
       new Set(['PORT']),
     )).toEqual(['DATABASE_URL']);
+  });
+
+  it('uses structured environment requirements and supports older analyses', () => {
+    const structured = application({
+      environmentKeys: ['DATABASE_URL'],
+      environmentRequirements: [{
+        key: 'DATABASE_URL',
+        required: true,
+        secret: true,
+        scope: 'runtime',
+        visibility: 'server',
+        confidence: 'high',
+        sources: [{ path: 'src/env.ts', line: 4, kind: 'validation' }],
+      }],
+    });
+    expect(detectedEnvironmentRequirements(structured)).toEqual(structured.environmentRequirements);
+
+    expect(detectedEnvironmentRequirements(application({
+      environmentKeys: ['NEXT_PUBLIC_ORIGIN', 'API_TOKEN'],
+      environmentRequirements: undefined,
+    }))).toEqual([
+      expect.objectContaining({ key: 'NEXT_PUBLIC_ORIGIN', visibility: 'public', secret: false, required: false }),
+      expect.objectContaining({ key: 'API_TOKEN', visibility: 'server', secret: true, required: false }),
+    ]);
   });
 });
 

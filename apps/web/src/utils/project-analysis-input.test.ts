@@ -43,7 +43,7 @@ describe('collectFolderAnalysisFiles', () => {
       },
       { path: 'vite.config.ts', size: 17, content: 'export default {}' },
       { path: 'pnpm-lock.yaml', size: 18 },
-      { path: 'src/main.tsx', size: 22 },
+      { path: 'src/main.tsx', size: 22, content: 'console.log("Shelter")' },
     ]);
   });
 
@@ -62,6 +62,27 @@ describe('collectFolderAnalysisFiles', () => {
       { path: '.env.example', size: 13, content: 'DATABASE_URL=' },
       { path: '.env.local.example', size: 10, content: 'API_TOKEN=' },
       { path: '.env.sample', size: 9, content: 'PORT=3000' },
+    ]);
+  });
+
+  it('reads bounded application source but ignores tests and generated code', async () => {
+    const oversizedSource = `process.env.${'A'.repeat(70 * 1024)}`;
+    const result = await collectFolderAnalysisFiles([
+      folderFile('project/src/server.ts', 'if (!process.env.API_TOKEN) throw new Error()'),
+      folderFile('project/src/server.test.ts', 'process.env.TEST_TOKEN'),
+      folderFile('project/tests/helper.ts', 'process.env.FIXTURE_TOKEN'),
+      folderFile('project/src/large.ts', oversizedSource),
+    ]);
+
+    expect(result).toEqual([
+      {
+        path: 'src/server.ts',
+        size: 45,
+        content: 'if (!process.env.API_TOKEN) throw new Error()',
+      },
+      { path: 'src/server.test.ts', size: 22 },
+      { path: 'tests/helper.ts', size: 25 },
+      { path: 'src/large.ts', size: oversizedSource.length },
     ]);
   });
 
@@ -164,7 +185,7 @@ describe('collectZipAnalysisFiles', () => {
       },
       { path: 'next.config.mjs', size: 17, content: 'export default {}' },
       { path: 'package-lock.json', size: 21 },
-      { path: 'app/page.tsx', size: 33 },
+      { path: 'app/page.tsx', size: 33, content: 'export default function Page() {}' },
     ]);
     expect(archive.arrayBuffer).not.toHaveBeenCalled();
     expect(progress[0]).toEqual({ scannedEntries: 0, bytesRead: 0, totalBytes: archive.size });

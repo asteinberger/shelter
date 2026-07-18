@@ -75,6 +75,100 @@ describe("project source analysis", () => {
     });
   });
 
+  it("detects bounded environment requirements from source references and validation schemas", () => {
+    const detected = application([
+      packageFile(".", {
+        scripts: { start: "node src/server.ts" },
+        dependencies: { "@anthropic-ai/sdk": "0.57.0", zod: "4.0.0" }
+      }),
+      {
+        path: "src/server.ts",
+        content: [
+          "// process.env.COMMENT_ONLY must be ignored",
+          "if (!process.env.ANTHROPIC_API_KEY) {",
+          "  throw new Error('missing API key');",
+          "}",
+          "const endpoint = process.env.OPTIONAL_ENDPOINT;",
+          "const publicOrigin = import.meta.env.VITE_PUBLIC_ORIGIN;"
+        ].join("\n")
+      },
+      {
+        path: "src/env.ts",
+        content: [
+          "export const env = createEnv({",
+          "  server: {",
+          "    DATABASE_URL: z.string().url(),",
+          "    OPTIONAL_REGION: z.string().optional(),",
+          "  },",
+          "});"
+        ].join("\n")
+      },
+      {
+        path: "src/server.test.ts"
+      }
+    ]);
+
+    expect(detected.environmentRequirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "ANTHROPIC_API_KEY",
+        required: true,
+        secret: true,
+        visibility: "server",
+        scope: "runtime",
+        confidence: "high",
+        sources: [expect.objectContaining({ path: "src/server.ts", line: 2, kind: "validation" })]
+      }),
+      expect.objectContaining({
+        key: "DATABASE_URL",
+        required: true,
+        secret: true,
+        confidence: "high",
+        sources: [expect.objectContaining({ path: "src/env.ts", line: 3, kind: "validation" })]
+      }),
+      expect.objectContaining({ key: "OPTIONAL_ENDPOINT", required: false, confidence: "medium" }),
+      expect.objectContaining({ key: "OPTIONAL_REGION", required: false, confidence: "high" }),
+      expect.objectContaining({
+        key: "VITE_PUBLIC_ORIGIN",
+        required: false,
+        secret: false,
+        visibility: "public",
+        scope: "build"
+      })
+    ]));
+    expect(detected.environmentKeys).toEqual([
+      "ANTHROPIC_API_KEY",
+      "DATABASE_URL",
+      "OPTIONAL_ENDPOINT",
+      "OPTIONAL_REGION",
+      "VITE_PUBLIC_ORIGIN"
+    ]);
+    expect(JSON.stringify(detected)).not.toContain("COMMENT_ONLY");
+    expect(JSON.stringify(detected)).not.toContain("TEST_ONLY_TOKEN");
+    expect(JSON.stringify(detected)).not.toContain("missing API key");
+  });
+
+  it("uses explicit environment examples without returning their values", () => {
+    const detected = application([
+      packageFile(".", { scripts: { start: "node server.js" } }),
+      {
+        path: ".env.example",
+        content: [
+          "ANTHROPIC_API_KEY=",
+          "# optional",
+          "LOG_LEVEL=info",
+          "NEXT_PUBLIC_ORIGIN=https://example.test"
+        ].join("\n")
+      }
+    ]);
+
+    expect(detected.environmentRequirements).toEqual([
+      expect.objectContaining({ key: "ANTHROPIC_API_KEY", required: true, secret: true, confidence: "high" }),
+      expect.objectContaining({ key: "LOG_LEVEL", required: false, confidence: "high" }),
+      expect.objectContaining({ key: "NEXT_PUBLIC_ORIGIN", required: false, visibility: "public", scope: "build" })
+    ]);
+    expect(JSON.stringify(detected)).not.toContain("https://example.test");
+  });
+
   it("detects React Vite, Create React App and plain Vite as SPAs", () => {
     expect(application([
       packageFile(".", { scripts: { build: "vite build" }, dependencies: { react: "19.1.0" }, devDependencies: { vite: "7.0.0" } }),
@@ -279,7 +373,10 @@ describe("project source analysis", () => {
     expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "../package.json", content: "{}" }] })).toThrow();
     expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: ".env", content: "SECRET=value" }] })).toThrow();
     expect(ProjectAnalysisRequestSchema.parse({ files: [{ path: ".env.local.example", content: "SAFE_KEY=" }] }).files).toHaveLength(1);
-    expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "src.js", content: "console.log(1)" }] })).toThrow();
+    expect(ProjectAnalysisRequestSchema.parse({ files: [{ path: "src.js", content: "process.env.SAFE_KEY" }] }).files).toHaveLength(1);
+    expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "src.test.ts", content: "process.env.TEST_KEY" }] })).toThrow();
+    expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "src/main.php", content: "getenv('SECRET')" }] })).toThrow();
+    expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "src.js", content: "x".repeat(64 * 1024 + 1) }] })).toThrow();
     expect(() => ProjectAnalysisRequestSchema.parse({ files: [{ path: "index.html" }, { path: "index.html" }] })).toThrow();
     expect(() => ProjectAnalysisRequestSchema.parse({
       files: Array.from({ length: MAX_ANALYSIS_PATHS + 1 }, (_, index) => ({ path: `files/${index}.txt` }))

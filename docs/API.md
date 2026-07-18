@@ -61,14 +61,14 @@ curl --fail-with-body \
   --data '{
     "files": [
       {"path":"package.json","content":"{\"scripts\":{\"build\":\"vite build\"},\"dependencies\":{\"react\":\"19.1.0\",\"vite\":\"7.0.0\"}}"},
-      {"path":"src/main.tsx","size":1200},
+      {"path":"src/main.tsx","size":1200,"content":"const origin = import.meta.env.VITE_API_ORIGIN"},
       {"path":"package-lock.json","size":42000}
     ]
   }' \
   "$SHELTER_URL/api/projects/analyze"
 ```
 
-Requests are limited to 10,000 safe relative POSIX paths, 512 KiB of allowlisted manifest content, and a 4 MiB HTTP body. Send lockfiles and source files as presence/size facts only. Content from real `.env` files is rejected; only explicit example/sample files may be inspected, and responses expose variable keys rather than values. The result includes detected applications, framework and rendering mode, package manager, root, commands, output directory, port, confidence, and evidence. Workspace-root manifests and lockfiles should be included when analyzing a monorepo so the recommended commands match the eventual npm, pnpm, Yarn, or Bun build. Treat the result as a recommendation: Shelter validates the checked-out or extracted source again during deployment.
+Requests are limited to 10,000 safe relative POSIX paths, 512 KiB of allowlisted text content, at most 64 KiB per supported source file, at most 384 KiB across source files, and a 4 MiB HTTP body. Lockfiles remain presence/size facts. Supported JavaScript, TypeScript, Astro, Vue, and Svelte source can include content for bounded environment-reference detection; tests, fixtures, generated trees, and unsupported source types remain presence-only. Content from real `.env` files is rejected; only explicit example/sample files may be inspected. Responses expose structured environment requirements, keys, source paths, and line numbers but never environment values or source snippets. The result also includes detected applications, framework and rendering mode, package manager, root, commands, output directory, port, confidence, and evidence. Workspace-root manifests and lockfiles should be included when analyzing a monorepo so the recommended commands match the eventual npm, pnpm, Yarn, or Bun build. Treat the result as a recommendation: Shelter validates the checked-out or extracted source again during deployment.
 
 ### Verify a token
 

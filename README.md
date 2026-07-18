@@ -3,8 +3,11 @@
   <h1>Shelter</h1>
   <p><strong>give your code a home</strong></p>
   <p>
-    A small, self-hosted deployment platform for Git repositories,<br />
-    ZIP archives, and project folders on your own VPS.
+    Open-source deployment infrastructure for people who want<br />
+    the simplicity of a platform and the ownership of their own VPS.
+  </p>
+  <p>
+    Built by <a href="https://raum.so"><strong>[ʁaʊ̯m̩]</strong></a>.
   </p>
   <p>
     <a href="https://shelter.host">Website</a>
@@ -28,7 +31,9 @@
 
 ---
 
-Shelter turns one VPS into a focused deployment control plane. Connect GitHub, use a public HTTPS Git source, or upload a project directly. Shelter builds a container image, checks the candidate, and only then switches production traffic. Domains and the administrator panel are published through a managed Cloudflare Tunnel, so project containers need no public host ports.
+Shelter turns one VPS into a deployment platform you own. Connect GitHub, use a public HTTPS Git source, or upload a project directly. Shelter builds a container image, checks the candidate, and only then switches production traffic. Domains and the administrator panel are published through a managed Cloudflare Tunnel, so project containers need no public host ports.
+
+It is built on a simple belief: owning your infrastructure should not mean operating every deployment by hand.
 
 The product and marketing site live at [shelter.host](https://shelter.host). Every installation intentionally uses its own domain for the control panel.
 
@@ -36,6 +41,8 @@ The product and marketing site live at [shelter.host](https://shelter.host). Eve
 > Shelter is currently a single-operator MVP for **trusted application code**. Docker builds are not a sandbox for hostile tenants. Read the [threat model](SECURITY.md#threat-model) before using Shelter in production.
 
 ## Why Shelter
+
+Most deployment platforms trade ownership for convenience. Traditional self-hosting often trades convenience for ownership. Shelter is built for the middle: platform-style workflows on infrastructure you control.
 
 | Deploy | Route | Control |
 | --- | --- | --- |
@@ -345,7 +352,7 @@ Public URL sources are analyzed after the worker has cloned the repository. Use 
 
 Upload a ZIP archive or select a folder in the browser. Folder uploads are compressed locally and sent in chunks with progress feedback. Archives are validated against path traversal, absolute paths, links, device files, excessive expanded size, and suspicious compression ratios.
 
-Shelter analyzes the selected ZIP or folder before the upload starts. Only safe relative paths and a small allowlist of project manifests are inspected; generated trees such as `node_modules`, `.next`, `dist`, and `build` are ignored. Real `.env` contents are never read. When a later upload appears to target a different app, root, runtime, or port, Shelter warns without silently changing the saved project settings.
+Shelter analyzes the selected ZIP or folder before the upload starts. Only safe relative paths, project manifests, explicit `.env.example`/`.env.sample` files, and a bounded set of supported text source files are inspected; generated trees such as `node_modules`, `.next`, `dist`, and `build` are ignored. Real `.env` contents are never read and repository code is never executed by the analyzer. When a later upload appears to target a different app, root, runtime, or port, Shelter warns without silently changing the saved project settings.
 
 If an upload contains only safe public assets such as images, media, or documents and no application entry point, Shelter publishes it as file storage. Original paths are preserved, directory browsing and dotfiles stay private, and unknown paths return `404` instead of an SPA fallback.
 
@@ -375,6 +382,8 @@ The project root, build type, Dockerfile path, application port, and health-chec
 ### Environment variables
 
 Variables are encrypted under `APP_SECRET` at rest. Saved values are not returned to the browser. The worker supplies them to automatic builds using a BuildKit secret and to running containers as environment variables.
+
+During GitHub, ZIP, and folder setup, Shelter detects bounded static references such as `process.env.KEY`, `import.meta.env.KEY`, Deno/Bun environment access, explicit example files, and common Zod/`createEnv` declarations. The setup separates required values from suggestions, server-only secrets from public client variables, and build-time from runtime use. High-confidence required values are requested before the first deployment, every finding links back to its source path and line, and a suspected false positive can be explicitly skipped. Dynamic lookups remain advisory and may need to be added manually.
 
 Builds run through Shelter's dedicated `docker-container` BuildKit builder rather than the unbounded default builder. The builder enforces configured memory, swap, CPU, PID, and maximum-parallelism limits and applies a cache-GC target; supported Buildx versions also receive the same per-build resource limits. Shelter checks free space throughout source preparation and the build, cancels cancellable work, and refuses completion below `BUILD_MIN_FREE_GB`.
 

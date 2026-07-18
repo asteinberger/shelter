@@ -21,6 +21,8 @@ export interface ProjectAnalysisInputOptions {
 
 const DEFAULT_MAX_ENTRIES = 10_000;
 const DEFAULT_MAX_CONTENT_BYTES = 512 * 1024;
+const MAX_SOURCE_FILE_BYTES = 64 * 1024;
+const MAX_SOURCE_CONTENT_BYTES = 384 * 1024;
 const MAX_ANALYSIS_PATH_LENGTH = 240;
 const MAX_SCANNED_ARCHIVE_ENTRIES = 100_000;
 const ZIP_INPUT_CHUNK_BYTES = 64 * 1024;
@@ -61,10 +63,20 @@ const TEXT_CONFIGURATION_FILES = new Set([
   'vite.config.js',
   'vite.config.mjs',
   'vite.config.ts',
+  'vite.config.jsx',
+  'vite.config.tsx',
   'next.config.cjs',
   'next.config.js',
   'next.config.mjs',
   'next.config.ts',
+]);
+
+const ENVIRONMENT_SOURCE_EXTENSIONS = new Set([
+  '.astro', '.cjs', '.js', '.jsx', '.mjs', '.svelte', '.ts', '.tsx', '.vue',
+]);
+
+const ENVIRONMENT_SOURCE_IGNORED_SEGMENTS = new Set([
+  '__fixtures__', '__mocks__', '__tests__', 'fixtures', 'mocks', 'test', 'tests',
 ]);
 
 interface ResolvedOptions {
@@ -139,10 +151,29 @@ function isExampleEnvironmentFile(name: string): boolean {
   return /^\.env(?:\.[a-z0-9_-]+)*\.(?:example|sample)$/i.test(name);
 }
 
+function extension(path: string): string {
+  const name = basename(path);
+  const index = name.lastIndexOf('.');
+  return index < 0 ? '' : name.slice(index).toLowerCase();
+}
+
+function isEnvironmentSourceContentPath(path: string): boolean {
+  const segments = path.toLowerCase().split('/');
+  const name = segments.at(-1) ?? '';
+  if (segments.some((segment) => ENVIRONMENT_SOURCE_IGNORED_SEGMENTS.has(segment))) return false;
+  if (/\.(?:spec|test|stories)\.[^.]+$/.test(name)) return false;
+  return ENVIRONMENT_SOURCE_EXTENSIONS.has(extension(path));
+}
+
+function isProjectConfigurationTextPath(path: string): boolean {
+  const name = basename(path).toLowerCase();
+  return TEXT_CONFIGURATION_FILES.has(name) || isExampleEnvironmentFile(name);
+}
+
 function shouldReadTextContent(path: string): boolean {
   const name = basename(path).toLowerCase();
   if (PRESENCE_ONLY_FILES.has(name)) return false;
-  return TEXT_CONFIGURATION_FILES.has(name) || isExampleEnvironmentFile(name);
+  return isProjectConfigurationTextPath(path) || isEnvironmentSourceContentPath(path);
 }
 
 function decodeUtf8(chunks: Uint8Array[], totalBytes: number): string | undefined {
@@ -226,6 +257,7 @@ export async function collectFolderAnalysisFiles(
   const results: ProjectAnalysisInputFile[] = [];
   const seenPaths = new Set<string>();
   let contentBytes = 0;
+  let sourceContentBytes = 0;
   let processedBytes = 0;
   let scannedEntries = 0;
 
@@ -241,11 +273,20 @@ export async function collectFolderAnalysisFiles(
 
     const result: ProjectAnalysisInputFile = { path: entry.path, size: entry.file.size };
     if (shouldReadTextContent(entry.path)) {
-      const remainingBytes = options.maxContentBytes - contentBytes;
+      const sourceFile = isEnvironmentSourceContentPath(entry.path)
+        && !isProjectConfigurationTextPath(entry.path);
+      const remainingBytes = sourceFile
+        ? Math.min(
+            options.maxContentBytes - contentBytes,
+            MAX_SOURCE_CONTENT_BYTES - sourceContentBytes,
+            MAX_SOURCE_FILE_BYTES,
+          )
+        : options.maxContentBytes - contentBytes;
       const content = await readFileText(entry.file, remainingBytes, options.signal);
       if (content !== undefined) {
         result.content = content;
         contentBytes += entry.file.size;
+        if (sourceFile) sourceContentBytes += entry.file.size;
       }
     }
     results.push(result);
@@ -278,6 +319,8 @@ export async function collectZipAnalysisFiles(
   const pending: ProjectAnalysisInputFile[] = [];
   const activeStreams = new Set<UnzipFile>();
   let contentBytes = 0;
+  let sourceContentBytes = 0;
+  let sourceReservedBytes = 0;
   let scannedEntries = 0;
   let bytesRead = 0;
   let failure: Error | null = null;
@@ -300,8 +343,20 @@ export async function collectZipAnalysisFiles(
     pending.push(result);
 
     if (isIgnoredPath(normalizedPath) || !shouldReadTextContent(normalizedPath)) return;
-    const remainingBytes = options.maxContentBytes - contentBytes;
+    const sourceFile = isEnvironmentSourceContentPath(normalizedPath)
+      && !isProjectConfigurationTextPath(normalizedPath);
+    const remainingBytes = sourceFile
+      ? Math.min(
+          options.maxContentBytes - contentBytes,
+          MAX_SOURCE_CONTENT_BYTES - sourceContentBytes - sourceReservedBytes,
+          MAX_SOURCE_FILE_BYTES,
+        )
+      : options.maxContentBytes - contentBytes;
     if (remainingBytes <= 0 || (entry.originalSize !== undefined && entry.originalSize > remainingBytes)) return;
+    const sourceReservation = sourceFile
+      ? Math.min(entry.originalSize ?? remainingBytes, remainingBytes)
+      : 0;
+    sourceReservedBytes += sourceReservation;
 
     const chunks: Uint8Array[] = [];
     let entryBytes = 0;
@@ -311,6 +366,7 @@ export async function collectZipAnalysisFiles(
       if (failure) return;
       if (error) {
         failure = error;
+        sourceReservedBytes -= sourceReservation;
         activeStreams.delete(entry);
         return;
       }
@@ -330,12 +386,14 @@ export async function collectZipAnalysisFiles(
       }
       if (!final) return;
       activeStreams.delete(entry);
+      sourceReservedBytes -= sourceReservation;
       if (result.size === undefined) result.size = entryBytes;
       if (exceededLimit) return;
       const content = decodeUtf8(chunks, entryBytes);
       if (content !== undefined) {
         result.content = content;
         contentBytes += entryBytes;
+        if (sourceFile) sourceContentBytes += entryBytes;
       }
     };
 
